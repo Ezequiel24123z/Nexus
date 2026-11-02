@@ -24,24 +24,31 @@ Switch per-chat or globally across **6 provider backends**:
 - **Architect Mode** (`architect`) — Read-only codebase exploration + structured plan generation (`todo_write`) and architecture design.
 - **Explore Mode** (`explore`) — Fast, read-only codebase research (`glob_files`, `grep_search`, `code_outline`, `read_file`).
 - **Unrestricted Mode** (`unrestricted`) — Zero local path confinement or per-action approval prompts; full operator control over the host machine.
-- **Built-in Slash Commands**: `/init` (auto-generate `NEXUS.md`), `/review` (structured diff & security review), `/architect` (step-by-step plan), `/mcp-create` (autonomous MCP server synthesis), and `/self-improve` (telemetry introspection & skill synthesis).
+- **Built-in Slash Commands**: `/init` (auto-generate `NEXUS.md`), `/review` (structured diff & security review), `/architect` (step-by-step plan), `/diagnostics` (automated codebase syntax & diagnostic audit), `/mcp-create` (autonomous MCP server synthesis), and `/self-improve` (telemetry introspection & skill synthesis).
 
-### 3. Industrial-Grade Agentic Coding Tool Suite
-- **Surgical Code Editing & Navigation**: `read_file` (with 1-based `startLine`/`endLine` range slicing for files up to 10 MB), `write_file`, `replace_text`, `multi_edit` (atomic multi-hunk replacements with automatic backups), `apply_patch` (`SEARCH/REPLACE` blocks and unified `@@` diff hunks), `glob_files`, `grep_search` (regex + context lines), and `code_outline` (AST/symbol structural map).
-- **Git & Worktree Operations**: `git_operation` (`status`, `diff`, `log`, `branch`, `stage`, `unstage`, `commit`, `worktree_list`, `worktree_add`).
-- **Background Process & Dev-Server Manager**: `manage_process` (`start`, `status`, `output`, `stop`, `list`) for asynchronous watchers, servers, and builds.
+### 3. Industrial-Grade Agentic Coding Tool Suite (34 Built-In Tools)
+- **Surgical Code Editing, Diagnostics & Navigation**: `read_file` (with 1-based `startLine`/`endLine` range slicing for files up to 10 MB), `write_file`, `replace_text`, `multi_edit` (atomic multi-hunk replacements with automatic backups), `apply_patch` (`SEARCH/REPLACE` blocks and unified `@@` diff hunks), `run_diagnostics` (automated syntax & structural verification across JS/MJS/CJS/JSON), `glob_files`, `grep_search` (regex + context lines), and `code_outline` (AST/symbol structural map).
+- **Stateful Shell & Background Process Manager**:
+  - `shell_session`: Persistent shell session per task that preserves working directory (`cd`/`Set-Location`) and environment variables (`$env:...`) across tool calls.
+  - `manage_process` (`start`, `status`, `output`, `stop`, `list`) for asynchronous watchers, servers, and builds.
+- **Git & Worktree Operations**: `git_operation` (`status`, `diff`, `log`, `branch`, `stage`, `unstage`, `commit`, `worktree_list`, `worktree_add`, `worktree_remove`).
+- **Unrestricted HTTP, Web & Headless Browser Inspection**:
+  - `http_request`: Full-featured HTTP/HTTPS client (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`) with custom headers, payloads, status codes, and latency metrics for API testing and security auditing.
+  - `browser_inspect`: Structured web page & DOM inspector (extracts page title, headings, interactive links, form inputs, and visible text, with optional offscreen JS rendering).
+  - `web_fetch`, OpenAPI 3.0/3.1 importer, and REST connectors with `Idempotency-Key` reconciliation.
 - **Autonomous MCP Server Creation & Self-Improvement**:
   - `scaffold_mcp_server`: The agent can write, register, and hot-connect new local Node.js stdio MCP servers on the fly without restarting.
   - `self_improve`: Introspects task telemetry and tool errors to synthesize reusable Skills and Functions into the local Capability Library.
-- **Sub-Agents, Memory & Web**:
+- **Sub-Agents, Memory & Desktop Control**:
   - `delegate_subagent`: Spawns an isolated sub-agent loop with its own clean context window and returns a compact synthesis.
   - `todo_write` / `todo_read`: Live multi-step task checklist rendered in real time in the chat header.
   - `memory_store`: Persistent global and project-scoped memories across sessions, plus automatic discovery of `NEXUS.md`, `CLAUDE.md`, `AGENTS.md`, and `.cursorrules`.
-  - `web_fetch`, OpenAPI 3.0/3.1 importer, REST connectors with `Idempotency-Key` reconciliation, and native Windows desktop control (`desktop_screenshot`, `desktop_action`).
+  - Native Windows desktop control (`desktop_screenshot`, `desktop_action`).
 
-### 4. Modern Studio UI/UX (Light & Dark Themes)
+### 4. Modern Studio UI/UX & Multi-Model Arena (Light & Dark Themes)
 - **Light (`Studio Paper`)** and **Dark (`Obsidian Carbon`)** themes with comfortable/compact density and reduced-motion accessibility.
-- **Files & Git Studio**: Interactive file browser, live Git working-tree inspector, syntax-highlighted unified diff viewer, 1-click stage/unstage/commit, integrated PowerShell Quick Terminal, and Background Process Monitor.
+- **Multi-Model Arena**: Dispatch the same coding prompt simultaneously across 2–4 models (e.g., Claude Sonnet, GPT-5, DeepSeek, or local Ollama) to compare code quality, speed, and reasoning side-by-side.
+- **Files & Git Studio**: Interactive file browser, live Git working-tree inspector, syntax-highlighted unified diff viewer, 1-click stage/unstage/commit, **Diagnostics** verifier, **Git Worktrees** manager, integrated PowerShell Quick Terminal, and Background Process Monitor.
 - **Context, Cache & Spend Inspector**: Inspect token budgets per context section, cache hit rates, provider routes, and pre-compaction checkpoints with zero API calls.
 
 ---

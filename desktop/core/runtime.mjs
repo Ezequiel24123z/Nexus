@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { baseTools, executeTool, READ_ONLY_TOOL_NAMES } from './tools.mjs';
-import { ProcessManager, discoverWorkspaceInstructions, expandSlashCommand } from './coding-engine.mjs';
+import { ProcessManager, StatefulShellManager, discoverWorkspaceInstructions, expandSlashCommand } from './coding-engine.mjs';
 import { aggregateUsage, normalizeUsage } from './telemetry.mjs';
 import {citationsFromAnnotations, readCompletionStream} from './stream.mjs';
 import {hydrateAttachmentReferences, materializeImageAttachment, materializeToolResult} from './artifacts.mjs';
@@ -31,13 +31,14 @@ export const estimateTokens = (value, bytesPerToken = 3) => {
 };
 
 export class Runtime extends EventEmitter {
-  constructor(store, { getSecret, desktop, mcp, request = fetch } = {}) {
-    super(); this.store = store; this.getSecret = getSecret; this.desktop = desktop; this.request = request;
+  constructor(store, { getSecret, desktop, browserInspect, mcp, request = fetch } = {}) {
+    super(); this.store = store; this.getSecret = getSecret; this.desktop = desktop; this.browserInspect = browserInspect; this.request = request;
     this.active = new Map(); this.approvals = new Map(); this.closed = false; this.desktopOwner = null;this.mcp=mcp;
     this.compacting=new Set();
     this.compressionControllers=new Map();
     this.attachments=new AttachmentStore(store);
     this.processes=new ProcessManager();
+    this.shells=new StatefulShellManager();
   }
   changed(task=undefined) { this.store.save(task); this.emit('change'); }
   get capabilities(){return this._capabilities ||= new CapabilityLibrary(this.store.directory);}

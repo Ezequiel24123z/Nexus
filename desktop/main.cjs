@@ -65,7 +65,7 @@ async function main() {
   const {searchConversation,conversationWindow,taskResults,previewTaskResult}=await import('./core/chat-workspace.mjs');
   const {validateChatOptions,validateModelCapabilities}=await import('./core/chat-options.mjs');
   const {modelConnection,providerCatalog,checkArliConnection,checkProviderConnection,SECRET_KEYS,PROVIDERS}=await import('./core/providers.mjs');
-  const {inspectGitWorkspace,executeGitOperation,inspectSystemEnvironment,detectLocalCopilotToken,scaffoldMcpServer,runSelfImprovement}=await import('./core/coding-engine.mjs');
+  const {inspectGitWorkspace,executeGitOperation,inspectSystemEnvironment,detectLocalCopilotToken,scaffoldMcpServer,runSelfImprovement,runCodeDiagnostics}=await import('./core/coding-engine.mjs');
   const { assertImageCapability } = await import('./core/attachments.mjs');
   async function checkAttachmentModel(ids,model,task) {
     const files=runtime.attachments.resolve(ids||[]);
@@ -297,6 +297,27 @@ async function main() {
         if(args.workspace && !allowedWorkspaces.has(args.workspace)) throw new Error('Select the workspace folder in the dialog first.');
         await checkAttachmentModel(args.attachmentIds,args.model||store.state.settings.model);
         const id=runtime.create(args);if(store.task(id).workspace)allowedWorkspaces.add(store.task(id).workspace);return id;
+      }
+      case 'createArena': {
+        if(args.workspace && !allowedWorkspaces.has(args.workspace)) throw new Error('Select the workspace folder in the dialog first.');
+        if(!Array.isArray(args.models) || args.models.length < 2) throw new Error('Select at least two models for Arena comparison.');
+        const ids = [];
+        for (const m of args.models.slice(0, 4)) {
+          const shortModel = String(m).split('/').pop();
+          const id = runtime.create({
+            prompt: args.prompt,
+            title: `[Arena · ${shortModel}] ${String(args.prompt).slice(0, 50)}`,
+            model: m,
+            projectId: args.projectId || null,
+            workspace: '',
+          });
+          ids.push(id);
+        }
+        return { ids };
+      }
+      case 'runDiagnostics': {
+        if(!args.workspace || !allowedWorkspaces.has(args.workspace)) throw new Error('Select an authorized workspace folder first.');
+        return runCodeDiagnostics(args.workspace, args.path || '.');
       }
       case 'pause': return runtime.pause(args.id);
       case 'compact': {

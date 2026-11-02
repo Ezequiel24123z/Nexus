@@ -356,14 +356,33 @@ export async function executeGitOperation(cwd, args = {}, signal) {
     return { operation: 'commit', output: res.stdout, status: await inspectGitWorkspace(cwd, { signal }) };
   }
   if (op === 'worktree_list') {
-    const res = await runGit(cwd, ['worktree', 'list'], { signal });
-    return { operation: 'worktree_list', output: res.stdout, exitCode: res.exitCode };
+    const res = await runGit(cwd, ['worktree', 'list', '--porcelain'], { signal });
+    const worktrees = [];
+    let current = null;
+    for (const line of (res.stdout || '').split(/\r?\n/)) {
+      if (line.startsWith('worktree ')) {
+        if (current) worktrees.push(current);
+        current = { path: line.slice(9).trim(), head: '', branch: 'detached' };
+      } else if (current && line.startsWith('HEAD ')) {
+        current.head = line.slice(5).trim().slice(0, 8);
+      } else if (current && line.startsWith('branch ')) {
+        current.branch = line.slice(7).trim().replace(/^refs\/heads\//, '');
+      }
+    }
+    if (current) worktrees.push(current);
+    return { operation: 'worktree_list', worktrees, output: res.stdout, exitCode: res.exitCode };
   }
   if (op === 'worktree_add') {
     if (!args.path || !args.branch) throw new Error('worktree_add requires path and branch.');
     const res = await runGit(cwd, ['worktree', 'add', '-b', args.branch, args.path], { signal });
     if (res.exitCode !== 0) throw new Error(res.stderr || 'git worktree add failed');
     return { operation: 'worktree_add', path: args.path, branch: args.branch, output: res.stdout };
+  }
+  if (op === 'worktree_remove') {
+    if (!args.path) throw new Error('worktree_remove requires path.');
+    const res = await runGit(cwd, ['worktree', 'remove', '--force', args.path], { signal });
+    if (res.exitCode !== 0) throw new Error(res.stderr || 'git worktree remove failed');
+    return { operation: 'worktree_remove', path: args.path, output: res.stdout };
   }
   throw new Error('Unsupported git operation: ' + op);
 }
@@ -810,7 +829,228 @@ export function expandSlashCommand(prompt = '') {
         mode: 'agent',
         prompt: `Run self_improve(action="analyze") to introspect workspace telemetry, recent tool errors, and capability coverage. Propose and save a new reusable skill or MCP tool that improves future agentic coding efficiency.${argText ? ' Context: ' + argText : ''}`,
       };
+    case '/diagnostics':
+      return {
+        mode: 'agent',
+        prompt: `Run run_diagnostics on the workspace to check for syntax or type errors, then fix any reported issues.${argText ? ' Target: ' + argText : ''}`,
+      };
     default:
       return { prompt, mode: undefined };
   }
+}
+
+export async function executeHttpRequest(args = {}, { request = fetch, signal } = {}) {
+  let parsed;
+  try { parsed = new URL(args.url); } catch { throw new Error('Invalid URL provided to http_request.'); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS protocols are supported.');
+  const method = String(args.method || 'GET').toUpperCase();
+  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(method)) {
+    throw new Error('Unsupported HTTP method: ' + method);
+  }
+  const headers = {};
+  if (args.headers && typeof args.headers === 'object' && !Array.isArray(args.headers)) {
+    for (const [k, v] of Object.entries(args.headers)) headers[String(k)] = String(v);
+  }
+  let body;
+  if (args.body !== undefined && !['GET', 'HEAD'].includes(method)) {
+    if (typeof args.body === 'string') body = args.body;
+    else {
+      body = JSON.stringify(args.body);
+      if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
+    }
+  }
+  const started = Date.now();
+  const response = await request(parsed.href, {
+    method,
+    headers,
+    body,
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
+  });
+  const text = (await response.text()).slice(0, 32000);
+  const responseHeaders = {};
+  response.headers?.forEach?.((v, k) => { responseHeaders[k] = v; });
+  return {
+    url: parsed.href,
+    method,
+    status: response.status,
+    ok: response.ok,
+    latencyMs: Date.now() - started,
+    headers: responseHeaders,
+    body: text,
+  };
+}
+
+export async function runCodeDiagnostics(workspace, targetPath = '.', { resolvePath, signal } = {}) {
+  if (!workspace) throw new Error('Select a workspace folder to run diagnostics.');
+  const target = resolvePath ? await resolvePath(workspace, targetPath, false) : path.resolve(workspace, targetPath);
+  const stat = await fs.stat(target);
+  const filesToCheck = [];
+  if (stat.isFile()) {
+    filesToCheck.push(target);
+  } else {
+    const walk = async dir => {
+      if (filesToCheck.length >= 60) return;
+      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (filesToCheck.length >= 60) break;
+        if (entry.isSymbolicLink() || IGNORED_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full);
+        else if (/\.(mjs|cjs|js|json)$/i.test(entry.name)) filesToCheck.push(full);
+      }
+    };
+    await walk(target);
+  }
+
+  const diagnostics = [];
+  for (const file of filesToCheck) {
+    signal?.throwIfAborted();
+    const rel = path.relative(workspace, file).replace(/\\/g, '/');
+    if (file.endsWith('.json')) {
+      try {
+        JSON.parse(await fs.readFile(file, 'utf8'));
+      } catch (err) {
+        diagnostics.push({ file: rel, severity: 'error', tool: 'json', message: err.message });
+      }
+    } else if (/\.(mjs|cjs|js)$/i.test(file)) {
+      try {
+        await execFileAsync(process.execPath, ['--check', file], { timeout: 8000, windowsHide: true });
+      } catch (err) {
+        const stderr = String(err.stderr || err.message || '').trim();
+        const lineMatch = /:(\d+)\r?\n/.exec(stderr);
+        diagnostics.push({
+          file: rel,
+          line: lineMatch ? Number(lineMatch[1]) : null,
+          severity: 'error',
+          tool: 'node --check',
+          message: stderr.split(/\r?\n/).slice(0, 6).join('\n'),
+        });
+      }
+    }
+  }
+  return {
+    workspace,
+    target: targetPath,
+    checkedFiles: filesToCheck.length,
+    passed: diagnostics.length === 0,
+    diagnostics,
+  };
+}
+
+export class StatefulShellManager {
+  constructor() {
+    this.sessions = new Map();
+  }
+  getOrInit(taskId, defaultCwd) {
+    if (!this.sessions.has(taskId)) {
+      this.sessions.set(taskId, { cwd: defaultCwd || process.cwd(), env: {}, history: [] });
+    }
+    const session = this.sessions.get(taskId);
+    if (!session.cwd && defaultCwd) session.cwd = defaultCwd;
+    return session;
+  }
+  async exec(taskId, commandText, { defaultCwd, envOverrides, signal, timeout = 60000 } = {}) {
+    if (typeof commandText !== 'string' || !commandText.trim()) throw new Error('Provide a shell command.');
+    const session = this.getOrInit(taskId, defaultCwd);
+    if (envOverrides && typeof envOverrides === 'object') {
+      for (const [k, v] of Object.entries(envOverrides)) {
+        if (v === null) delete session.env[k];
+        else session.env[String(k)] = String(v);
+      }
+    }
+    const marker = '__NEXUS_CWD_' + crypto.randomUUID().slice(0, 8) + '__';
+    const isWin = process.platform === 'win32';
+    const wrapped = isWin
+      ? `${commandText}\n$__code = $LASTEXITCODE\nWrite-Output "${marker}:$((Get-Location).Path)"\nif ($__code -ne $null) { exit $__code }`
+      : `${commandText}\n__code=$?\nprintf "\\n${marker}:%s\\n" "$(pwd)"\nexit $__code`;
+    const exe = isWin ? 'powershell.exe' : 'sh';
+    const args = isWin ? ['-NoProfile', '-NonInteractive', '-Command', wrapped] : ['-c', wrapped];
+
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(new Error('Cancelled'));
+      const child = spawn(exe, args, {
+        cwd: session.cwd,
+        env: { ...process.env, ...session.env },
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '', stderr = '', stopped = false;
+      const stop = () => {
+        stopped = true;
+        if (isWin && child.pid) spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
+        else child.kill('SIGKILL');
+      };
+      const timer = timeout > 0 ? setTimeout(stop, timeout) : null;
+      signal?.addEventListener('abort', stop, { once: true });
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', stop); };
+      child.stdout.on('data', d => { stdout = (stdout + d).slice(-48000); });
+      child.stderr.on('data', d => { stderr = (stderr + d).slice(-24000); });
+      child.on('error', err => { cleanup(); reject(err); });
+      child.on('close', code => {
+        cleanup();
+        if (stopped) return reject(new Error('Stateful shell command stopped or timed out.'));
+        const markerRegex = new RegExp(`${marker}:([^\\r\\n]+)`);
+        const match = markerRegex.exec(stdout);
+        if (match && match[1]) {
+          const nextCwd = match[1].trim();
+          if (fsSync.existsSync(nextCwd)) session.cwd = nextCwd;
+          stdout = stdout.replace(markerRegex, '').trimEnd();
+        }
+        const combined = (stdout + (stderr ? '\n' + stderr : '')).trim();
+        session.history.push({ command: commandText, cwd: session.cwd, exitCode: code, at: new Date().toISOString() });
+        if (session.history.length > 50) session.history.shift();
+        resolve({ exitCode: code, cwd: session.cwd, envKeys: Object.keys(session.env), output: combined });
+      });
+    });
+  }
+}
+
+export async function inspectWebPage(urlInput, { extractLinks = true, extractForms = true, renderJs = false, browserInspect, request = fetch, signal } = {}) {
+  let parsed;
+  try { parsed = new URL(urlInput); } catch { throw new Error('Invalid URL.'); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS URLs are supported.');
+  if (renderJs && typeof browserInspect === 'function') {
+    return browserInspect(parsed.href, { extractLinks, extractForms, signal });
+  }
+  const response = await request(parsed.href, {
+    headers: { 'User-Agent': 'NEXUS-Agent/0.4 (+https://github.com/Ezequiel24123z/Nexus)' },
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
+  });
+  const html = await response.text();
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : parsed.hostname;
+  const links = [];
+  if (extractLinks) {
+    for (const m of html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+      if (links.length >= 60) break;
+      try {
+        const href = new URL(m[1], parsed.href).href;
+        const text = m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        if (['http:', 'https:'].includes(new URL(href).protocol)) links.push({ text: text || href, url: href });
+      } catch {}
+    }
+  }
+  const forms = [];
+  if (extractForms) {
+    for (const m of html.matchAll(/<form([^>]*)>([\s\S]*?)<\/form>/gi)) {
+      if (forms.length >= 20) break;
+      const actionMatch = /action=["']([^"']+)["']/i.exec(m[1]);
+      const methodMatch = /method=["']([^"']+)["']/i.exec(m[1]);
+      const inputs = [...m[2].matchAll(/<(?:input|textarea|select)[^>]+name=["']([^"']+)["'][^>]*>/gi)].map(im => im[1]);
+      forms.push({
+        action: actionMatch ? actionMatch[1] : parsed.pathname,
+        method: (methodMatch ? methodMatch[1] : 'GET').toUpperCase(),
+        fields: inputs.slice(0, 30),
+      });
+    }
+  }
+  const text = htmlToReadableText(html).slice(0, 16000);
+  return {
+    url: parsed.href,
+    status: response.status,
+    title,
+    text,
+    links,
+    forms,
+  };
 }

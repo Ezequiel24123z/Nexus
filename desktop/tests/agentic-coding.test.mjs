@@ -350,3 +350,81 @@ test('code_outline, scaffold_mcp_server, self_improve, and slash commands (/init
   }, signal);
   await runtime.mcp.disconnect('Autonomous Math MCP');
 });
+
+test('http_request, run_diagnostics, shell_session stateful cwd/env, browser_inspect, and git worktree management work end-to-end', async t => {
+  const { runtime, store, workspace, directory } = await setup(t);
+  const signal = new AbortController().signal;
+  const id = runtime.create({ prompt: 'v0.4.0 capabilities', workspace });
+  const task = store.task(id);
+
+  // 1. Unrestricted system prompt verification
+  assert.match(store.state.settings.globalInstructions, /without imposing client-side topic or domain restrictions/);
+
+  // 2. http_request (supports HTTP/HTTPS, custom headers, and JSON body)
+  runtime.request = async (url, opts) => {
+    assert.equal(url, 'http://127.0.0.1:8080/api/probe');
+    assert.equal(opts.method, 'POST');
+    assert.equal(opts.headers['X-Custom-Probe'], 'nexus-redteam');
+    return new Response(JSON.stringify({ status: 'ok', echoed: JSON.parse(opts.body) }), {
+      status: 201,
+      headers: { 'content-type': 'application/json', 'x-server': 'local-lab' },
+    });
+  };
+  const httpRes = await executeTool(runtime, task, 'http_request', {
+    url: 'http://127.0.0.1:8080/api/probe',
+    method: 'POST',
+    headers: { 'X-Custom-Probe': 'nexus-redteam' },
+    body: { target: 'localhost' },
+  }, signal);
+  assert.equal(httpRes.status, 201);
+  assert.equal(httpRes.ok, true);
+  assert.match(httpRes.body, /"target":"localhost"/);
+
+  // 3. browser_inspect (extracts title, text, links, and forms)
+  runtime.request = async () => new Response(
+    '<html><head><title>Lab Portal</title></head><body><h1>Welcome</h1><a href="/login">Sign In</a><form action="/auth" method="post"><input name="username"/><input name="password"/></form></body></html>',
+    { status: 200, headers: { 'content-type': 'text/html' } }
+  );
+  const inspected = await executeTool(runtime, task, 'browser_inspect', { url: 'http://localhost:3000/portal' }, signal);
+  assert.equal(inspected.title, 'Lab Portal');
+  assert.equal(inspected.links.length, 1);
+  assert.equal(inspected.links[0].url, 'http://localhost:3000/login');
+  assert.equal(inspected.forms.length, 1);
+  assert.deepEqual(inspected.forms[0].fields, ['username', 'password']);
+
+  // 4. run_diagnostics (detects valid and invalid JS/JSON syntax)
+  await fs.writeFile(path.join(workspace, 'valid.mjs'), 'export const x = 42;\n', 'utf8');
+  await fs.writeFile(path.join(workspace, 'broken.json'), '{ "unclosed": 1 ', 'utf8');
+  const diag1 = await executeTool(runtime, task, 'run_diagnostics', {}, signal);
+  assert.equal(diag1.passed, false);
+  assert.equal(diag1.diagnostics.length, 1);
+  assert.equal(diag1.diagnostics[0].file, 'broken.json');
+  await fs.writeFile(path.join(workspace, 'broken.json'), '{ "closed": 1 }\n', 'utf8');
+  const diag2 = await executeTool(runtime, task, 'run_diagnostics', {}, signal);
+  assert.equal(diag2.passed, true);
+
+  // 5. shell_session (persists working directory and environment variables across calls)
+  const subDir = path.join(workspace, 'nested-dir');
+  await fs.mkdir(subDir, { recursive: true });
+  await executeTool(runtime, task, 'shell_session', {
+    command: 'Set-Location "nested-dir"',
+    env: { NEXUS_SESSION_VAR: 'persisted_value_99' },
+  }, signal);
+  const secondShell = await executeTool(runtime, task, 'shell_session', {
+    command: 'Write-Output "$env:NEXUS_SESSION_VAR|$((Get-Location).Path)"',
+  }, signal);
+  assert.match(secondShell.output, /persisted_value_99/);
+  assert.ok(secondShell.cwd.endsWith('nested-dir'));
+
+  // 6. Git worktree list, add, and remove
+  await runGit(workspace, ['init']);
+  await runGit(workspace, ['config', 'user.email', 'nexus@example.com']);
+  await runGit(workspace, ['config', 'user.name', 'NEXUS Test']);
+  await executeTool(runtime, task, 'git_operation', { operation: 'commit', stageAll: true, message: 'base commit' }, signal);
+  const wtPath = path.join(directory, 'wt-branch');
+  await executeTool(runtime, task, 'git_operation', { operation: 'worktree_add', branch: 'feat-wt', path: wtPath }, signal);
+  const wtList = await executeTool(runtime, task, 'git_operation', { operation: 'worktree_list' }, signal);
+  assert.ok(wtList.worktrees.length >= 2);
+  assert.ok(wtList.worktrees.some(w => w.branch === 'feat-wt'));
+  await executeTool(runtime, task, 'git_operation', { operation: 'worktree_remove', path: wtPath }, signal);
+});

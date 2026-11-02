@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { GitBranch, Terminal, Play, Square, RefreshCw, Check, Plus, Minus, Cpu } from 'lucide-react';
+import { GitBranch, Terminal, Play, Square, RefreshCw, Check, Plus, Minus, Cpu, ShieldCheck, Layers } from 'lucide-react';
 
 const api = (method, args) => window.nexus.invoke(method, args);
 
@@ -16,6 +16,10 @@ export default function CodeGitStudio({ workspace, onNotice, onError }) {
   const [bgCmd, setBgCmd] = useState('');
   const [bgLabel, setBgLabel] = useState('');
   const [selectedProc, setSelectedProc] = useState(null);
+  const [diag, setDiag] = useState(null);
+  const [worktrees, setWorktrees] = useState([]);
+  const [wtBranch, setWtBranch] = useState('');
+  const [wtPath, setWtPath] = useState('');
 
   const refreshGit = async () => {
     if (!workspace) return;
@@ -40,9 +44,31 @@ export default function CodeGitStudio({ workspace, onNotice, onError }) {
     } catch {}
   };
 
+  const refreshDiagnostics = async () => {
+    if (!workspace) return;
+    setBusy(true);
+    try {
+      setDiag(await api('runDiagnostics', { workspace }));
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshWorktrees = async () => {
+    if (!workspace) return;
+    try {
+      const res = await api('gitAction', { workspace, operation: 'worktree_list' });
+      setWorktrees(res?.worktrees || []);
+    } catch {}
+  };
+
   useEffect(() => {
     if (workspace && subTab === 'git') void refreshGit();
     if (subTab === 'processes') void refreshProcesses();
+    if (workspace && subTab === 'diagnostics') void refreshDiagnostics();
+    if (workspace && subTab === 'worktrees') void refreshWorktrees();
   }, [workspace, subTab]);
 
   const inspectFileDiff = async (path, staged = false) => {
@@ -127,6 +153,8 @@ export default function CodeGitStudio({ workspace, onNotice, onError }) {
       <div className="studio-header">
         <div className="filter-pills" role="group" aria-label="Developer studio tools">
           <button type="button" aria-pressed={subTab === 'git'} onClick={() => setSubTab('git')}><GitBranch size={14} /> Git & Diff</button>
+          <button type="button" aria-pressed={subTab === 'diagnostics'} onClick={() => setSubTab('diagnostics')}><ShieldCheck size={14} /> Diagnostics</button>
+          <button type="button" aria-pressed={subTab === 'worktrees'} onClick={() => setSubTab('worktrees')}><Layers size={14} /> Worktrees</button>
           <button type="button" aria-pressed={subTab === 'terminal'} onClick={() => setSubTab('terminal')}><Terminal size={14} /> Quick Terminal</button>
           <button type="button" aria-pressed={subTab === 'processes'} onClick={() => setSubTab('processes')}><Cpu size={14} /> Background Processes ({processes.filter(p => p.status === 'running').length})</button>
         </div>
@@ -252,6 +280,57 @@ export default function CodeGitStudio({ workspace, onNotice, onError }) {
             </div>
           </div>
         </div>
+      )}
+
+      {subTab === 'diagnostics' && (
+        !workspace ? <p className="hint">Select a workspace folder above to run syntax and JSON diagnostics.</p> : (
+          <div>
+            <div className="row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
+              <strong>{diag ? `${diag.checkedFiles} files checked · ${diag.passed ? 'All passed' : `${diag.diagnostics.length} issues found`}` : 'Workspace Diagnostics'}</strong>
+              <button type="button" className="secondary" disabled={busy} onClick={refreshDiagnostics}><RefreshCw size={13} /> Run Diagnostics</button>
+            </div>
+            {diag?.diagnostics?.map((item, idx) => (
+              <div className="task-row" key={idx}>
+                <div>
+                  <strong>{item.file}{item.line ? `:${item.line}` : ''}</strong> <span className="status failed">{item.tool}</span>
+                  <pre style={{ marginTop: 6 }}>{item.message}</pre>
+                </div>
+              </div>
+            ))}
+            {diag?.passed && <p className="hint">Zero syntax or JSON errors detected across {diag.checkedFiles} checked files.</p>}
+          </div>
+        )
+      )}
+
+      {subTab === 'worktrees' && (
+        !workspace ? <p className="hint">Select a workspace folder above to inspect or create isolated Git worktrees.</p> : (
+          <div>
+            <form className="row" style={{ marginBottom: 14 }} onSubmit={async e => {
+              e.preventDefault();
+              if (!wtBranch.trim() || !wtPath.trim()) return;
+              setBusy(true);
+              try {
+                await api('gitAction', { workspace, operation: 'worktree_add', branch: wtBranch.trim(), path: wtPath.trim() });
+                setWtBranch(''); setWtPath('');
+                await refreshWorktrees();
+                onNotice?.('Created Git worktree ' + wtBranch.trim());
+              } catch (err) { onError?.(err.message); } finally { setBusy(false); }
+            }}>
+              <input placeholder="New branch name (e.g. feat/isolated-task)" value={wtBranch} onChange={e => setWtBranch(e.target.value)} style={{ flex: 1 }} />
+              <input placeholder="Target directory path…" value={wtPath} onChange={e => setWtPath(e.target.value)} style={{ flex: 2 }} />
+              <button className="primary" disabled={busy || !wtBranch.trim() || !wtPath.trim()}><Plus size={14} /> Add Worktree</button>
+            </form>
+            {worktrees.map(wt => (
+              <div className="task-row" key={wt.path}>
+                <div>
+                  <strong>{wt.branch}</strong> <code>{wt.head}</code>
+                  <small>{wt.path}</small>
+                </div>
+              </div>
+            ))}
+            {!worktrees.length && <p className="hint">No Git worktrees found for this folder.</p>}
+          </div>
+        )
       )}
     </section>
   );

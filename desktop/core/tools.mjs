@@ -16,6 +16,9 @@ import {
   extractCodeOutline,
   scaffoldMcpServer,
   runSelfImprovement,
+  executeHttpRequest,
+  runCodeDiagnostics,
+  inspectWebPage,
 } from './coding-engine.mjs';
 
 export const READ_ONLY_TOOL_NAMES = new Set([
@@ -31,6 +34,8 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   'glob_files',
   'grep_search',
   'code_outline',
+  'run_diagnostics',
+  'browser_inspect',
   'list_effects',
   'search_journal',
   'search_history',
@@ -106,8 +111,12 @@ export const baseTools = [
   def('replace_text', 'Replace an exact, unique text block in a file. Fails if oldText does not match exactly once. Creates an automatic backup.', { path: str('File path'), oldText: str('Exact text to replace'), newText: str('Replacement text'), reason: str('Reason for change') }, ['path', 'oldText', 'newText', 'reason']),
   def('multi_edit', 'Apply multiple sequential exact text replacements to a single file atomically in one operation. Creates a backup before modifying.', { path: str('File path'), edits: { type: 'array', items: { type: 'object', properties: { oldText: str('Exact text to find'), newText: str('Replacement text') }, required: ['oldText', 'newText'], additionalProperties: false } }, reason: str('Reason for changes') }, ['path', 'edits', 'reason']),
   def('apply_patch', 'Apply a patch to a file using either <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks or unified diff @@ hunks.', { path: str('File path'), patch: str('Patch content'), reason: str('Reason for patch') }, ['path', 'patch', 'reason']),
-  def('git_operation', 'Execute structured Git operations in the workspace: status, diff, log, branch, stage, unstage, commit, worktree_list, or worktree_add.', { operation: { type: 'string', enum: ['status', 'diff', 'log', 'branch', 'stage', 'unstage', 'commit', 'worktree_list', 'worktree_add'] }, staged: { type: 'boolean', description: 'For diff: inspect staged changes' }, target: str('Optional file path for diff/stage/unstage'), paths: { type: 'array', items: { type: 'string' }, description: 'File paths for stage/unstage' }, message: str('Commit message when operation is commit'), stageAll: { type: 'boolean', description: 'Stage all changes before commit' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, path: str('Target directory for worktree_add'), branch: str('Branch name for worktree_add') }, ['operation']),
+  def('git_operation', 'Execute structured Git operations in the workspace: status, diff, log, branch, stage, unstage, commit, worktree_list, worktree_add, or worktree_remove.', { operation: { type: 'string', enum: ['status', 'diff', 'log', 'branch', 'stage', 'unstage', 'commit', 'worktree_list', 'worktree_add', 'worktree_remove'] }, staged: { type: 'boolean', description: 'For diff: inspect staged changes' }, target: str('Optional file path for diff/stage/unstage'), paths: { type: 'array', items: { type: 'string' }, description: 'File paths for stage/unstage' }, message: str('Commit message when operation is commit'), stageAll: { type: 'boolean', description: 'Stage all changes before commit' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, path: str('Target directory for worktree_add or worktree_remove'), branch: str('Branch name for worktree_add') }, ['operation']),
   def('run_command', 'Execute a PowerShell command with the user Windows permissions. Unsandboxed. No automatic timeout; user can pause.', { command: str('PowerShell command'), reason: str('Purpose of command') }, ['command', 'reason']),
+  def('shell_session', 'Execute a command in a persistent stateful shell session for this task that preserves working directory (cd) and environment variables across calls.', { command: str('Command to run in the persistent session'), env: { type: 'object', additionalProperties: true, description: 'Optional environment variables to set or persist' }, reason: str('Purpose of command') }, ['command']),
+  def('run_diagnostics', 'Run fast syntax and type diagnostics (node --check, JSON validation) across a file or workspace directory.', { path: str('Optional relative file or directory path (default ".")') }),
+  def('http_request', 'Send a direct, unrestricted HTTP or HTTPS request (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS) to any local, LAN, or external endpoint with custom headers and body.', { url: str('HTTP or HTTPS URL'), method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] }, headers: { type: 'object', additionalProperties: true }, body: { type: ['string', 'object'], additionalProperties: true } }, ['url']),
+  def('browser_inspect', 'Inspect a web page or local dev server URL, extracting title, readable text, links, forms, and optionally rendering JavaScript via headless browser.', { url: str('HTTP or HTTPS URL'), renderJs: { type: 'boolean', description: 'Render dynamic JavaScript in an offscreen browser window when available' }, extractLinks: { type: 'boolean' }, extractForms: { type: 'boolean' } }, ['url']),
   def('manage_process', 'Start, inspect, read output from, list, or stop long-running background processes (dev servers, watchers, builds).', { action: { type: 'string', enum: ['start', 'status', 'output', 'stop', 'list'] }, id: str('Process ID for status/output/stop'), command: str('Shell command when action is start'), label: str('Short label for the background process') }, ['action']),
   def('todo_write', 'Create or update the structured task checklist (plan) for this session to track multi-step engineering progress.', { todos: { type: 'array', items: { type: 'object', properties: { id: str('Short kebab-case ID'), title: str('Actionable task description'), status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'blocked'] }, priority: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['id', 'title', 'status'], additionalProperties: false } } }, ['todos']),
   def('todo_read', 'Read the current structured task checklist for this session.', {}),
@@ -254,6 +263,8 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     throw new Error('Unsupported memory_store action.');
   }
   if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, request: runtime.request, signal });
+  if(name==='http_request')return executeHttpRequest(args, { request: runtime.request, signal });
+  if(name==='browser_inspect')return inspectWebPage(args.url, { extractLinks: args.extractLinks !== false, extractForms: args.extractForms !== false, renderJs: Boolean(args.renderJs), browserInspect: runtime.browserInspect, request: runtime.request, signal });
   if(name==='system_info')return inspectSystemEnvironment(task.workspace);
   if(name==='delegate_subagent')return runtime.runSubagent(task, args, signal);
   if(name==='scaffold_mcp_server'){
@@ -297,9 +308,13 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
   }
   if (!task.workspace) throw new Error('Select a project workspace folder to use file, Git, or terminal tools.');
   if (name === 'run_command') return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', args.command], { cwd: task.workspace, signal, timeout:0 });
+  if (name === 'shell_session') return runtime.shells.exec(task.id, args.command, { defaultCwd: task.workspace, envOverrides: args.env, signal, timeout: 60000 });
   if (name === 'git_operation') return executeGitOperation(task.workspace, args, signal);
   const unrestricted = store.state.settings.autonomous || task.agentMode === 'unrestricted';
   const resolvePath = unrestricted ? async(root,requested='.')=>path.resolve(root,requested) : workspacePath;
+  if (name === 'run_diagnostics') {
+    return runCodeDiagnostics(task.workspace, args.path || '.', { resolvePath: unrestricted ? null : workspacePath, signal });
+  }
   if (name === 'glob_files') {
     const searchRoot = args.path ? await resolvePath(task.workspace, args.path, false) : task.workspace;
     return globWorkspaceFiles(searchRoot, args.pattern, { resolvePath: unrestricted ? null : workspacePath, signal });
