@@ -224,7 +224,9 @@ test('unsafe paths and directory junction escapes are denied',async t=>{
   const outside=path.join(directory,'outside');await fs.mkdir(outside);
   await fs.symlink(outside,path.join(workspace,'link'),process.platform==='win32'?'junction':'dir');
   await assert.rejects(workspacePath(workspace,'link/file.txt',true));
-  assert.equal(await workspacePath(workspace,'new/sub/file.txt',true),path.join(workspace,'new','sub','file.txt'));
+  // Windows runners can expose TEMP through an 8.3 alias; workspacePath returns the real root.
+  const canonicalWorkspace=await fs.realpath(workspace);
+  assert.equal(await workspacePath(workspace,'new/sub/file.txt',true),path.join(canonicalWorkspace,'new','sub','file.txt'));
 });
 
 test('interrupted unfinished tool calls are not replayed when resuming',async t=>{

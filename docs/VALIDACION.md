@@ -18,6 +18,8 @@ La primera compilación de Desktop con sólo sus dependencias instaladas falló:
 
 No se cambió el motor, el esquema de datos ni la configuración del perfil original. El checkout original en `D:/Agents` permanece separado de esta exportación.
 
+La primera ejecución de GitHub detectó una expectativa de prueba no portable: TEMP usa a veces un alias Windows 8.3 (`RUNNER~1`), mientras que `workspacePath` devuelve la raíz real. Se corrigió la expectativa para usar `fs.realpath`, manteniendo los rechazos de escape y de junctions. No se alteró el módulo de rutas.
+
 ## Alcance y límites
 
 La prueba Electron se ejecutó fuera de pantalla con un almacén nuevo y comprobó navegación, adjuntos, continuidad, biblioteca, contratos, inspector, almacenamiento y panel de proveedores. El informe final declaró `passed: true`, 170 comprobaciones y ausencia de desbordamiento horizontal a 1500 y 940 píxeles. Los errores de validación deliberados de esas pruebas aparecen en su salida como rechazos esperados.

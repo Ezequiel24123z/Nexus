@@ -8,6 +8,7 @@ Instantánea del 2 de noviembre de 2026 del árbol de trabajo de NEXUS en `D:/Ag
 - El nuevo repositorio empieza con esta instantánea revisada; no publica el historial Git anterior. Los informes y el inventario conservan contexto histórico.
 - El README del starter web se conserva en `docs/WEB-STARTER.md`.
 - Se aisló la configuración PostCSS de Vite en Desktop: antes heredaba la configuración web y fallaba al compilar con sólo sus propias dependencias instaladas. No se cambió el motor del agente.
+- Se corrigió una comparación de rutas en una prueba: los runners Windows pueden utilizar un alias 8.3 para TEMP. Ahora la expectativa usa la ruta canónica, igual que el contrato del módulo; se conservan las comprobaciones de bloqueo de escapes.
 
 Se incluyen ambas aplicaciones, sus lockfiles, pruebas sintéticas, utilidades de desarrollo, migraciones, informes, planes y avisos de terceros existentes.
 
