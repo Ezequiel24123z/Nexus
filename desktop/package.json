@@ -1,8 +1,9 @@
 {
   "name": "nexus-desktop",
-  "version": "0.2.0",
-  "description": "NEXUS local agent workspace",
+  "version": "0.3.0",
+  "description": "NEXUS Autonomous Agentic Coding & Personal Operator IDE",
   "author": "NEXUS",
+  "repository": "https://github.com/Ezequiel24123z/Nexus",
   "private": true,
   "type": "module",
   "main": "main.cjs",
@@ -17,7 +18,8 @@
     "test:live-orchestration": "electron tests/run-live-from-vault.cjs tests/live-orchestration.mjs",
     "test:live-native-output": "electron tests/run-live-from-vault.cjs tests/live-native-output.mjs",
     "test:live-recovery": "electron tests/run-live-from-vault.cjs tests/live-recovery.mjs",
-    "package": "npm run build && electron-builder --win dir"
+    "package": "npm run build && electron-builder --win dir",
+    "dist:portable": "npm run build && electron-builder --win portable"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
@@ -36,6 +38,7 @@
   "build": {
     "appId": "app.nexus.operator",
     "productName": "NEXUS",
+    "compression": "store",
     "directories": {
       "output": "release"
     },
@@ -45,14 +48,25 @@
       "preload.cjs",
       "core/**",
       "native/**",
-      "package.json"
+      "package.json",
+      "!node_modules/lucide-react/**",
+      "!node_modules/react/**",
+      "!node_modules/react-dom/**",
+      "!node_modules/react-markdown/**",
+      "!node_modules/remark-gfm/**"
     ],
     "asarUnpack": [
       "native/**"
     ],
     "win": {
-      "target": "dir",
+      "target": [
+        "portable",
+        "dir"
+      ],
       "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "NEXUS-Portable.exe"
     }
   }
 }

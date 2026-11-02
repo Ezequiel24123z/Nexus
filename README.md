@@ -1,14 +1,58 @@
-# NEXUS
+# NEXUS — Autonomous Agentic Coding & Personal Operator IDE
 
-Espacio de trabajo de agentes de IA con chats, proyectos, herramientas locales, conectores REST/MCP y seguimiento de contexto, tokens y coste. La aplicación principal es **NEXUS Desktop para Windows**, construida con Electron, React y Vite. Admite **OpenRouter y Arli.ai**.
+**NEXUS** is an open, local-first **Agentic Coding & Personal Operator Workspace** for Windows, built with Electron, React 19, and a durable Node.js ESM execution engine.
 
-Este repositorio reúne el código actual de escritorio, el prototipo web original y los informes de diseño, evolución y verificación. Es una revisión de desarrollo; el paquete conserva la versión `0.2.0`.
+Designed for maximum personal autonomy, NEXUS imposes **zero client-side content filters or artificial guardrails**—delegating content policy solely to the model provider you choose while granting full, auditable power over your local environment, codebase, shell, Git repositories, desktop UI, REST APIs, and Model Context Protocol (MCP) servers.
 
-![Inicio de NEXUS con un perfil de prueba vacío](docs/images/nexus-desktop.png)
+![NEXUS Desktop — Agentic Coding & Personal Operator IDE](docs/images/nexus-desktop.png)
 
-## Empezar con Desktop
+---
 
-Requisitos: Windows, Git y **Node.js 24.12.0**, versión usada para esta entrega y fijada en `.node-version`.
+## Key Capabilities
+
+### 1. Multi-Provider Model Engine
+Switch per-chat or globally across **6 provider backends**:
+- **OpenRouter** (`owner/model`) — 300+ models, prompt caching affinity, provider routing (`price`, `throughput`, `latency`), and native server web search.
+- **Arli.ai** (`arliai/<model>`) — High-context coding (`DeepSeek-V4.1-Flash-1017`) and uncensored/derestricted models (`GLM-4.6-Derestricted-v5`, `QwQ`).
+- **OpenAI Direct** (`openai/<model>`) — Direct access to `gpt-5`, `gpt-5-mini`, `gpt-4.1`, `o3`, and `o4-mini` with native `reasoning_effort` and streaming token usage.
+- **GitHub Copilot** (`copilot/<model>`) — Use your GitHub Copilot subscription (`claude-sonnet-4.5`, `gpt-5`, `gemini-2.5-pro`, `claude-opus-4.5`) with **1-click token import** from GitHub CLI (`gh auth token`) or local Copilot configuration.
+- **Anthropic Direct** (`anthropic/<model>`) — Direct Claude 4.5 (`claude-sonnet-4-5`, `claude-opus-4-5`, `claude-haiku-4-5`).
+- **Custom / Local OpenAI-Compatible** (`custom/<model>`) — Connect to **Ollama**, **LM Studio**, **vLLM**, or **llama.cpp** (`http://localhost:11434/v1`) with no API key required and zero external restrictions.
+
+### 2. Four Operating Modes & Slash Commands
+- **Agent Mode** (`agent`) — Full read/write coding, shell execution, Git operations, background processes, MCP builder, and sub-agent delegation.
+- **Architect Mode** (`architect`) — Read-only codebase exploration + structured plan generation (`todo_write`) and architecture design.
+- **Explore Mode** (`explore`) — Fast, read-only codebase research (`glob_files`, `grep_search`, `code_outline`, `read_file`).
+- **Unrestricted Mode** (`unrestricted`) — Zero local path confinement or per-action approval prompts; full operator control over the host machine.
+- **Built-in Slash Commands**: `/init` (auto-generate `NEXUS.md`), `/review` (structured diff & security review), `/architect` (step-by-step plan), `/mcp-create` (autonomous MCP server synthesis), and `/self-improve` (telemetry introspection & skill synthesis).
+
+### 3. Industrial-Grade Agentic Coding Tool Suite
+- **Surgical Code Editing & Navigation**: `read_file` (with 1-based `startLine`/`endLine` range slicing for files up to 10 MB), `write_file`, `replace_text`, `multi_edit` (atomic multi-hunk replacements with automatic backups), `apply_patch` (`SEARCH/REPLACE` blocks and unified `@@` diff hunks), `glob_files`, `grep_search` (regex + context lines), and `code_outline` (AST/symbol structural map).
+- **Git & Worktree Operations**: `git_operation` (`status`, `diff`, `log`, `branch`, `stage`, `unstage`, `commit`, `worktree_list`, `worktree_add`).
+- **Background Process & Dev-Server Manager**: `manage_process` (`start`, `status`, `output`, `stop`, `list`) for asynchronous watchers, servers, and builds.
+- **Autonomous MCP Server Creation & Self-Improvement**:
+  - `scaffold_mcp_server`: The agent can write, register, and hot-connect new local Node.js stdio MCP servers on the fly without restarting.
+  - `self_improve`: Introspects task telemetry and tool errors to synthesize reusable Skills and Functions into the local Capability Library.
+- **Sub-Agents, Memory & Web**:
+  - `delegate_subagent`: Spawns an isolated sub-agent loop with its own clean context window and returns a compact synthesis.
+  - `todo_write` / `todo_read`: Live multi-step task checklist rendered in real time in the chat header.
+  - `memory_store`: Persistent global and project-scoped memories across sessions, plus automatic discovery of `NEXUS.md`, `CLAUDE.md`, `AGENTS.md`, and `.cursorrules`.
+  - `web_fetch`, OpenAPI 3.0/3.1 importer, REST connectors with `Idempotency-Key` reconciliation, and native Windows desktop control (`desktop_screenshot`, `desktop_action`).
+
+### 4. Modern Studio UI/UX (Light & Dark Themes)
+- **Light (`Studio Paper`)** and **Dark (`Obsidian Carbon`)** themes with comfortable/compact density and reduced-motion accessibility.
+- **Files & Git Studio**: Interactive file browser, live Git working-tree inspector, syntax-highlighted unified diff viewer, 1-click stage/unstage/commit, integrated PowerShell Quick Terminal, and Background Process Monitor.
+- **Context, Cache & Spend Inspector**: Inspect token budgets per context section, cache hit rates, provider routes, and pre-compaction checkpoints with zero API calls.
+
+---
+
+## Quick Start (Single-Click Portable `.exe` or From Source)
+
+### Option A: Single-Click Portable Executable (Windows)
+Download **`NEXUS-Portable.exe`** from the [**GitHub Releases**](https://github.com/Ezequiel24123z/Nexus/releases) page and double-click it—no installation required.
+
+### Option B: Run or Build from Source
+Requirements: Windows, Git, and **Node.js 24.12.0** (`.node-version`).
 
 ```powershell
 git clone https://github.com/Ezequiel24123z/Nexus.git
@@ -19,47 +63,29 @@ npm run build
 npm start
 ```
 
-Configura la clave de OpenRouter o Arli.ai dentro de NEXUS. Copilot sirve para desarrollar el programa; su suscripción no proporciona las credenciales de inferencia de NEXUS.
-
-Después de cambiar la interfaz, ejecuta `npm run build` antes de abrirla: `npm start` carga `desktop/ui/`, generado por ese comando. `Abrir NEXUS.cmd` también necesita las dependencias y la interfaz compilada.
-
-## Documentación
-
-| Documento | Contenido |
-| --- | --- |
-| [VM y Copilot](docs/VM-Y-COPILOT.md) | Instalación, claves, ramas y primer encargo sugerido |
-| [Arquitectura](docs/ARQUITECTURA.md) | Mapa de módulos y reglas de continuidad |
-| [Estado y próximos pasos](docs/ESTADO-Y-ROADMAP.md) | Funciones actuales, límites y trabajo pendiente |
-| [Validación de la entrega](docs/VALIDACION.md) | Comprobaciones actuales y sus límites |
-| [Procedencia](docs/PROCEDENCIA.md) | Origen de esta instantánea y exclusiones |
-| [Manual Desktop](desktop/README.md) | Uso detallado y persistencia |
-| [Investigación](docs/INVESTIGACION.md) | Índice de planes, auditorías y verificaciones históricas |
-| [Instrucciones de Copilot](.github/copilot-instructions.md) | Contexto permanente del repositorio |
-
-## Dos aplicaciones independientes
-
-- `desktop/`: aplicación Windows, motor, interfaz, pruebas e investigación.
-- `app/`, `lib/`, `db/`, `components/`: prototipo web con Vinext/React, Cloudflare Workers y D1. No comparte el motor completo de Desktop.
-- `docs/`: guías de incorporación y entrega.
-- `.github/`: instrucciones de Copilot y validación automática de Desktop.
-
-Los dos `package.json` son independientes. Para Desktop instala y ejecuta los comandos **dentro de `desktop/`**; no necesitas las dependencias de la raíz.
-
-El prototipo web conserva su configuración en [WEB-STARTER.md](docs/WEB-STARTER.md). Sus comandos, desde la raíz, son `npm ci`, `npm run build` y `npm run dev`. Compilar no configura secretos, autenticación ni bases de datos de un despliegue. Las APIs web usan bindings de Cloudflare y claves de servidor, no el vault de Desktop.
-
-## Datos y credenciales
-
-Esta entrega contiene código y documentación. Se excluyen chats, adjuntos, vaults, bases de datos reales, copias de recuperación, dependencias y resultados generados. Los secretos de Desktop se guardan mediante Electron `safeStorage` en el perfil local; hay que introducirlos de nuevo en otro equipo.
-
-Para abrir una sesión de desarrollo aislada en PowerShell, antes de `npm start`:
+To build the standalone single-click portable `.exe` yourself:
 
 ```powershell
-$env:NEXUS_TEST_DATA = Join-Path $env:TEMP ('nexus-dev-' + [guid]::NewGuid())
-npm start
+cd desktop
+npm run dist:portable
 ```
 
-`NEXUS_TEST_DATA` impide importar automáticamente perfiles anteriores. `NEXUS_DATA_DIR` cambia el directorio normal de datos, pero no desactiva esa importación.
+This generates `desktop/release/NEXUS-Portable.exe`.
 
-`npm test` usa datos sintéticos y no necesita claves de inferencia. Los comandos `test:live*` pueden consumir saldo y quedan fuera de la validación normal. El control de escritorio requiere Windows.
+---
 
-Se conservan los avisos de licencia de terceros incluidos. Esta exportación no añade una licencia general para el código propio.
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Architecture](docs/ARQUITECTURA.md) | Module map, runtime data flow, and durability invariants |
+| [Status & Roadmap](docs/ESTADO-Y-ROADMAP.md) | Implemented capabilities and upcoming milestones |
+| [Validation](docs/VALIDACION.md) | Automated unit tests, Electron UI smoke suite, and packaging checks |
+| [Desktop Manual](desktop/README.md) | Detailed guide to providers, tools, storage, and recovery |
+| [Agent Instructions](AGENTS.md) | Development and verification workflow for coding agents |
+
+---
+
+## Security & Local Privacy
+- **Encrypted Local Vault**: API keys and tokens are encrypted on disk using Windows DPAPI (`Electron safeStorage`) with automatic rotating backups. Secrets never enter model prompts or renderer snapshots.
+- **Durable Continuity**: Conversations, JSONL journals, effect ledgers (`intended → dispatched → observed / uncertain`), and compaction checkpoints are stored locally in JSON or incremental SQLite (`node:sqlite`).

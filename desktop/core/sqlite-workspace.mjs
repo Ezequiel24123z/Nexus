@@ -12,18 +12,16 @@ function encodeTask(task){
  const data={},sizes={},items={};
  for(const [key,value] of Object.entries(task)){
    if(transient.has(key))continue;
-   if(collections.includes(key)&&Array.isArray(value)){sizes[key]=value.length;items[key]=value.map(item=>{const text=JSON.stringify(item);if(text===undefined)throw new Error('Registro de historial no válido.');return text;});}
+   if(collections.includes(key)&&Array.isArray(value)){sizes[key]=value.length;items[key]=value.map(item=>{const text=JSON.stringify(item);if(text===undefined)throw new Error('Invalid history record.');return text;});}
    else data[key]=value;
  }
  return {meta:JSON.stringify({data,sizes}),items};
 }
 
-// Synchronous compatibility adapter. Small transactional writes replace complete
-// JSON rewrites; loading/paging from disk and moving I/O to a worker remain separate work.
 export class SqliteWorkspace {
  constructor(filename,{create=false,readOnly=false}={}){
-   if(create&&readOnly)throw new Error('No se puede crear una copia en modo sólo lectura.');
-   if(!create&&!fs.existsSync(filename))throw new Error('Falta el almacén SQLite. No se ha vuelto al historial antiguo.');
+   if(create&&readOnly)throw new Error('Cannot create a database in read-only mode.');
+   if(!create&&!fs.existsSync(filename))throw new Error('SQLite store is missing. Did not fall back to stale legacy history.');
    const {DatabaseSync}=require('node:sqlite');this.filename=filename;this.readOnly=readOnly;this.db=new DatabaseSync(filename,{timeout:3000,readOnly,defensive:true});
    try{
      this.db.exec(readOnly?'PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;':'PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
@@ -31,8 +29,8 @@ export class SqliteWorkspace {
        CREATE TABLE tasks(id TEXT PRIMARY KEY,data TEXT NOT NULL);
        CREATE TABLE entries(task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,collection TEXT NOT NULL,ordinal INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(task_id,collection,ordinal));
        PRAGMA user_version=1;`);}
-     if(this.db.prepare('PRAGMA user_version').get().user_version!==1)throw new Error('Versión de almacenamiento SQLite no compatible.');
-     if(this.db.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('El almacén SQLite necesita recuperación.');
+     if(this.db.prepare('PRAGMA user_version').get().user_version!==1)throw new Error('Unsupported SQLite storage version.');
+     if(this.db.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw new Error('SQLite store requires recovery.');
      this.cache=new Map();this.root=null;this.revision=0;this.lastSave=null;
      if(readOnly)return;
      this.putMeta=this.db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
@@ -47,28 +45,28 @@ export class SqliteWorkspace {
    catch(error){this.db.exec('ROLLBACK');throw error;}
  }
  readSnapshot(){
-   const root=this.db.prepare("SELECT value FROM meta WHERE key='root'").get();if(!root)throw new Error('Migración SQLite incompleta; no hay raíz confirmada.');
-   const data=JSON.parse(root.value);if(!Array.isArray(data.tasks)||new Set(data.tasks).size!==data.tasks.length)throw new Error('Índice de tareas no válido.');
+   const root=this.db.prepare("SELECT value FROM meta WHERE key='root'").get();if(!root)throw new Error('Incomplete SQLite migration; no committed root record.');
+   const data=JSON.parse(root.value);if(!Array.isArray(data.tasks)||new Set(data.tasks).size!==data.tasks.length)throw new Error('Invalid task index.');
    const tasks=new Map(),cache=new Map();
    for(const row of this.db.prepare('SELECT id,data FROM tasks').all()){
-     const item=JSON.parse(row.data);if(item.data?.id!==row.id||!item.sizes)throw new Error('Metadatos de tarea no válidos.');
+     const item=JSON.parse(row.data);if(item.data?.id!==row.id||!item.sizes)throw new Error('Invalid task metadata.');
      const task=item.data,raw={meta:row.data,items:{}};
-     for(const [name,length] of Object.entries(item.sizes)){if(!collections.includes(name)||!Number.isSafeInteger(length)||length<0)throw new Error('Colección no válida.');task[name]=[];raw.items[name]=[];}
+     for(const [name,length] of Object.entries(item.sizes)){if(!collections.includes(name)||!Number.isSafeInteger(length)||length<0)throw new Error('Invalid collection.');task[name]=[];raw.items[name]=[];}
      tasks.set(row.id,{task,sizes:item.sizes});cache.set(row.id,raw);
    }
    for(const row of this.db.prepare('SELECT task_id,collection,ordinal,data FROM entries ORDER BY task_id,collection,ordinal').all()){
-     const item=tasks.get(row.task_id),array=item?.task[row.collection];if(!collections.includes(row.collection)||!Array.isArray(array)||row.ordinal!==array.length||row.ordinal>=item.sizes[row.collection])throw new Error('Historial SQLite incompleto o no contiguo.');
+     const item=tasks.get(row.task_id),array=item?.task[row.collection];if(!collections.includes(row.collection)||!Array.isArray(array)||row.ordinal!==array.length||row.ordinal>=item.sizes[row.collection])throw new Error('Incomplete or non-contiguous SQLite history.');
      array.push(JSON.parse(row.data));cache.get(row.task_id).items[row.collection].push(row.data);
    }
-   if(tasks.size!==data.tasks.length||data.tasks.some(id=>!tasks.has(id)))throw new Error('Índice e historial no coinciden.');
-   for(const {task,sizes} of tasks.values())for(const [name,length] of Object.entries(sizes))if(task[name].length!==length)throw new Error('Faltan registros del historial.');
+   if(tasks.size!==data.tasks.length||data.tasks.some(id=>!tasks.has(id)))throw new Error('Task index and history do not match.');
+   for(const {task,sizes} of tasks.values())for(const [name,length] of Object.entries(sizes))if(task[name].length!==length)throw new Error('Missing history records.');
    this.root=root.value;this.cache=cache;this.revision=Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()?.value||0);
    return {...data,tasks:data.tasks.map(id=>tasks.get(id).task)};
  }
  save(state,focus=undefined){
-   if(this.readOnly)throw new Error('La copia está abierta en modo sólo lectura.');
+   if(this.readOnly)throw new Error('The database is opened in read-only mode.');
    const started=performance.now(),root=JSON.stringify({...state,tasks:state.tasks.map(task=>task.id)}),ids=new Set(state.tasks.map(task=>task.id));
-   if(ids.size!==state.tasks.length||state.tasks.some(task=>typeof task.id!=='string'||!task.id))throw new Error('Identificadores de tarea no válidos.');
+   if(ids.size!==state.tasks.length||state.tasks.some(task=>typeof task.id!=='string'||!task.id))throw new Error('Invalid task identifiers.');
    const target=focus?.id??focus;
    const changed=new Map(),writes=[],removed=[...this.cache.keys()].filter(id=>!ids.has(id));let encodedBytes=0,scannedTasks=0;
    for(const task of state.tasks){
@@ -88,7 +86,7 @@ export class SqliteWorkspace {
    this.db.exec('BEGIN IMMEDIATE');
    try{
      const revision=Number(this.db.prepare("SELECT value FROM meta WHERE key='revision'").get()?.value||0);
-     if(revision!==this.revision)throw new Error('El almacén cambió desde otro proceso. Cierra y vuelve a abrir NEXUS antes de guardar.');
+     if(revision!==this.revision)throw new Error('The store changed from another process. Close and reopen NEXUS before saving.');
      for(const id of removed)this.db.prepare('DELETE FROM tasks WHERE id=?').run(id);
      for(const [kind,...args] of writes){if(kind==='task')this.putTask.run(...args);else if(kind==='entry')this.putEntry.run(...args);else this.trim.run(...args);}
      if(rootChanged)this.putMeta.run('root',root);

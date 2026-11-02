@@ -4,34 +4,34 @@ import {StdioClientTransport,getDefaultEnvironment} from '@modelcontextprotocol/
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 export function validateServer(server){
- if(!server || !/^[\w -]{1,80}$/.test(server.name))throw new Error('Nombre MCP no válido');
- if(!['stdio','http'].includes(server.transport))throw new Error('Transporte no válido');
- if(server.envSecrets && (typeof server.envSecrets!=='object'||Array.isArray(server.envSecrets)))throw new Error('Las variables deben ser un objeto JSON');
+ if(!server || !/^[\w -]{1,80}$/.test(server.name))throw new Error('Invalid MCP server name');
+ if(!['stdio','http'].includes(server.transport))throw new Error('Invalid MCP transport');
+ if(server.envSecrets && (typeof server.envSecrets!=='object'||Array.isArray(server.envSecrets)))throw new Error('Environment secrets must be a JSON object');
  if(server.transport==='stdio'){
-  if(typeof server.command!=='string'||!server.command.trim())throw new Error('Falta el ejecutable MCP');
-  if(!Array.isArray(server.args)||server.args.some(a=>typeof a!=='string'))throw new Error('Los argumentos deben ser una lista JSON de textos');
+  if(typeof server.command!=='string'||!server.command.trim())throw new Error('Missing MCP executable command');
+  if(!Array.isArray(server.args)||server.args.some(a=>typeof a!=='string'))throw new Error('Arguments must be a JSON array of strings');
  }else{
   const url=new URL(server.url);
-  if(url.username||url.password||!(url.protocol==='https:'||url.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('MCP remoto requiere HTTPS; HTTP solo en localhost');
+  if(url.username||url.password||!(url.protocol==='https:'||url.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('Remote MCP requires HTTPS; HTTP is only allowed on localhost');
  }
- for(const reference of [...Object.values(server.envSecrets||{}),server.secretRef].filter(Boolean))if(typeof reference!=='string'||!/^CONNECTOR_[A-Z0-9_]+$/.test(reference))throw new Error('Utiliza referencias CONNECTOR_ para las credenciales');
+ for(const reference of [...Object.values(server.envSecrets||{}),server.secretRef].filter(Boolean))if(typeof reference!=='string'||!/^CONNECTOR_[A-Z0-9_]+$/.test(reference))throw new Error('Use CONNECTOR_ secret references for credentials');
 }
 export class McpManager extends EventEmitter{
  constructor(store,getSecret){super();this.store=store;this.getSecret=getSecret;this.sessions=new Map();this.pending=new Map();this.statuses=new Map();this.closed=false;}
  status({compact=false}={}){return Object.fromEntries([...this.statuses].map(([name,status])=>[name,compact?{...status,tools:(status.tools||[]).slice(0,20).map(tool=>({name:tool.name,description:String(tool.description||'').slice(0,600)})),toolCount:status.tools?.length||0}:status]));}
  mark(name,data){this.statuses.set(name,data);this.emit('change');}
  async connect(name){
-  if(this.closed)throw new Error('MCP cerrado');
+  if(this.closed)throw new Error('MCP manager closed');
   if(this.sessions.has(name))return this.sessions.get(name);
   if(this.pending.has(name))return this.pending.get(name);
   const operation=this.open(name);this.pending.set(name,operation);
   try{return await operation;}finally{this.pending.delete(name);}
  }
  async open(name){
-  const server=this.store.state.mcpServers.find(s=>s.name===name);if(!server)throw new Error('Servidor MCP no encontrado');validateServer(server);
+  const server=this.store.state.mcpServers.find(s=>s.name===name);if(!server)throw new Error('MCP server not found');validateServer(server);
   this.mark(name,{status:'connecting',tools:[]});
   const client=new Client({name:'nexus-desktop',version:'0.2.0'},{capabilities:{}});
-  const secret=ref=>{const v=this.getSecret(ref);if(!v)throw new Error('Configura el secreto '+ref);return v;};
+  const secret=ref=>{const v=this.getSecret(ref);if(!v)throw new Error('Configure secret '+ref);return v;};
   try{
    let transport;
    if(server.transport==='stdio'){
@@ -40,16 +40,16 @@ export class McpManager extends EventEmitter{
     transport.stderr?.on('data',()=>{}); // Do not persist server stderr: it may contain credentials.
    }else transport=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{redirect:'error',headers:server.secretRef?{Authorization:'Bearer '+secret(server.secretRef)}:{}}});
    await client.connect(transport,{timeout:30000});
-   if(this.closed){await client.close();throw new Error('MCP cerrado');}
+   if(this.closed){await client.close();throw new Error('MCP manager closed');}
    const catalog=[];let cursor;const cursors=new Set();
-   do{const result=await client.listTools(cursor?{cursor}:{},{timeout:30000});catalog.push(...result.tools);cursor=result.nextCursor;if(cursor&&cursors.has(cursor))throw new Error('Paginación MCP inválida');if(cursor)cursors.add(cursor);}while(cursor);
+   do{const result=await client.listTools(cursor?{cursor}:{},{timeout:30000});catalog.push(...result.tools);cursor=result.nextCursor;if(cursor&&cursors.has(cursor))throw new Error('Invalid MCP pagination');if(cursor)cursors.add(cursor);}while(cursor);
    const session={client,catalog};this.sessions.set(name,session);
    client.onclose=()=>{if(this.sessions.get(name)===session){this.sessions.delete(name);this.mark(name,{status:'disconnected',tools:[]});}};
    this.mark(name,{status:'connected',tools:catalog.map(t=>({name:t.name,description:t.description}))});return session;
-  }catch(e){await client.close().catch(()=>{});this.mark(name,{status:'error',tools:[],error:'No se pudo conectar. Revisa ejecutable, argumentos, credenciales y disponibilidad.'});throw new Error('Conexión MCP fallida: '+name);}
+  }catch(e){await client.close().catch(()=>{});this.mark(name,{status:'error',tools:[],error:'Could not connect. Check executable, arguments, credentials, and server availability.'});throw new Error('MCP connection failed: '+name);}
  }
  async list(name){const session=await this.connect(name);return session.catalog;}
- async call(name,tool,args,signal){signal?.throwIfAborted();const session=await this.connect(name);signal?.throwIfAborted();if(!session.catalog.some(t=>t.name===tool))throw new Error('Herramienta no anunciada por el servidor');return session.client.callTool({name:tool,arguments:args||{}},undefined,{signal,timeout:300000});}
+ async call(name,tool,args,signal){signal?.throwIfAborted();const session=await this.connect(name);signal?.throwIfAborted();if(!session.catalog.some(t=>t.name===tool))throw new Error('Tool not advertised by MCP server');return session.client.callTool({name:tool,arguments:args||{}},undefined,{signal,timeout:300000});}
  async disconnect(name){
   // Await an in-flight handshake so removing a server cannot leave an orphan process.
   if(this.pending.has(name))await this.pending.get(name).catch(()=>{});

@@ -1,44 +1,38 @@
-# Arquitectura de NEXUS
+# NEXUS Architecture
 
-Desktop es la aplicación principal y no depende de tener la web publicada. El prototipo web se conserva en la raíz como antecedente funcional, con sus propias dependencias y almacenamiento.
+Desktop (`desktop/`) is the primary application and operates completely offline/locally except when contacting the user's configured model provider or external connectors. The root web prototype is retained as historical context with its own dependencies and storage.
 
-| Área | Archivos dentro de desktop/ | Responsabilidad |
+| Area | Files inside `desktop/` | Responsibility |
 | --- | --- | --- |
-| Proceso principal Electron | `main.cjs` | Ventanas, IPC, vault, archivos, modelos y acciones nativas |
-| Puente renderer | `preload.cjs` | Lista permitida de métodos `nexus:invoke` |
-| Interfaz | `src/main.jsx`, componentes JSX y CSS | Chats, proyectos, configuración, conectores y paneles |
-| Ejecución | `core/runtime.mjs` | Ciclo del agente, cola, dependencias, pausa y compresión |
-| Proveedores | `core/providers.mjs`, `model-request.mjs`, `provider-errors.mjs`, `stream.mjs` | Routing, payloads, errores y parsing incremental |
-| Herramientas | `core/tools.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs` | Archivos, comandos, REST, MCP, contratos y capacidades |
-| Persistencia | `core/store.mjs`, `sqlite-workspace.mjs`, `storage-migration.mjs` | JSON inicial, SQLite opcional y migración explícita |
-| Recuperación | `core/storage-recovery*.mjs`, `recovery-jobs.mjs`, `response-journal.mjs`, `migrate.mjs` | Recuperación de estado, respuestas interrumpidas y perfiles heredados |
-| Contexto y uso | `core/context-inspector.mjs`, `chat-workspace.mjs`, `telemetry.mjs`, `artifacts.mjs` | Paginación, costes, estimaciones e inspección |
-| Adjuntos/borradores | `core/attachments.mjs`, `drafts.mjs` y componentes en `src/` | Referencias locales y guardado por conversación |
-| Windows | `native/desktop.ps1` | Entrada nativa de ratón y teclado, coordinada desde Electron |
-| Pruebas Node | `tests/*.test.mjs` y `tests/fixtures/` | Respuestas simuladas, procesos reales de prueba y datos temporales |
-| Pruebas Electron | `core/*smoke.mjs` | Navegación y flujos del renderer con almacenes aislados |
+| Electron Main Process | `main.cjs` | Window lifecycle, IPC validation, DPAPI vault, files, models, Git/process actions, and native desktop control |
+| Renderer Bridge | `preload.cjs` | Explicit allowlist of `nexus:invoke` methods |
+| User Interface | `src/main.jsx`, `src/CodeGitStudio.jsx`, JSX & CSS | 100% English UI, Light/Dark themes, chats, projects, Files & Git Studio, Quick Terminal, Background Process Monitor, Memory Manager, Connectors, and MCP Builder |
+| Agent Runtime | `core/runtime.mjs` | Agent loop, operating modes (`agent`, `architect`, `explore`, `unrestricted`), sub-agent delegation, dependency queue, pause/resume, and context compaction |
+| Agentic Coding Engine | `core/coding-engine.mjs` | Line-range file reader, `multi_edit`, `apply_patch`, `glob_files`, `grep_search`, `code_outline` symbol maps, Git & worktree operations, background process manager, `NEXUS.md`/`CLAUDE.md`/`AGENTS.md` auto-discovery, `web_fetch`, `scaffold_mcp_server`, `self_improve`, and slash command expansion |
+| Multi-Provider Engine | `core/providers.mjs`, `model-request.mjs`, `provider-errors.mjs`, `stream.mjs` | Routing across OpenRouter, Arli.ai, OpenAI, GitHub Copilot, Anthropic, and Custom/Local OpenAI-compatible servers; SSE parsing and retry budget |
+| Tools & Extensibility | `core/tools.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs` | 30+ built-in agentic tools, stdio/HTTP MCP client, OpenAPI 3.0/3.1 importer, and on-demand Skills/Functions catalog |
+| Persistence | `core/store.mjs`, `sqlite-workspace.mjs`, `storage-migration.mjs` | Atomic JSON store, optional incremental SQLite (`node:sqlite`), and verified storage migration |
+| Recovery | `core/storage-recovery*.mjs`, `recovery-jobs.mjs`, `response-journal.mjs`, `migrate.mjs` | Isolated backup verification/restoration, interrupted stream recovery, and legacy profile migration |
+| Observability & Cost | `core/context-inspector.mjs`, `chat-workspace.mjs`, `telemetry.mjs`, `artifacts.mjs` | Paged history, USD cost accounting, cache hit metrics, and bounded local artifacts |
+| Attachments & Drafts | `core/attachments.mjs`, `drafts.mjs`, `src/Attachments.jsx` | Local attachment descriptors (zero base64 inflation in state) and per-chat draft persistence |
+| Windows Native | `native/desktop.ps1` | Native mouse and keyboard automation coordinated from Electron |
+| Node Unit Suite | `tests/*.test.mjs` and `tests/fixtures/` | Synthetic provider responses, real stdio child processes, and temporary stores |
+| Electron Smoke Suite | `core/*smoke.mjs` | Offscreen real-Electron UI, accessibility, layout, and IPC verification |
 
-Los nombres abreviados de módulos de motor de la tabla están bajo `desktop/core/`. El prototipo web usa `app/api/`, `lib/runtime.ts`, `db/` y `app/page.tsx`.
+## Primary Execution Flow
 
-## Flujo principal
+1. The renderer invokes an allowlisted operation via `preload.cjs`; the main process validates origin, frame, and arguments.
+2. `Runtime` expands slash commands (`/init`, `/review`, `/architect`, `/mcp-create`, `/self-improve`), assembles typed context sections (global instructions, project instructions, auto-discovered `NEXUS.md`/`CLAUDE.md`/`AGENTS.md`, persistent memories, active todo checklist, pinned messages, and compacted continuity), and filters tools according to the active Operating Mode.
+3. `modelConnection(model)` resolves the provider from the namespaced model ID (`arliai/*`, `openai/*`, `copilot/*`, `anthropic/*`, `custom/*`, or OpenRouter default).
+4. The SSE parser streams text, reasoning summaries, token/cost usage, and tool calls without executing partial tool arguments on interrupted streams.
+5. External side effects (`write_file`, `multi_edit`, `apply_patch`, `run_command`, `git_operation`, `manage_process`, `invoke_mcp`, `invoke_connector`, `scaffold_mcp_server`) are tracked in the durable effect ledger (`intended → dispatched → observed / uncertain`).
+6. Large tool outputs are materialized as local hash-verified artifacts and read in bounded slices via `read_artifact`.
 
-1. El renderer solicita una operación por preload; el proceso principal valida métodos y argumentos.
-2. El runtime aplica instrucciones, construye contexto y ofrece herramientas al modelo.
-3. El ID determina el proveedor: `arliai/<id>` selecciona Arli.ai y retira el prefijo en la petición; los demás IDs siguen OpenRouter.
-4. El parser recibe texto, uso y llamadas de herramientas. No ejecuta argumentos parciales de un stream interrumpido.
-5. Se conservan conversación, diario, efectos y telemetría; los resultados extensos pueden almacenarse como artefactos consultables por fragmentos.
-6. La UI recibe historial paginado del chat visible y metadatos de navegación de los demás.
+## Core Invariants
 
-## Invariantes
-
-- Conservar originales y checkpoints al comprimir. El reasoning literal no se reenvía en cada paso.
-- No reintentar automáticamente generaciones con salida previa ni repetir herramientas incompletas.
-- Al reiniciar, pausar tareas interrumpidas y conciliar efectos externos no confirmados.
-- Coste desconocido no significa cero. Contexto estimado y tokens acumulados son métricas distintas.
-- Conservar adjuntos como referencias locales, sin base64 permanente dentro del historial.
-- Después de activar SQLite, el JSON anterior queda congelado y no es un fallback actualizado.
-- Probar SQLite con un runtime compatible con `node:sqlite`: esta entrega usa Node 24.12.0 y Electron fijado en el lockfile.
-
-Mantener ESM `.mjs` en el motor y CommonJS `.cjs` en los puntos de entrada de Electron. Vite compila JSX a `ui/`. No existe script de lint de Desktop; el lint de la raíz pertenece a la web.
-
-Las utilidades de vault y pruebas con proveedor real no forman parte del flujo normal ni de CI. `npm run package` genera un directorio Windows con electron-builder; no produce por sí mismo un instalador firmado ni un actualizador.
+- Preserve original messages and checkpoints on compaction; never resend hidden literal reasoning across turns.
+- Never automatically retry a generation after visible output has been emitted, and never replay incomplete tool calls.
+- On restart, pause formerly running tasks and mark unfinished external side effects as `uncertain` for evidence-based reconciliation.
+- Unknown cost (`null`) is never conflated with `$0.00`. Estimated context tokens and cumulative usage tokens are tracked separately.
+- Keep binary/image attachments on disk as local descriptors; hydrate base64 only at the outbound network boundary.
+- Keep `desktop/core/*.mjs` in ESM and `main.cjs` / `preload.cjs` in CommonJS. Vite compiles JSX into `desktop/ui/`. `npm run dist:portable` packages a standalone click-to-run Windows `.exe` (`NEXUS-Portable.exe`).

@@ -1,4 +1,4 @@
-name: Desktop checks
+name: Desktop CI & Portable Release
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
       - 'desktop/**'
       - '.github/workflows/desktop.yml'
       - '.node-version'
+    tags:
+      - 'v*'
   pull_request:
     paths:
       - 'desktop/**'
@@ -14,12 +16,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   desktop:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: desktop
@@ -32,4 +34,14 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - run: npm ci --no-audit --no-fund
       - run: npm test
-      - run: npm run build
+      - run: npm run dist:portable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-Portable-Windows
+          path: desktop/release/NEXUS-Portable.exe
+      - name: Publish GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" release/NEXUS-Portable.exe --clobber || gh release create "${{ github.ref_name }}" release/NEXUS-Portable.exe --title "NEXUS ${{ github.ref_name }}" --generate-notes

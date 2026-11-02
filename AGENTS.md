@@ -1,9 +1,7 @@
-# Desarrollo de NEXUS
+# NEXUS Development Guide
 
-Lee `.github/copilot-instructions.md` para el mapa y las invariantes. La aplicación principal está en `desktop/`; la raíz tiene otro paquete para el prototipo web.
+Read `.github/copilot-instructions.md` for the module map and core invariants. The primary application lives in `desktop/` (Electron + React 19 + Vite + Node ESM engine). The root directory contains an earlier standalone web prototype.
 
-Usa Node 24.12.0. Para Desktop: `cd desktop`, `npm ci`, `npm test`, `npm run build`. `npm start` carga la interfaz compilada. Para abrirla sin tocar perfiles anteriores usa `NEXUS_TEST_DATA` con una ruta temporal nueva.
+Use Node 24.12.0. For Desktop: `cd desktop`, `npm ci`, `npm test`, `npm run build`. `npm start` loads the compiled UI from `desktop/ui/`. To launch an isolated development profile without importing legacy data, set `NEXUS_TEST_DATA` to a fresh temporary directory.
 
-No ejecutes pruebas de inferencia de pago ni utilidades de vault en tareas rutinarias. No publiques perfiles, chats, secretos o recuperaciones. Conserva continuidad, originales/checkpoints, efectos externos y costes desconocidos según las instrucciones de Copilot.
-
-Consulta `docs/ESTADO-Y-ROADMAP.md` y distingue implementación de validación. No cambies ambas aplicaciones a la vez salvo que el encargo lo requiera.
+All UI strings, tool schemas, system prompts, and documentation must remain in English. Preserve continuity checkpoints, external effect reconciliation, and unknown-cost accounting invariants.

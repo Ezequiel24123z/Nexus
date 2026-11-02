@@ -86,7 +86,7 @@ test('Arli never falls back to a saved OpenRouter key and credential status foll
  let requested=false;
  const {store,runtime}=await fixture(t,name=>name==='OPENROUTER_API_KEY'?'router-key':null,async()=>{requested=true;});
  store.state.settings.model=arliModel;const id=runtime.create({prompt:'Test'});
- await assert.rejects(runtime.completion([],store.task(id),new AbortController().signal),/clave de Arli.ai/);
+ await assert.rejects(runtime.completion([],store.task(id),new AbortController().signal),/Arli\.ai API key/);
  assert.equal(requested,false);assert.equal(runtime.snapshot().hasKey,false);assert.equal(runtime.snapshot().providerKeys.openrouter,true);
 });
 
@@ -114,7 +114,7 @@ test('persistent fetch failures stop after one retry with a readable and sanitiz
  const {runtime,store}=await fixture(t,()=> 'private-test-key',async()=>{calls++;throw new TypeError('fetch failed',{cause:Object.assign(new Error('private-test-key'),{code:'UND_ERR_SOCKET'})});});
  store.state.settings.model=arliModel;const task=store.task(runtime.create({prompt:'Test'}));
  await assert.rejects(runtime.completion([],task,new AbortController().signal),error=>{
-  assert.match(error.message,/No se pudo conectar con Arli.ai/);assert.match(error.message,/mensaje se conserva/);
+  assert.match(error.message,/Could not connect to Arli\.ai/);assert.match(error.message,/message is preserved/);
   assert.ok(!error.message.includes('private-test-key'));assert.ok(!error.message.includes('fetch failed'));return true;
  });
  assert.equal(calls,2);assert.equal(task.calls.length,2);
@@ -124,9 +124,9 @@ test('HTTP 503 retries once while invalid credentials fail without retry',async 
  let calls=0;
  const {runtime,store}=await fixture(t,()=> 'key',async()=>{calls++;return new Response('provider private body',{status:503});});
  store.state.settings.model=arliModel;const task=store.task(runtime.create({prompt:'Test'}));
- await assert.rejects(runtime.completion([],task,new AbortController().signal),/HTTP 503.*temporalmente/);assert.equal(calls,2);
+ await assert.rejects(runtime.completion([],task,new AbortController().signal),/HTTP 503.*temporarily/);assert.equal(calls,2);
  calls=0;runtime.request=async()=>{calls++;return new Response('provider private body',{status:401});};
- await assert.rejects(runtime.completion([],task,new AbortController().signal),/clave no fue aceptada/);assert.equal(calls,1);
+ await assert.rejects(runtime.completion([],task,new AbortController().signal),/key or token was rejected/);assert.equal(calls,1);
 });
 
 test('a broken stream after visible output is preserved without replaying the request',async t=>{
@@ -140,7 +140,7 @@ test('a broken stream after visible output is preserved without replaying the re
   return new Response(body,{headers:{'content-type':'text/event-stream'}});
  });
  store.state.settings.model=arliModel;const task=store.task(runtime.create({prompt:'Test'}));
- await assert.rejects(runtime.completion([],task,new AbortController().signal),/No se pudo conectar/);
+ await assert.rejects(runtime.completion([],task,new AbortController().signal),/Could not connect/);
  assert.equal(calls,1);assert.match(task.conversation.at(-1).content,/Partial preserved/);
 });
 
@@ -149,6 +149,6 @@ test('certificate failures are explained and never retried or bypassed',async t=
  const error=new TypeError('fetch failed',{cause:Object.assign(new Error('certificate details'),{code:'CERT_HAS_EXPIRED'})});
  const {runtime,store}=await fixture(t,()=> 'key',async()=>{calls++;throw error;});
  store.state.settings.model=arliModel;const task=store.task(runtime.create({prompt:'Test'}));
- await assert.rejects(runtime.completion([],task,new AbortController().signal),/verificar el certificado/);assert.equal(calls,1);
+ await assert.rejects(runtime.completion([],task,new AbortController().signal),/verify the service TLS certificate/);assert.equal(calls,1);
  assert.ok(!networkFailure(error,'Arli.ai').message.includes('certificate details'));
 });

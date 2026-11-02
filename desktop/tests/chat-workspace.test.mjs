@@ -22,7 +22,7 @@ test('search includes old messages, literal symbols, pagination and no reasoning
 test('message windows are bounded and can reach both ends without silently dropping ranges',()=>{
  const task={conversation:Array.from({length:1000},(_,i)=>({id:String(i),content:'message'}))};
  const page=conversationWindow(task,'20');assert.equal(page.start,0);assert.equal(page.end,120);assert.equal(page.total,1000);assert.equal(page.items[20].id,'20');
- const tail=conversationWindow(task,'999');assert.equal(tail.end,1000);assert.equal(tail.items.at(-1).id,'999');assert.throws(()=>conversationWindow(task,'missing'),/encontrado/);
+ const tail=conversationWindow(task,'999');assert.equal(tail.end,1000);assert.equal(tail.items.at(-1).id,'999');assert.throws(()=>conversationWindow(task,'missing'),/not found/);
 });
 test('result index includes only recorded changes, durable outputs and valid source origins',()=>{
  const task={conversation:[{id:'m',sources:[{url:'https://example.com',title:'Fuente'},{url:'file:///secret'},{url:'https://user:pass@example.com'}]}],events:[{id:'attempt',kind:'write_intent',detail:{path:'not-written'}},{id:'e1',kind:'file_change',detail:{path:'a.txt',reason:'first'}},{id:'e2',kind:'file_change',detail:{path:'a.txt',reason:'last'}},{id:'p',kind:'progress',detail:{verification:'not independently verified'}}]};
@@ -30,8 +30,8 @@ test('result index includes only recorded changes, durable outputs and valid sou
 });
 test('result previews use recorded ids, stay bounded and do not treat binaries as text',async t=>{
  const {store,runtime,task,directory}=await setup(t);await executeTool(runtime,task,'write_file',{path:'result.txt',content:'contenido '.repeat(3000),reason:'test'},new AbortController().signal);
- const item=taskResults(task).items[0];const preview=await previewTaskResult(store,task,item.id);assert.ok(Buffer.byteLength(preview.content)<=12000);assert.match(preview.note,/parcial/);
- await assert.rejects(previewTaskResult(store,task,'../workspace.json'),/encontrado/);
+ const item=taskResults(task).items[0];const preview=await previewTaskResult(store,task,item.id);assert.ok(Buffer.byteLength(preview.content)<=12000);assert.match(preview.note,/partial/);
+ await assert.rejects(previewTaskResult(store,task,'../workspace.json'),/not found/);
  await fs.writeFile(path.join(directory,'result.txt'),Buffer.from([0,1,2]));assert.equal((await previewTaskResult(store,task,item.id)).content,undefined);
  const a=await materializeToolResult(store,task,'run_command',{text:'x'.repeat(15000)});const event=store.journal(task,'tool_result',{name:'run_command',result:a.journal});assert.equal((await previewTaskResult(store,task,event.id)).content.length,12000);
 });
@@ -45,8 +45,8 @@ test('invalid chat updates are atomic and active calls cannot change model or re
  const {runtime,task}=await setup(t);const original=task.model;
  assert.throws(()=>runtime.updateChat({id:task.id,model:'changed',reasoningEffort:'invented'}));assert.equal(task.model,original);
  assert.throws(()=>runtime.updateChat({id:task.id,model:'changed',projectId:'missing'}));assert.equal(task.model,original);
- runtime.active.set(task.id,new AbortController());assert.throws(()=>runtime.updateChat({id:task.id,reasoningEffort:'high'}),/Pausa/);assert.equal(task.reasoningEffort,undefined);runtime.active.clear();
- runtime.compacting.add(task.id);assert.throws(()=>runtime.updateChat({id:task.id,model:'changed'}),/Pausa/);runtime.compacting.clear();
+ runtime.active.set(task.id,new AbortController());assert.throws(()=>runtime.updateChat({id:task.id,reasoningEffort:'high'}),/Pause/);assert.equal(task.reasoningEffort,undefined);runtime.active.clear();
+ runtime.compacting.add(task.id);assert.throws(()=>runtime.updateChat({id:task.id,model:'changed'}),/Pause/);runtime.compacting.clear();
 });
 test('per-chat thinking and provider preferences reach provider payload; compression effort stays explicit',async t=>{
  const {runtime,task,store}=await setup(t);store.state.settings.streaming=false;

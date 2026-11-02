@@ -18,3 +18,66 @@ html[data-motion=reduced] *,html[data-motion=reduced] *::before,html[data-motion
 .sidebar{overflow:hidden}.sidebar>nav,.sidebar>.brand,.sidebar>.nav-item,.sidebar>.search,.sidebar-footer{flex-shrink:0}.sidebar-library{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.sidebar-library .recent-tasks{min-height:0;overflow:visible;flex:initial}.settings-grid{align-items:start}
 .capability-page .subtitle{margin-bottom:18px}.library-overview>div,.library-overview>button{position:relative;padding:15px}.library-overview strong{font-size:22px}.library-overview svg{position:absolute;right:14px;top:17px}.library-overview span{padding-right:4px;line-height:1.5}.library-explainer{margin-bottom:18px}
 @media(max-width:1250px){.library-overview{grid-template-columns:repeat(4,minmax(0,1fr))}.library-overview>:nth-child(2){border-right:1px solid var(--line)}.library-overview>:nth-child(-n+2){border-bottom:0}.library-overview span{font-size:10px}.library-overview>div,.library-overview>button{padding:12px}.library-overview svg{width:15px;right:10px;top:16px}}
+
+/* Agent Mode Pills, Todo Tracker, Code & Git Studio, and Dark Theme */
+.composer-controls-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.mode-pills{display:inline-flex;gap:4px;padding:3px;background:#f2f3ef;border:1px solid var(--line);border-radius:11px}
+.mode-pill{font-size:11px;padding:4px 10px;border-radius:8px;color:#62685f;gap:5px}
+.mode-pill.active{background:#fff;color:#1f241d;font-weight:600;box-shadow:0 1px 4px #00000010}
+.mode-pill.unrestricted.active{background:#32231c;color:#f9d7c0}
+.slash-hints{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap}
+.slash-chip{padding:1px 6px;font-size:10px;border-radius:5px;border:1px solid var(--line);color:#666}
+.slash-chip:hover{background:#ececea;color:#111}
+
+.todo-tracker{margin:0 30px;padding:10px 16px;border-bottom:1px solid var(--line);background:#fafbf8;font-size:12px}
+.todo-tracker summary{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.todo-tracker progress{width:140px;height:6px;accent-color:#3a7d5c}
+.todo-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;margin-top:10px}
+.todo-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.todo-item span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.todo-item.completed{opacity:.7;color:#3d7357}
+.todo-item.in_progress{border-color:#88b39b;background:#f3f9f5}
+
+.studio-panel{margin-top:22px}
+.studio-header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.git-branch-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:5px 11px;border-radius:16px;background:#eff4ec;color:#3d5838;border:1px solid #d6e2cf}
+.studio-git-grid{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;min-height:360px}
+.studio-git-sidebar{display:flex;flex-direction:column;gap:10px;min-width:0}
+.git-file-list{border:1px solid var(--line);border-radius:10px;max-height:240px;overflow:auto;padding:6px;background:#fafbf9}
+.git-file-row{display:flex;align-items:center;justify-content:space-between;gap:6px;border-radius:7px;padding:2px 4px}
+.git-file-row.selected{background:#e9ece4}
+.git-file-btn{flex:1;justify-content:flex-start;text-align:left;font-size:12px;padding:6px 8px;min-width:0}
+.git-file-btn span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.git-badge{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:4px;font-size:10px;font-weight:700;flex-shrink:0}
+.git-badge.staged{background:#d7eee2;color:#256346}
+.git-badge.modified{background:#f7e8ce;color:#85581a}
+.git-badge.untracked{background:#e6e8ec;color:#525866}
+.git-commit-box{display:flex;gap:8px}
+.git-commits-mini{border-top:1px solid var(--line);padding-top:8px;display:grid;gap:4px}
+.git-commit-item{display:flex;align-items:center;gap:8px;font-size:11px}
+.git-commit-item span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.studio-diff-viewer{border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.diff-pre{margin:0;border:0;border-radius:0;flex:1;max-height:380px;overflow:auto;padding:12px 14px;font:12px/1.55 "Cascadia Code",Consolas,monospace}
+.diff-add{background:#e6f6ec;color:#1c5636;padding:0 4px;border-radius:3px}
+.diff-del{background:#fcebe9;color:#8c2d25;padding:0 4px;border-radius:3px}
+.diff-hunk{color:#52668a;font-weight:600;margin-top:6px}
+.terminal-history{display:grid;gap:10px;margin-top:14px;max-height:360px;overflow:auto}
+.terminal-entry{border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.terminal-entry-head{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:#f3f4f0;font-size:11px}
+.terminal-entry pre{margin:0;border:0;border-radius:0;max-height:220px}
+
+html[data-theme=dark]{color-scheme:dark;--surface:#111315;--soft:#171a1d;--line:#262b30;--ink:#eceff4;--quiet:#949ba6;--accent:#4cc38a;color:#e6e9ef;background:#0f1113}
+html[data-theme=dark] body,html[data-theme=dark] .main,html[data-theme=dark] .composer-area{background:#0f1113;color:#e6e9ef}
+html[data-theme=dark] .sidebar,html[data-theme=dark] .chat-side-panel,html[data-theme=dark] .todo-tracker{background:#14171a;border-color:#24292e}
+html[data-theme=dark] .topbar,html[data-theme=dark] .chat-toolbar{background:#0f1113f0;border-color:#22262b}
+html[data-theme=dark] .card,html[data-theme=dark] .modal,html[data-theme=dark] .composer,html[data-theme=dark] .capability-card,html[data-theme=dark] .search-result,html[data-theme=dark] .result-card,html[data-theme=dark] .inspector-section,html[data-theme=dark] .todo-item{background:#16191d;border-color:#282e34;color:#e6e9ef}
+html[data-theme=dark] input,html[data-theme=dark] textarea,html[data-theme=dark] select,html[data-theme=dark] .secondary{background:#121518;border-color:#2c3239;color:#e6e9ef}
+html[data-theme=dark] .message.user{background:#1d2228;color:#f0f3f8}
+html[data-theme=dark] .message.assistant .message-label,html[data-theme=dark] .telemetry-grid strong{color:#d8dee9}
+html[data-theme=dark] .formatted pre,html[data-theme=dark] pre,html[data-theme=dark] .formatted .code-block,html[data-theme=dark] .git-file-list{background:#121417;border-color:#262b31;color:#dce2ec}
+html[data-theme=dark] .code-actions,html[data-theme=dark] .terminal-entry-head,html[data-theme=dark] .filter-pills,html[data-theme=dark] .mode-pills,html[data-theme=dark] .settings-nav{background:#1b1f24;border-color:#2b3138}
+html[data-theme=dark] .selected,html[data-theme=dark] .nav-item.active,html[data-theme=dark] .chat-link.selected,html[data-theme=dark] button:hover,html[data-theme=dark] .filter-pills button[aria-pressed=true],html[data-theme=dark] .mode-pill.active{background:#232930;color:#fff}
+html[data-theme=dark] .send,html[data-theme=dark] .primary,html[data-theme=dark] .brand-mark{background:#3ca374;color:#08130e}
+html[data-theme=dark] .diff-add{background:#133123;color:#7ee2b0}
+html[data-theme=dark] .diff-del{background:#381919;color:#f5938c}
+@media(max-width:1000px){.studio-git-grid{grid-template-columns:1fr}}

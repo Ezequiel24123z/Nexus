@@ -27,14 +27,14 @@ export async function readCompletionStream(response,{onText=()=>{},onReasoning=(
  const parser=createParser({onEvent(event){
   if(event.data==='[DONE]'){done=true;return;}
   const chunk=JSON.parse(event.data);
-  if(chunk.error){const detail=chunk.error?.message?(' Detalle: '+String(chunk.error.message).slice(0,300)):'';throw new Error('El proveedor interrumpió la generación.'+detail+' Puedes reanudar la tarea.');}
+  if(chunk.error){const detail=chunk.error?.message?(' Detail: '+String(chunk.error.message).slice(0,300)):'';throw new Error('The provider interrupted generation.'+detail+' You can resume the task.');}
   const changedMetadata=(chunk.id&&chunk.id!==result.id)||(chunk.model&&chunk.model!==result.model);
   result.id=chunk.id||result.id;result.model=chunk.model||result.model;
   if(changedMetadata)onMetadata({id:result.id,model:result.model});
   if(chunk.usage){result.usage={...result.usage,...chunk.usage};onOutput();onUsage(chunk.usage);}
   if(chunk.openrouter_metadata)result.openrouter_metadata=chunk.openrouter_metadata;
   const choice=chunk.choices?.[0];if(!choice)return;
-  if(choice.finish_reason==='error')throw new Error('La generación terminó con un error de proveedor.');
+  if(choice.finish_reason==='error')throw new Error('Generation terminated with a provider error.');
   if(choice.finish_reason){finished=true;result.choices[0].finish_reason=choice.finish_reason;}
   const delta=choice.delta||{};
   if(delta.content || delta.tool_calls?.length || delta.reasoning_details?.length || delta.reasoning || delta.annotations?.length)onOutput();
@@ -55,8 +55,8 @@ export async function readCompletionStream(response,{onText=()=>{},onReasoning=(
  }});
  const reader=response.body.getReader(),decoder=new TextDecoder();
  try{while(!done){const {value,done:eof}=await reader.read();if(eof){parser.feed(decoder.decode());break;}onActivity();parser.feed(decoder.decode(value,{stream:true}));}}finally{await reader.cancel().catch(()=>{});}
- if(!done&&!finished)throw new Error('Conexión interrumpida antes de completar la respuesta. No se ejecutaron llamadas parciales.');
- if(calls.size){message.tool_calls=[...calls.entries()].sort((a,b)=>a[0]-b[0]).map(([,call])=>call);for(const call of message.tool_calls)if(!call.id||!call.function.name)throw new Error('Llamada de herramienta incompleta');}
+ if(!done&&!finished)throw new Error('Stream interrupted before completing the response. No partial tool calls were executed.');
+ if(calls.size){message.tool_calls=[...calls.entries()].sort((a,b)=>a[0]-b[0]).map(([,call])=>call);for(const call of message.tool_calls)if(!call.id||!call.function.name)throw new Error('Incomplete tool call in stream');}
  if(reasoning.size)message.reasoning_details=[...reasoning.values()];
  if(annotations.length)message.annotations=annotations;
  return result;

@@ -48,7 +48,7 @@ test('legacy writes after activation are detected instead of silently discarding
  const {store,open}=await setup(t);store.migrateToSqlite();store.close();await fs.appendFile(store.filename,'\n');assert.throws(()=>open(),/cambió después de migrar/);
 });
 test('missing or corrupt active database never falls back silently to stale JSON',async t=>{
- const {store,open}=await setup(t);const info=store.migrateToSqlite();store.close();await fs.rename(info.file,info.file+'.preserved');assert.throws(()=>open(),/Falta el almacén/);await fs.writeFile(info.file,'broken');assert.throws(()=>open());
+ const {store,open}=await setup(t);const info=store.migrateToSqlite();store.close();await fs.rename(info.file,info.file+'.preserved');assert.throws(()=>open(),/SQLite store is missing/);await fs.writeFile(info.file,'broken');assert.throws(()=>open());
 });
 test('SQLite backups and JSON export preserve current records independently of live database',async t=>{
  const {store,task,directory,handles}=await setup(t);store.migrateToSqlite();task.conversation.push({id:'latest',role:'assistant',content:'Contenido posterior a migración'});store.save(task);
@@ -56,7 +56,7 @@ test('SQLite backups and JSON export preserve current records independently of l
  const output=path.join(directory,'export.json');store.exportState(output);assert.equal(JSON.parse(await fs.readFile(output,'utf8')).tasks[0].conversation.at(-1).id,'latest');
 });
 test('stale independent writer is rejected before it can overwrite a committed revision',async t=>{
- const {store,task,handles}=await setup(t);const info=store.migrateToSqlite(),other=new SqliteWorkspace(info.file);handles.push(other);const stale=other.read();task.title='Nuevo título';store.save(task);stale.tasks[0].title='Viejo';assert.throws(()=>other.save(stale),/otro proceso/);assert.equal(store.backend.read().tasks[0].title,'Nuevo título');
+ const {store,task,handles}=await setup(t);const info=store.migrateToSqlite(),other=new SqliteWorkspace(info.file);handles.push(other);const stale=other.read();task.title='Nuevo título';store.save(task);stale.tasks[0].title='Viejo';assert.throws(()=>other.save(stale),/another process/);assert.equal(store.backend.read().tasks[0].title,'Nuevo título');
 });
 test('hard process termination rolls back uncommitted SQLite work and retains committed state',async t=>{
  const {store,task,directory,open}=await setup(t);store.migrateToSqlite();store.close();
@@ -72,7 +72,7 @@ test('synthetic incremental save reports payload reduction without claiming phys
 test('activation followed by an open failure freezes legacy writes until restart',async t=>{
  const {store,open}=await setup(t),read=SqliteWorkspace.prototype.read;let reads=0;
  const mock=t.mock.method(SqliteWorkspace.prototype,'read',function(){if(++reads===2)throw new Error('synthetic post-activation failure');return read.call(this);});
- assert.throws(()=>store.migrateToSqlite(),/post-activation/);assert.throws(()=>store.save(),/detenido/);store.close();mock.mock.restore();const restored=open();assert.equal(restored.storageInfo().engine,'sqlite');
+ assert.throws(()=>store.migrateToSqlite(),/post-activation/);assert.throws(()=>store.save(),/halted/);store.close();mock.mock.restore();const restored=open();assert.equal(restored.storageInfo().engine,'sqlite');
 });
 test('agent tool loop and compaction persist correctly using only the migrated backend',async t=>{
  const {store,runtime,task,open,directory}=await setup(t);store.migrateToSqlite();runtime.getSecret=()=> 'synthetic-only';let steps=0;

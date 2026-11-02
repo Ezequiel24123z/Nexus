@@ -40,14 +40,14 @@ test('isolated restoration preserves source and active data, pauses work and ver
 test('changed source cannot restore under an earlier confirmation',t=>{
  const {root,active,source,state}=setup(t),preview=inspectRecovery(source);
  state.tasks[0].title='Changed';fs.writeFileSync(source,JSON.stringify(state));
- assert.throws(()=>restoreIsolated({source,parent:root,activeDirectory:active,expectedFingerprint:preview.fingerprint}),/cambió/);
+ assert.throws(()=>restoreIsolated({source,parent:root,activeDirectory:active,expectedFingerprint:preview.fingerprint}),/changed/);
  assert.equal(fs.readdirSync(root).some(name=>name.startsWith('nexus-restored-')),false);
 });
 
 test('preview flags a frozen legacy JSON beside a SQLite marker and shows file age',t=>{
  const {root,source}=setup(t),legacy=path.join(root,'workspace.json');fs.copyFileSync(source,legacy);fs.writeFileSync(path.join(root,'storage-engine.json'),'{}');
- const preview=inspectRecovery(legacy);assert.ok(preview.warnings.some(text=>text.includes('congelado')));assert.ok(Number.isFinite(Date.parse(preview.modifiedAt)));
- assert.equal(inspectRecovery(source).warnings.some(text=>text.includes('congelado')),false);
+ const preview=inspectRecovery(legacy);assert.ok(preview.warnings.some(text=>text.includes('frozen')));assert.ok(Number.isFinite(Date.parse(preview.modifiedAt)));
+ assert.equal(inspectRecovery(source).warnings.some(text=>text.includes('frozen')),false);
 });
 
 test('invalid versions, collections, identities and dependencies are rejected before restoration',t=>{
@@ -60,8 +60,8 @@ test('invalid versions, collections, identities and dependencies are rejected be
 
 test('active directory, descendants and junction aliases are not restoration destinations',t=>{
  const {root,active}=setup(t),child=path.join(active,'child'),alias=path.join(root,'alias');fs.mkdirSync(child);
- assert.throws(()=>isolatedRecoveryParent(active,active),/fuera/);assert.throws(()=>isolatedRecoveryParent(child,active),/fuera/);
- fs.symlinkSync(active,alias,process.platform==='win32'?'junction':'dir');assert.throws(()=>isolatedRecoveryParent(alias,active),/fuera/);
+ assert.throws(()=>isolatedRecoveryParent(active,active),/outside/);assert.throws(()=>isolatedRecoveryParent(child,active),/outside/);
+ fs.symlinkSync(active,alias,process.platform==='win32'?'junction':'dir');assert.throws(()=>isolatedRecoveryParent(alias,active),/outside/);
  assert.equal(isolatedRecoveryParent(root,active),fs.realpathSync(root));
 });
 
@@ -69,7 +69,7 @@ test('SQLite inspection is read-only and includes committed WAL records',t=>{
  const {root,state,handles}=setup(t),filename=path.join(root,'copy.sqlite'),db=new SqliteWorkspace(filename,{create:true});handles.push(db);db.save(state);
  state.tasks[0].conversation.push({id:'wal-message',role:'assistant',content:'Confirmado en WAL'});db.save(state);
  const before=fs.readFileSync(filename),preview=inspectRecovery(filename);assert.equal(preview.messages,2);assert.equal(preview.format,'sqlite');assert.deepEqual(fs.readFileSync(filename),before);
- const reader=new SqliteWorkspace(filename,{readOnly:true});handles.push(reader);assert.throws(()=>reader.save(state),/sólo lectura/);assert.equal(reader.read().tasks[0].conversation.length,2);
+ const reader=new SqliteWorkspace(filename,{readOnly:true});handles.push(reader);assert.throws(()=>reader.save(state),/read-only/);assert.equal(reader.read().tasks[0].conversation.length,2);
 });
 
 test('standalone SQLite backup restores into a compatible JSON workspace',t=>{
@@ -83,10 +83,10 @@ test('standalone SQLite backup restores into a compatible JSON workspace',t=>{
 test('failed verified rename keeps a candidate but never replaces current workspace',t=>{
  const {root,source,active}=setup(t),preview=inspectRecovery(source);
  t.mock.method(fs,'renameSync',()=>{throw new Error('synthetic write failure');});
- assert.throws(()=>restoreIsolated({source,parent:root,activeDirectory:active,expectedFingerprint:preview.fingerprint}),/diagnóstico/);
+ assert.throws(()=>restoreIsolated({source,parent:root,activeDirectory:active,expectedFingerprint:preview.fingerprint}),/Diagnostic/);
  const directory=path.join(root,fs.readdirSync(root).find(name=>name.startsWith('nexus-restored-')));
  assert.equal(fs.existsSync(path.join(directory,'workspace.json')),false);assert.ok(fs.existsSync(path.join(directory,'workspace.recovery-candidate.json')));
- assert.throws(()=>new Store(directory),/recuperación incompleta/);
+ assert.throws(()=>new Store(directory),/incomplete recovery/);
  assert.ok(fs.existsSync(source));assert.equal(fs.readdirSync(active).length,0);
 });
 

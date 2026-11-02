@@ -1,40 +1,41 @@
-# NEXUS: contexto de desarrollo
+# NEXUS Development Context
 
-NEXUS es un workspace de agentes. La aplicación principal está en `desktop/`: Electron + React/JSX + Vite, motor ESM `.mjs` y entradas CommonJS `.cjs`. La raíz contiene un prototipo web independiente Vinext/Workers/D1. No mezcles comandos, secretos ni almacenamiento.
+NEXUS is an autonomous local agentic coding and personal operator workspace. The primary application lives in `desktop/`: Electron + React/JSX + Vite, ESM `.mjs` engine modules, and CommonJS `.cjs` entrypoints. The root directory contains a separate Vinext/Workers/D1 web prototype. Do not mix commands, secrets, or storage between them.
 
-Lee `docs/ARQUITECTURA.md`, `docs/ESTADO-Y-ROADMAP.md` y `docs/VALIDACION.md`. Los informes de `desktop/research/` son históricos; no asumas vigencia de catálogos, precios o disponibilidad.
+Read `docs/ARQUITECTURA.md`, `docs/ESTADO-Y-ROADMAP.md`, and `docs/VALIDACION.md`. Reports in `desktop/research/` are historical snapshots.
 
-## Instalar y verificar
+## Install, Test & Build
 
-Usa Windows y Node 24.12.0 (`.node-version`). Desde `desktop/`:
+Use Windows and Node 24.12.0 (`.node-version`). From `desktop/`:
 
 ```text
 npm ci
 npm test
 npm run build
+npm run dist:portable
 ```
 
-Después `npm start` carga la UI compilada en `ui/`. Usa `npm.cmd` si PowerShell bloquea `npm.ps1`. No existe lint específico de Desktop. CI instala, prueba y compila Desktop en Windows.
+Then `npm start` loads the compiled UI in `ui/`. Use `npm.cmd` if PowerShell blocks `npm.ps1`.
 
-`npm test` usa datos sintéticos y no requiere API keys. No ejecutes `test:live*`, `tests/provision-vault.cjs`, `tools/vault-inspect.cjs` ni puentes de vault durante tareas normales. No publiques credenciales, perfiles ni logs privados.
+`npm test` uses synthetic fixtures and requires no API keys. Do not run `test:live*`, `tests/provision-vault.cjs`, or `tools/vault-inspect.cjs` during routine tasks. Never publish credentials, profiles, or private logs.
 
-Para abrir la app en desarrollo fija `NEXUS_TEST_DATA` a una carpeta temporal nueva: también impide importar perfiles heredados. `NEXUS_DATA_DIR` por sí sola no desactiva esa importación.
+To open the app with an isolated profile during development, set `NEXUS_TEST_DATA` to a new temporary folder.
 
-## Mapa del código (relativo a desktop/)
+## Code Map (relative to `desktop/`)
 
-- Ventanas/IPC/vault: `main.cjs`; lista del puente: `preload.cjs`.
-- Ciclo del agente/cola/compresión: `core/runtime.mjs`.
-- Modelos/peticiones/red: `core/providers.mjs`, `model-request.mjs`, `provider-errors.mjs`, `stream.mjs`.
-- Herramientas: `core/tools.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs`.
-- Persistencia/recuperación: `core/store.mjs`, `sqlite-workspace.mjs`, `storage-*`, `response-journal.mjs`.
-- Interfaz: `src/`; pruebas Node: `tests/*.test.mjs`.
+- Windows/IPC/Vault: `main.cjs`; allowed renderer bridge list: `preload.cjs`.
+- Agent loop, modes, subagents, queue, compaction: `core/runtime.mjs`.
+- Agentic coding engine, Git, processes, MCP scaffolding, outline, self-improvement: `core/coding-engine.mjs`.
+- Providers, payloads, errors, SSE stream parser: `core/providers.mjs`, `model-request.mjs`, `provider-errors.mjs`, `stream.mjs`.
+- Tools, MCP, OpenAPI, Capabilities: `core/tools.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs`.
+- Persistence & recovery: `core/store.mjs`, `sqlite-workspace.mjs`, `storage-*`, `response-journal.mjs`.
+- UI components (100% English, Light/Dark themes): `src/main.jsx`, `src/CodeGitStudio.jsx`, `src/*.jsx`; Node tests: `tests/*.test.mjs`.
 
-## Reglas de continuidad
+## Core Invariants
 
-Conserva formatos persistidos y verifica migraciones si cambian. No borres originales/checkpoints al comprimir ni reenvíes reasoning literal. No repitas herramientas incompletas o efectos externos inciertos. No reintentes una generación que ya emitió salida. Mantén coste desconocido distinto de cero y tokens de ventana distintos de uso acumulado.
-
-Los IDs `arliai/<modelo>` conservan el proveedor por conversación. No envíes extensiones exclusivas de OpenRouter a Arli.ai. Validar una clave no prueba disponibilidad de generación.
-
-Mantén secretos en el proceso principal/vault; no los devuelvas al renderer ni los insertes en prompts. Conserva validación IPC y de rutas. Usa datos temporales y prueba fallos si alteras durabilidad o reintentos.
-
-Prioriza cambios pequeños de la hoja de ruta, UI en español y pruebas de comportamiento. Ejecuta suite y compilación al cambiar código Desktop. Para UI revisa también Electron en Windows con perfil aislado. No afirmes validación visual o con proveedor real si sólo ejecutaste pruebas sintéticas.
+- All application UI, tool schemas, system prompts, and error messages must be in English.
+- Zero client-side content filtering: delegate content policy to the selected model provider and grant full local capability in the user's chosen environment.
+- Preserve originals and checkpoints on compaction; never resend literal hidden reasoning.
+- Never automatically replay interrupted generations after visible output or repeat incomplete tool calls.
+- Keep unknown cost (`null`) distinct from zero (`0`), and estimated context window tokens distinct from cumulative token usage.
+- Keep secrets in the main process vault (`safeStorage`); never return raw secrets to the renderer or embed them in prompts.

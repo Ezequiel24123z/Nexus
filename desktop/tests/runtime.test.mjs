@@ -68,7 +68,7 @@ test('partial chunk summaries request enough bounded output to terminate cleanly
  const seen=[];const {runtime,store,workspace}=await setup(t,async(_,options)=>{seen.push(JSON.parse(options.body));return reply('Continuidad: rutas, decisiones, pruebas y pendientes claros.');});
  runtime.closed=true;const id=runtime.create({prompt:'Compact',workspace});const task=store.task(id);task.messages.push({role:'user',content:'payload '.repeat(30000)});
  await runtime.compact(task,new AbortController().signal);
- assert.ok(seen.some(body=>body.max_tokens===2000&&body.messages.at(-1).content.includes('Máximo 900 palabras')));
+ assert.ok(seen.some(body=>body.max_tokens===2000&&body.messages.at(-1).content.includes('Maximum 900 words')));
 });
 test('reasoning is disabled by default but remains user-configurable',async t=>{
  let body;const {runtime,store}=await setup(t,async(_,options)=>{body=JSON.parse(options.body);return reply('Done');});
@@ -233,7 +233,7 @@ test('interrupted unfinished tool calls are not replayed when resuming',async t=
   const {runtime,store,workspace}=await setup(t,async(_,options)=>{
     const body=JSON.parse(options.body);
     assert.equal(body.messages.at(-1).role,'tool');
-    assert.match(body.messages.at(-1).content,/Interrumpida/);
+    assert.match(body.messages.at(-1).content,/Interrupted/);
     return reply('Inspected interrupted state');
   });
   runtime.closed=true;
@@ -260,7 +260,7 @@ test('shell cancellation stops the child process',async()=>{
   const abort=new AbortController();
   const result=command(process.execPath,['-e','setTimeout(()=>{},60000)'],{signal:abort.signal,timeout:1000});
   abort.abort();
-  await assert.rejects(result,/detenido/);
+  await assert.rejects(result,/stopped/);
 });
 
 test('literal replace uses exact match and preserves dollar patterns',async t=>{
@@ -342,10 +342,10 @@ test('a truncated compaction summary is continued by the model instead of being 
   await runtime.compact(task,new AbortController().signal);
   assert.equal(task.compressions,1);
   assert.equal(calls,3,'el compactador pide hasta dos continuaciones antes de rendirse');
-  assert.match(JSON.stringify(bodies[1].messages),/Continúa exactamente donde quedó/,'la segunda llamada continúa el corte en lugar de aceptarlo');
+  assert.match(JSON.stringify(bodies[1].messages),/Continue exactly where it stopped/,'la segunda llamada continúa el corte en lugar de aceptarlo');
   assert.ok(task.events.some(e=>e.kind==='compression_degraded'),'si aun así queda cortado se degrada, no se acepta en silencio');
   assert.equal(task.lastCompression.continuations,3);
-  assert.match(task.summary,/Nota: el resumen se truncó/);
+  assert.match(task.summary,/Note: summary was truncated/);
   assert.ok(task.summary.includes('Resumen parcial'),'el texto parcial sigue disponible en el resumen');
   const checkpoint=JSON.parse(await fs.readFile(path.join(directory,'data','tasks',id,'checkpoint-1.json'),'utf8'));
   assert.equal(checkpoint.messages.length,2,'el prompt inicial y el mensaje original quedan íntegros en el checkpoint');
@@ -360,7 +360,7 @@ test('a complete compaction summary is stored in one call without asking for a c
   await runtime.compact(task,new AbortController().signal);
   assert.equal(calls,1);assert.equal(task.lastCompression.continuations,0);
   assert.ok(!task.events.some(e=>e.kind==='compression_degraded'));
-  assert.ok(!task.summary.includes('se truncó'));
+  assert.ok(!task.summary.includes('was truncated'));
 });
 
 test('read_checkpoint lists originals, pages fragments and needs no project folder',async t=>{
@@ -387,10 +387,10 @@ test('read_checkpoint lists originals, pages fragments and needs no project fold
   await runtime.compact(task,new AbortController().signal);
   const many=await executeTool(runtime,task,'read_checkpoint',{checkpoints:[2,2,1],offset:0,length:10},signal);
   assert.deepEqual(many.checkpoints.map(c=>c.checkpoint),[1,2],'los checkpoints repetidos se leen una sola vez y se ordenan');
-  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[9]},signal),/no encontrado/);
-  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[0]},signal),/Lista de checkpoints no válida/);
-  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[1],length:0},signal),/Rango no válido/);
-  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[1],section:'otros'},signal),/Sección no válida/);
+  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[9]},signal),/not found/);
+  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[0]},signal),/Invalid checkpoint list/);
+  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[1],length:0},signal),/Invalid range/);
+  await assert.rejects(executeTool(runtime,task,'read_checkpoint',{checkpoints:[1],section:'otros'},signal),/Invalid section/);
 });
 
 test('follow-ups sent while running are appended and delivered to the next step',async t=>{
@@ -446,7 +446,7 @@ test('simultaneous manual compactions cannot bill twice or race the checkpoint',
  const {runtime,store}=await setup(t,async()=>{requests++;await gate;return reply('Continuidad comprobada: preservar decisiones y pruebas; siguiente paso pendiente documentado.');});
  runtime.closed=true;const id=runtime.create({prompt:'Compactar una vez'});const task=store.task(id);
  const first=runtime.compact(task,new AbortController().signal);
- await assert.rejects(runtime.compact(task,new AbortController().signal),/Ya se está compactando/);
+ await assert.rejects(runtime.compact(task,new AbortController().signal),/already being compacted/);
  assert.equal(runtime.snapshot().tasks[0].compacting,true);
  release();await first;assert.equal(requests,1);assert.equal(task.compressions,1);assert.equal(runtime.compacting.size,0);
 });
@@ -496,7 +496,7 @@ test('external effects have a durable lifecycle and interrupted dispatch becomes
  const id=runtime.create({prompt:'effects',workspace});const task=store.task(id);
  const effect=store.beginEffect(task,'invoke_connector',{name:'billing'});store.updateEffect(task,effect.id,'dispatched');store.save();
  const restored=new Store(store.directory);const recovered=restored.task(id).effects[0];
- assert.equal(recovered.status,'uncertain');assert.match(recovered.note,/No repetir/);
+ assert.equal(recovered.status,'uncertain');assert.match(recovered.note,/Do not repeat/);
  const reconciled=await executeTool(runtime,task,'reconcile_effect',{id:effect.id,status:'confirmed',evidence:'GET /status devolvió el recurso esperado'},new AbortController().signal);
  assert.equal(reconciled.status,'confirmed');assert.match(reconciled.evidence,/GET/);
 });
@@ -517,7 +517,7 @@ test('idempotent connectors reuse the effect id and can be reconciled or retried
 test('long work receives a durable progress reminder without imposing a step limit',async t=>{
  const {runtime,store,workspace}=await setup(t);runtime.closed=true;
  const id=runtime.create({prompt:'Document progress',workspace});const task=store.task(id);task.steps=12;
- runtime.refreshProgressReminder(task);assert.equal(task.progressDue,true);assert.match(JSON.stringify(runtime.buildContext(task)),/Recordatorio de continuidad/);
+ runtime.refreshProgressReminder(task);assert.equal(task.progressDue,true);assert.match(JSON.stringify(runtime.buildContext(task)),/Continuity reminder/);
  await executeTool(runtime,task,'document_progress',{decisions:'d',changes:'c',verification:'v',next:'n'},new AbortController().signal);
  assert.equal(task.progressDue,false);assert.equal(task.lastProgressStep,12);
 });
@@ -593,5 +593,5 @@ test('a provider reply received after pause is retained as interrupted, never de
  const {runtime,store}=await setup(t,async()=>{started=true;await gate;return reply('Respuesta recibida después de pausar');});
  const id=runtime.create({prompt:'Pausa en carrera'});await until(()=>started);runtime.pause(id);release();await until(()=>!runtime.active.size);
  const task=store.task(id);assert.equal(task.status,'paused');assert.equal(task.calls[0].status,'interrupted');assert.equal(task.result,undefined);
- assert.match(task.conversation.at(-1).content,/Respuesta recibida después de pausar/);assert.match(task.conversation.at(-1).content,/no completada/);assert.equal(task.liveActivity,'');
+ assert.match(task.conversation.at(-1).content,/Respuesta recibida después de pausar/);assert.match(task.conversation.at(-1).content,/incomplete/);assert.equal(task.liveActivity,'');
 });

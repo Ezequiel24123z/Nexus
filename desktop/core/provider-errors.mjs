@@ -17,20 +17,20 @@ export function retryableNetworkFailure(error) {
 }
 export function networkFailure(error,provider) {
   const code=networkCode(error);
-  const reason=certificateCodes.has(code)?'No se pudo verificar el certificado del servicio.':
-    ['ENOTFOUND','EAI_AGAIN'].includes(code)?'No se pudo resolver la dirección del servicio.':
-    ['ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(code)?'El servicio no respondió a tiempo.':
-    code==='ECONNREFUSED'?'El servicio rechazó la conexión.':'La conexión se interrumpió antes de completar la respuesta.';
-  return new Error('No se pudo conectar con '+provider+'. '+reason+' Tu mensaje se conserva; puedes reanudar el chat.');
+  const reason=certificateCodes.has(code)?'Could not verify the service TLS certificate.':
+    ['ENOTFOUND','EAI_AGAIN'].includes(code)?'Could not resolve the service host address.':
+    ['ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT'].includes(code)?'The service did not respond in time.':
+    code==='ECONNREFUSED'?'The service refused the connection.':'The connection was interrupted before completing the response.';
+  return new Error('Could not connect to '+provider+'. '+reason+' Your message is preserved; you can resume the chat.');
 }
 export function providerHttpFailure(status,provider) {
-  const reason=status===401?'La clave no fue aceptada; revísala en Configuración.':
-    status===403?'Tu cuenta no tiene acceso a ese modelo o recurso.':
-    status===429?'Se alcanzó el límite de peticiones simultáneas; espera y reanuda el chat.':
-    [502,503,504].includes(status)?'El servicio o el modelo no está disponible temporalmente; puedes reanudar el chat.':
-    status===400?'La petición no fue aceptada. Revisa el modelo, el contexto y sus ajustes.':
-    'Comprueba el modelo y tu cuenta; puedes reanudar el chat.';
-  const error=new Error(provider+' respondió HTTP '+status+'. '+reason);
+  const reason=status===401?'The API key or token was rejected; check it in Settings.':
+    status===403?'Your account does not have access to this model or resource.':
+    status===429?'Rate or concurrency limit reached; wait a moment and resume the chat.':
+    [502,503,504].includes(status)?'The service or model is temporarily unavailable; you can resume the chat.':
+    status===400?'The request was rejected by the provider. Check the model ID, context window, and parameters.':
+    'Check the model and your account status; you can resume the chat.';
+  const error=new Error(provider+' returned HTTP '+status+'. '+reason);
   error.retryable=[408,502,503,504].includes(status);
   return error;
 }

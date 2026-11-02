@@ -53,7 +53,7 @@ test('image bytes are hydrated for outbound vision but kept out of persisted mes
 test('unknown IDs and cross-chat reads cannot inject attachment paths',async t=>{
  const {runtime,store,directory}=await setup(t);const filename=path.join(directory,'a.txt');await fs.writeFile(filename,'a');
  const file=await runtime.attachments.importFile(filename),id=runtime.create({prompt:'Sin adjuntos'});
- await assert.rejects(runtime.attachments.read(store.task(id),file.id),/no pertenece/);
+ await assert.rejects(runtime.attachments.read(store.task(id),file.id),/does not belong/);
  assert.throws(()=>runtime.create({prompt:'Inyección',attachmentIds:['../../vault.bin']}));
  assert.throws(()=>runtime.create({prompt:'Inyección',attachmentIds:[{id:file.id,path:'C:\\otro'}]}));
  assert.equal(store.state.tasks.length,1);
@@ -62,7 +62,7 @@ test('binary files remain local without being misrepresented as UTF-8 or sent as
  const {runtime,store,directory}=await setup(t);const filename=path.join(directory,'documento.pdf');await fs.writeFile(filename,Buffer.from('%PDF-1.7\n\0binary'));
  const attachment=await runtime.attachments.importFile(filename);assert.equal(attachment.kind,'file');
  const id=runtime.create({prompt:'Revisa',attachmentIds:[attachment.id]});const page=await runtime.attachments.read(store.task(id),attachment.id);
- assert.ok(page.path);assert.equal(page.content,undefined);assert.match(page.note,/extracción/);
+ assert.ok(page.path);assert.equal(page.content,undefined);assert.match(page.note,/extraction/);
  assert.ok(!JSON.stringify(runtime.buildContext(store.task(id))).includes('%PDF'));
 });
 test('attachment follow-ups remain queued until a valid tool boundary',async t=>{
@@ -74,7 +74,7 @@ test('attachment follow-ups remain queued until a valid tool boundary',async t=>
  assert.ok(JSON.stringify(task.messages.at(-1)).includes(file.id));assert.equal(task.conversation.at(-1).attachments[0].id,file.id);
 });
 test('preflight prevents sending images to unconfirmed text-only models',()=>{
- assert.throws(()=>assertImageCapability([{kind:'image'}],{architecture:{input_modalities:['text']}}),/visión/);
+ assert.throws(()=>assertImageCapability([{kind:'image'}],{architecture:{input_modalities:['text']}}),/vision/);
  assert.throws(()=>assertImageCapability([{kind:'image'}],undefined));
  assert.doesNotThrow(()=>assertImageCapability([{kind:'image'}],{architecture:{input_modalities:['text','image']}}));
  assert.doesNotThrow(()=>assertImageCapability([{kind:'text'}],undefined));

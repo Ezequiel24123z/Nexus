@@ -64,14 +64,15 @@ async function main() {
   const connectorRevision=value=>require('node:crypto').createHash('sha256').update(JSON.stringify(value)).digest('hex');
   const {searchConversation,conversationWindow,taskResults,previewTaskResult}=await import('./core/chat-workspace.mjs');
   const {validateChatOptions,validateModelCapabilities}=await import('./core/chat-options.mjs');
-  const {modelConnection,providerCatalog,checkArliConnection}=await import('./core/providers.mjs');
+  const {modelConnection,providerCatalog,checkArliConnection,checkProviderConnection,SECRET_KEYS,PROVIDERS}=await import('./core/providers.mjs');
+  const {inspectGitWorkspace,executeGitOperation,inspectSystemEnvironment,detectLocalCopilotToken,scaffoldMcpServer,runSelfImprovement}=await import('./core/coding-engine.mjs');
   const { assertImageCapability } = await import('./core/attachments.mjs');
   async function checkAttachmentModel(ids,model,task) {
     const files=runtime.attachments.resolve(ids||[]);
     const retained=(task?.messages||[]).flatMap(message=>Array.isArray(message.content)?message.content.filter(part=>part.type==='nexus_attachment').map(part=>part.attachment):[]);
     if(![...files,...retained].some(file=>file.kind==='image'))return;
     if(!modelCatalog.has(model)){
-      const entries=await providerCatalog(modelConnection(model).id);
+      const entries=await providerCatalog(modelConnection(model,store.state.settings).id,{settings:store.state.settings});
       for(const item of entries)modelCatalog.set(item.id,item);
     }
     assertImageCapability([...files,...retained],modelCatalog.get(model));
@@ -187,18 +188,18 @@ async function main() {
   runtime.on('change',() => { if(win && !win.isDestroyed()) win.webContents.send('nexus:change',runtime.snapshot(activeUiTask)); });
   mcp.on('change',()=>runtime.emit('change'));
   ipcMain.handle('nexus:invoke', async (event, method, args = {}) => {
-    if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || !event.senderFrame.url.startsWith('nexus://app/')) throw new Error('Origen no permitido');
+    if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame || !event.senderFrame.url.startsWith('nexus://app/')) throw new Error('Origin not permitted');
     switch(method) {
       case 'getDrafts': {
         const result=drafts.list();
         for(const draft of Object.values(result.items)){
-          const attachments=draft.attachmentIds.map(id=>{try{return runtime.attachments.resolve([id])[0];}catch{return {id,name:'Adjunto no disponible',kind:'file',bytes:0,missing:true};}});
+          const attachments=draft.attachmentIds.map(id=>{try{return runtime.attachments.resolve([id])[0];}catch{return {id,name:'Unavailable attachment',kind:'file',bytes:0,missing:true};}});
           result.items[draft.key]={...draft,attachments};
         }
         return result;
       }
       case 'saveDraft':
-        if(args.workspace&&!allowedWorkspaces.has(args.workspace))throw new Error('Selecciona primero la carpeta del borrador.');
+        if(args.workspace&&!allowedWorkspaces.has(args.workspace))throw new Error('Select the draft folder first.');
         return drafts.save(args);
       case 'clearDraft': return drafts.clear(args.key,args.revision);
       case 'openExternal': return shell.openExternal(externalWebUrl(args.url));
@@ -218,18 +219,18 @@ async function main() {
       }
       case 'importOpenApi': return importOpenApi(runtime,args);
       case 'mcpToolsPage': return catalogPage((await mcp.list(args.server)).map(item=>({name:item.name,description:String(item.description||'').slice(0,600)})),{query:args.query,offset:args.offset,limit:20});
-      case 'getConnector': {const definition=store.state.connectors.find(item=>item.name===args.name);if(!definition)throw new Error('Conector no encontrado.');return {definition,revision:connectorRevision(definition)};}
+      case 'getConnector': {const definition=store.state.connectors.find(item=>item.name===args.name);if(!definition)throw new Error('Connector not found.');return {definition,revision:connectorRevision(definition)};}
       case 'updateConnector': {
         runtime.validateConnector(args.definition);
         const index=store.state.connectors.findIndex(item=>item.name===args.definition.name);
-        if(index<0||connectorRevision(store.state.connectors[index])!==args.revision)throw new Error('El conector cambió. Ábrelo de nuevo antes de guardar.');
+        if(index<0||connectorRevision(store.state.connectors[index])!==args.revision)throw new Error('The connector changed. Reopen it before saving.');
         store.state.connectors[index]=args.definition;runtime.changed(null);return true;
       }
       case 'inspectRecovery': {
-        if(recoveryBusy)throw new Error('Ya hay una comprobación de copia en curso.');
+        if(recoveryBusy)throw new Error('A backup check is already in progress.');
         recoveryBusy=true;recoverySelection=null;
         try{
-          const choice=await dialog.showOpenDialog(win,{title:'Revisar copia de NEXUS',properties:['openFile'],filters:[{name:'Copia NEXUS',extensions:['json','sqlite']}]});
+          const choice=await dialog.showOpenDialog(win,{title:'Inspect NEXUS Backup',properties:['openFile'],filters:[{name:'NEXUS Backup',extensions:['json','sqlite']}]});
           if(choice.canceled)return null;
           const source=fs.realpathSync(choice.filePaths[0]);
           const preview=await recoveryJob({operation:'inspect',source});
@@ -238,28 +239,28 @@ async function main() {
         }finally{recoveryBusy=false;}
       }
       case 'restoreRecovery': {
-        if(recoveryBusy)throw new Error('Ya hay una comprobación de copia en curso.');
-        if(!recoverySelection||args.token!==recoverySelection.token)throw new Error('Selecciona y revisa una copia antes de recuperarla.');
+        if(recoveryBusy)throw new Error('A backup check is already in progress.');
+        if(!recoverySelection||args.token!==recoverySelection.token)throw new Error('Select and review a backup before restoring it.');
         recoveryBusy=true;
         try{
-          const choice=await dialog.showOpenDialog(win,{title:'Carpeta para una recuperación aislada (se creará una subcarpeta nueva)',properties:['openDirectory','createDirectory']});
+          const choice=await dialog.showOpenDialog(win,{title:'Destination folder for isolated recovery (a new subfolder will be created)',properties:['openDirectory','createDirectory']});
           if(choice.canceled)return null;
           const result=await recoveryJob({operation:'restore',source:recoverySelection.source,expectedFingerprint:recoverySelection.fingerprint,parent:choice.filePaths[0],activeDirectory:store.directory});
           recoverySelection=null;return result;
         }finally{recoveryBusy=false;}
       }
       case 'migrateStorage': {
-        if(runtime.active.size||runtime.compacting.size||store.state.tasks.some(task=>task.status==='queued'))throw new Error('Pausa todas las tareas y espera a que terminen las llamadas antes de migrar.');
+        if(runtime.active.size||runtime.compacting.size||store.state.tasks.some(task=>task.status==='queued'))throw new Error('Pause all tasks and wait for active calls to finish before migrating.');
         const info=store.migrateToSqlite();runtime.emit('change');return info;
       }
       case 'exportStorage': {
-        if(runtime.active.size||runtime.compacting.size)throw new Error('Pausa las tareas antes de exportar el estado.');
-        const result=await dialog.showSaveDialog(win,{defaultPath:'nexus-workspace-export.json',filters:[{name:'Estado NEXUS compatible',extensions:['json']}]});
+        if(runtime.active.size||runtime.compacting.size)throw new Error('Pause all tasks before exporting workspace state.');
+        const result=await dialog.showSaveDialog(win,{defaultPath:'nexus-workspace-export.json',filters:[{name:'Compatible NEXUS State',extensions:['json']}]});
         if(result.canceled)return false;
-        if(runtime.active.size||runtime.compacting.size)throw new Error('La ejecución cambió mientras elegías destino. Pausa las tareas y vuelve a exportar.');
+        if(runtime.active.size||runtime.compacting.size)throw new Error('Execution state changed while choosing destination. Pause tasks and export again.');
         const relative=path.relative(store.directory,path.resolve(result.filePath));
         const inside=relative!==''&&!relative.startsWith('..'+path.sep)&&relative!=='..'&&!path.isAbsolute(relative);
-        if(!relative||(inside&&relative.split(path.sep)[0].toLowerCase()!=='exports')||path.extname(result.filePath).toLowerCase()!=='.json')throw new Error('Elige un archivo .json fuera de la carpeta de datos, o dentro de su subcarpeta exports. No sobrescribas archivos internos.');
+        if(!relative||(inside&&relative.split(path.sep)[0].toLowerCase()!=='exports')||path.extname(result.filePath).toLowerCase()!=='.json')throw new Error('Choose a .json file outside the data directory, or inside its exports subfolder. Do not overwrite internal files.');
         store.exportState(result.filePath);return true;
       }
       case 'watchChat': {
@@ -272,7 +273,7 @@ async function main() {
       case 'taskResults': return taskResults(store.task(args.id),args);
       case 'previewResult': return previewTaskResult(store,store.task(args.id),args.resultId);
       case 'chooseAttachments': {
-        const result=await dialog.showOpenDialog(win,{properties:['openFile','multiSelections'],title:'Adjuntar archivos al chat'});
+        const result=await dialog.showOpenDialog(win,{properties:['openFile','multiSelections'],title:'Attach files to chat'});
         if(result.canceled)return {attachments:[],errors:[]};
         const attachments=[],errors=[];
         for(const filename of result.filePaths){try{attachments.push(await runtime.attachments.importFile(filename));}catch(error){errors.push(path.basename(filename)+': '+error.message);}}
@@ -282,25 +283,25 @@ async function main() {
         const preview=await runtime.attachments.preview(args.id,{offset:args.offset??0,length:args.length??8000});
         if(preview.attachment.kind==='image'){
           const original=nativeImage.createFromBuffer(fs.readFileSync(runtime.attachments.filename(args.id)));
-          if(original.isEmpty())throw new Error('No se pudo decodificar la imagen.');
+          if(original.isEmpty())throw new Error('Could not decode image.');
           preview.image=original.resize({width:Math.min(1000,original.getSize().width)}).toDataURL();
         }
         return preview;
       }
       case 'chooseWorkspace': {
-        const result = await dialog.showOpenDialog(win,{properties:['openDirectory','createDirectory'],title:'Seleccionar carpeta de proyecto'});
+        const result = await dialog.showOpenDialog(win,{properties:['openDirectory','createDirectory'],title:'Select Project Workspace Folder'});
         if(result.canceled) return null;
         const root = fs.realpathSync(result.filePaths[0]); allowedWorkspaces.add(root); return root;
       }
       case 'createTask': {
-        if(args.workspace && !allowedWorkspaces.has(args.workspace)) throw new Error('Selecciona primero la carpeta en el diálogo.');
+        if(args.workspace && !allowedWorkspaces.has(args.workspace)) throw new Error('Select the workspace folder in the dialog first.');
         await checkAttachmentModel(args.attachmentIds,args.model||store.state.settings.model);
         const id=runtime.create(args);if(store.task(id).workspace)allowedWorkspaces.add(store.task(id).workspace);return id;
       }
       case 'pause': return runtime.pause(args.id);
       case 'compact': {
         const task=store.task(args.id);
-        if(runtime.active.has(task.id)) throw new Error('Pausa la tarea antes de compactar.');
+        if(runtime.active.has(task.id)) throw new Error('Pause the task before compacting.');
         try{await runtime.compact(task, new AbortController().signal);}
         catch(error){if(error.name==='AbortError')return false;throw error;}
         runtime.changed(); return true;
@@ -312,19 +313,45 @@ async function main() {
       }
       case 'approve': return runtime.approve(args.id,args.allowed);
       case 'settings': runtime.settings(args); return runtime.snapshot(activeUiTask);
-      case 'balance': return modelConnection(store.state.settings.model).id==='arliai'?{subscription:true,remaining:null,keyRemaining:null}:readBalance(name=>secrets[name]);
+      case 'balance': {
+        const providerId = modelConnection(store.state.settings.model, store.state.settings).id;
+        return providerId === 'openrouter' ? readBalance(name=>secrets[name]) : { subscription: true, provider: providerId, remaining: null, keyRemaining: null };
+      }
       case 'checkArli': return checkArliConnection(secrets.ARLIAI_API_KEY);
+      case 'checkProvider': {
+        const providerId = args.provider || modelConnection(store.state.settings.model, store.state.settings).id;
+        const provider = PROVIDERS.find(p => p.id === providerId) || PROVIDERS[0];
+        return checkProviderConnection(provider.id, secrets[provider.key], { settings: store.state.settings });
+      }
+      case 'importCopilotToken': {
+        const detected = await detectLocalCopilotToken();
+        secrets.GITHUB_COPILOT_TOKEN = detected.token;
+        saveSecrets();
+        runtime.changed();
+        return { ok: true, source: detected.source };
+      }
       case 'saveMcp': {
         validateServer(args);await mcp.disconnect(args.name);
         const existing=store.state.mcpServers.findIndex(s=>s.name===args.name);
         if(existing>=0)store.state.mcpServers[existing]=args;else store.state.mcpServers.push(args);
         runtime.changed();return true;
       }
+      case 'scaffoldMcp': {
+        const res = await scaffoldMcpServer(store, mcp, args);
+        runtime.changed();
+        return res;
+      }
+      case 'testConnector': {
+        const started = Date.now();
+        const res = await runtime.invokeConnector({ name: args.name, input: args.input || {} }, new AbortController().signal);
+        return { ...res, latencyMs: Date.now() - started };
+      }
+      case 'selfImprove': return runSelfImprovement(runtime, null, args);
       case 'connectMcp': await mcp.list(args.name);return true;
       case 'disconnectMcp': await mcp.disconnect(args.name);return true;
       case 'removeMcp': await mcp.disconnect(args.name);store.state.mcpServers=store.state.mcpServers.filter(s=>s.name!==args.name);runtime.changed();return true;
       case 'saveProject': {
-        if(args.workspace && !allowedWorkspaces.has(args.workspace))throw new Error('Selecciona la carpeta en el diálogo.');
+        if(args.workspace && !allowedWorkspaces.has(args.workspace))throw new Error('Select the folder in the dialog first.');
         const id=store.project(args);runtime.changed();return id;
       }
       case 'removeProject': {
@@ -334,7 +361,7 @@ async function main() {
       }
       case 'pinMessage': {
         const task=store.task(args.id),message=task.conversation.find(m=>m.id===args.messageId);
-        if(!message)throw new Error('Mensaje no encontrado');
+        if(!message)throw new Error('Message not found');
         message.pinned=Boolean(args.pinned);runtime.changed();return true;
       }
       case 'updateChat': {
@@ -348,48 +375,105 @@ async function main() {
       }
       case 'saveKey': {
         const name = args.name || 'OPENROUTER_API_KEY';
-        if(!['ARLIAI_API_KEY','OPENROUTER_API_KEY','OPENROUTER_MANAGEMENT_KEY'].includes(name) && !/^CONNECTOR_[A-Z0-9_]+$/.test(name)) throw new Error('Nombre de secreto no válido.');
-        if(typeof args.value !== 'string' || args.value.length > 10000) throw new Error('Clave no válida');
+        if(!SECRET_KEYS.includes(name) && !/^CONNECTOR_[A-Z0-9_]+$/.test(name)) throw new Error('Invalid secret name.');
+        if(typeof args.value !== 'string' || args.value.length > 10000) throw new Error('Invalid key value');
         if(args.value.trim()) secrets[name] = args.value.trim(); else delete secrets[name];
         saveSecrets(); runtime.changed(); return true;
       }
       case 'models': {
         const sorts=new Set(['pricing-low-to-high','context-high-to-low','throughput-high-to-low','latency-low-to-high','most-popular','newest','intelligence-high-to-low','design-arena-elo-high-to-low']);
-        const results=await Promise.allSettled(['arliai','openrouter'].map(provider=>providerCatalog(provider,{sort:sorts.has(args.sort)?args.sort:''})));
+        const results=await Promise.allSettled(['arliai','openrouter','openai','copilot','anthropic','custom'].map(provider=>providerCatalog(provider,{sort:sorts.has(args.sort)?args.sort:'',settings:store.state.settings})));
         const entries=results.flatMap(result=>result.status==='fulfilled'?result.value:[]);
-        if(!entries.length)throw new Error('Catálogos no disponibles. Puedes conservar tu modelo actual y reintentar.');
+        if(!entries.length)throw new Error('Model catalogs unavailable. You can keep your current model and retry.');
         for(const model of entries)modelCatalog.set(model.id,model);
         return entries.map(m => ({id:m.id,name:m.name,provider:m.provider||'openrouter',context:m.context_length,tools:m.supported_parameters?.includes('tools'),vision:m.architecture?.input_modalities?.includes('image'),reasoning:m.reasoning||null,pricing:m.pricing||{},topProvider:m.top_provider?{context:m.top_provider.context_length,maxOutput:m.top_provider.max_completion_tokens}:null,benchmarks:m.benchmarks||null,description:m.description||''}));
       }
       case 'addConnector':
         runtime.validateConnector(args);
-        if(store.state.connectors.some(c => c.name === args.name)) throw new Error('Ya existe ese conector');
+        if(store.state.connectors.some(c => c.name === args.name)) throw new Error('A connector with that name already exists');
         store.state.connectors.push(args); runtime.changed(); return true;
       case 'removeConnector':
         store.state.connectors = store.state.connectors.filter(c => c.name !== args.name); runtime.changed(); return true;
       case 'files': {
-        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Carpeta no autorizada');
+        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Unauthorized workspace folder');
         const target = await workspacePath(args.workspace,args.path || '.');
         return fs.readdirSync(target,{withFileTypes:true}).slice(0,500).map(f=>({name:f.name,directory:f.isDirectory()}));
       }
       case 'readFile': {
-        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Carpeta no autorizada');
+        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Unauthorized workspace folder');
         const target = await workspacePath(args.workspace,args.path);
-        if(fs.statSync(target).size > 100000) throw new Error('La vista previa admite hasta 100 KB');
+        if(fs.statSync(target).size > 100000) throw new Error('Preview supports files up to 100 KB');
         return fs.readFileSync(target,'utf8');
       }
+      case 'gitStatus': {
+        if(!args.workspace || !allowedWorkspaces.has(args.workspace)) throw new Error('Select an authorized workspace folder first.');
+        return inspectGitWorkspace(args.workspace);
+      }
+      case 'gitDiff': {
+        if(!args.workspace || !allowedWorkspaces.has(args.workspace)) throw new Error('Select an authorized workspace folder first.');
+        return executeGitOperation(args.workspace, { operation: 'diff', target: args.target, staged: args.staged });
+      }
+      case 'gitAction': {
+        if(!args.workspace || !allowedWorkspaces.has(args.workspace)) throw new Error('Select an authorized workspace folder first.');
+        return executeGitOperation(args.workspace, args);
+      }
+      case 'terminalExec': {
+        if(!args.workspace || !allowedWorkspaces.has(args.workspace)) throw new Error('Select an authorized workspace folder first.');
+        if(typeof args.command !== 'string' || !args.command.trim()) throw new Error('Enter a command to execute.');
+        return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', args.command], { cwd: args.workspace, timeout: 60000 });
+      }
+      case 'processesList': return runtime.processes.list();
+      case 'processStart': {
+        if(args.workspace && !allowedWorkspaces.has(args.workspace)) throw new Error('Unauthorized workspace folder.');
+        return runtime.processes.start({ command: args.command, cwd: args.workspace || process.cwd(), label: args.label });
+      }
+      case 'processOutput': return runtime.processes.get(args.id);
+      case 'processStop': return runtime.processes.stop(args.id);
+      case 'memoriesList': return store.state.memories || [];
+      case 'memorySave': {
+        store.state.memories ||= [];
+        if(typeof args.key !== 'string' || !args.key.trim() || typeof args.value !== 'string' || !args.value.trim()) throw new Error('Key and value are required.');
+        const scope = args.scope === 'project' ? 'project' : 'global';
+        const workspace = scope === 'project' ? (args.workspace || '') : '';
+        const existing = store.state.memories.find(m => m.id === args.id || (m.key.toLowerCase() === args.key.trim().toLowerCase() && m.scope === scope && m.workspace === workspace));
+        if(existing){
+          existing.key = args.key.trim().slice(0, 120);
+          existing.value = args.value.trim().slice(0, 4000);
+          existing.scope = scope;
+          existing.workspace = workspace;
+          existing.updatedAt = new Date().toISOString();
+        } else {
+          store.state.memories.push({
+            id: require('node:crypto').randomUUID(),
+            key: args.key.trim().slice(0, 120),
+            value: args.value.trim().slice(0, 4000),
+            scope,
+            workspace,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        runtime.changed(null);
+        return store.state.memories;
+      }
+      case 'memoryDelete': {
+        store.state.memories = (store.state.memories || []).filter(m => m.id !== args.id);
+        runtime.changed(null);
+        return store.state.memories;
+      }
+      case 'systemInfo': return inspectSystemEnvironment(args.workspace && allowedWorkspaces.has(args.workspace) ? args.workspace : process.cwd());
       case 'openProject':
-        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Carpeta no autorizada');
+        if(!allowedWorkspaces.has(args.workspace)) throw new Error('Unauthorized workspace folder');
         return shell.openPath(args.workspace);
       case 'openJournal': return shell.openPath(store.directoryFor(store.task(args.id).id));
       case 'exportTask': {
         const task = store.task(args.id);
         const result = await dialog.showSaveDialog(win,{defaultPath:'nexus-' + task.id.slice(0,8) + '.md',filters:[{name:'Markdown',extensions:['md']}]});
         if(result.canceled) return false;
-        const text = '# ' + task.title + '\n\n## Objetivo\n' + task.prompt + '\n\n## Continuidad\n' + task.summary + '\n\n## Conversación\n' + task.conversation.map(m=>'### ' + m.role + '\n' + (m.content||(m.reasoning?('(razonamiento del paso '+m.step+')\n'+m.reasoning):''))).join('\n\n') + '\n\n## Diario\n' + task.events.map(e=>'### ' + e.at + ' · ' + e.kind + '\n\n' + JSON.stringify(e.detail,null,2)).join('\n\n');
+        const text = '# ' + task.title + '\n\n## Objective\n' + task.prompt + '\n\n## Continuity\n' + task.summary + '\n\n## Conversation\n' + task.conversation.map(m=>'### ' + m.role + '\n' + (m.content||(m.reasoning?('(step '+m.step+' reasoning)\n'+m.reasoning):''))).join('\n\n') + '\n\n## Journal\n' + task.events.map(e=>'### ' + e.at + ' · ' + e.kind + '\n\n' + JSON.stringify(e.detail,null,2)).join('\n\n');
         fs.writeFileSync(result.filePath,text); return true;
       }
-      default: throw new Error('Operación no permitida');
+      default: throw new Error('Operation not permitted');
     }
   });
   await win.loadURL('nexus://app/');

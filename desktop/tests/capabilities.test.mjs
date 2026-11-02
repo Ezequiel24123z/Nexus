@@ -15,7 +15,7 @@ const skill=(name='Revisar')=>({kind:'skill',name,description:'Pruebas de calida
 test('skills persist independently, revisions preserve history and stale edits are rejected',t=>{
  const root=fixture(t),library=new CapabilityLibrary(root),first=library.save(skill());
  const next=library.save({...first,instructions:'Segundo procedimiento'});
- assert.equal(next.revision,2);assert.throws(()=>library.save({...first,name:'Stale'}),/cambió/);
+ assert.equal(next.revision,2);assert.throws(()=>library.save({...first,name:'Stale'}),/changed/);
  assert.equal(JSON.parse(fs.readFileSync(path.join(root,'capabilities','history',first.id,'1.json'))).instructions,first.instructions);
  assert.equal(new CapabilityLibrary(root).get(first.id).instructions,'Segundo procedimiento');
  assert.equal(library.summary().total,1);
@@ -23,12 +23,12 @@ test('skills persist independently, revisions preserve history and stale edits a
 test('disabled entries remain editable but are absent from discovery and cannot execute',t=>{
  const library=new CapabilityLibrary(fixture(t)),fn=library.save({kind:'function',name:'Leer',tool:'read_file',defaults:{path:'a.txt'}});
  library.save({...fn,enabled:false});assert.equal(library.list().total,0);assert.equal(library.list({includeDisabled:true}).total,1);
- assert.throws(()=>library.resolve(fn.id),/desactivada/);assert.equal(library.get(fn.id,{includeDisabled:true}).enabled,false);
+ assert.throws(()=>library.resolve(fn.id),/disabled/);assert.equal(library.get(fn.id,{includeDisabled:true}).enabled,false);
 });
 test('function defaults merge without mutation and nested or unknown tools cannot be registered',t=>{
  const library=new CapabilityLibrary(fixture(t)),fn=library.save({kind:'function',name:'Leer',tool:'read_file',defaults:{path:'a.txt'}});
  assert.equal(library.resolve(fn.id,{path:'b.txt'}).args.path,'b.txt');assert.equal(library.get(fn.id).defaults.path,'a.txt');
- for(const tool of ['invoke_function','save_capability','desktop_action','eval'])assert.throws(()=>library.save({kind:'function',name:tool,tool,defaults:{}}),/herramienta/);
+ for(const tool of ['invoke_function','save_capability','desktop_action','eval'])assert.throws(()=>library.save({kind:'function',name:tool,tool,defaults:{}}),/tool/);
  assert.throws(()=>library.get('../outside'));assert.throws(()=>library.resolve(fn.id,[]));
 });
 test('malformed files are preserved and reported without losing valid definitions',t=>{

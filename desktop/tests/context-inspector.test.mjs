@@ -31,7 +31,7 @@ test('context previews are bounded and refuse a stale snapshot after a context e
  const {runtime,task}=await setup(t);task.messages=[{role:'user',content:'x'.repeat(16000)}];const report=inspectContext(runtime,task);
  const args={section:'history-user',fingerprint:report.fingerprint},first=contextSection(runtime,task,args);assert.equal(first.content.length,6000);assert.equal(first.next,6000);
  const second=contextSection(runtime,task,{...args,offset:first.next});assert.equal(second.offset,6000);assert.equal(second.content.length,6000);
- task.messages.push({role:'user',content:'Cambio'});assert.throws(()=>contextSection(runtime,task,args),/cambió/);
+ task.messages.push({role:'user',content:'Cambio'});assert.throws(()=>contextSection(runtime,task,args),/changed/);
 });
 test('image previews omit binary data without hydrating attachment references',async t=>{
  const {runtime,task}=await setup(t);task.messages=[{role:'user',content:[{type:'image_url',image_url:{url:'data:image/png;base64,DO_NOT_RENDER_BINARY'}},{type:'nexus_attachment',attachment:{id:'missing-file',kind:'image',name:'fixture.png'}}]}];
@@ -44,7 +44,7 @@ test('cost groups distinguish compression, retries and unknown costs without dou
 test('cost pages read full history rather than the last UI snapshot and detect live changes',()=>{
  const task={calls:Array.from({length:101},(_,i)=>({id:String(i),kind:'generation',cost:0,input:10,cached:5,status:'complete'}))};const report=inspectCosts(task);
  assert.equal(report.total.calls,101);assert.equal(report.items.length,20);assert.equal(report.items[0].id,'100');
- assert.equal(inspectCosts(task,{offset:100,version:report.version}).items[0].id,'0');task.calls[100].cost=.2;assert.throws(()=>inspectCosts(task,{offset:20,version:report.version}),/cambió/);
+ assert.equal(inspectCosts(task,{offset:100,version:report.version}).items[0].id,'0');task.calls[100].cost=.2;assert.throws(()=>inspectCosts(task,{offset:20,version:report.version}),/changed/);
 });
 test('invalid cache counters and costs are not presented as valid coverage or free usage',()=>{
  const result=aggregateUsage([{input:100,cached:150,cost:-1},{input:-2,cached:0,cost:'0'},{input:10,cached:5,cost:0}]);assert.equal(result.cacheHitRate,.5);assert.equal(result.cacheCoverage,1/3);assert.equal(result.cost,0);assert.equal(result.unknownCosts,2);
@@ -55,7 +55,7 @@ test('checkpoint preview is local, paged, redacts hidden reasoning and validates
  const report=inspectContext(runtime,task);assert.equal(report.checkpoints[0].before,9000);
  const original=await previewCheckpoint(store,task,{checkpoint:1,section:'messages'});assert.ok(original.content.includes('Verificado'));assert.ok(!original.content.includes('PRIVATE_CHAIN'));assert.ok(!original.content.includes('SECRET_BINARY'));
  assert.equal((await previewCheckpoint(store,task,{checkpoint:1,section:'summary'})).content,'Resumen de continuidad');
- for(const checkpoint of [-1,'../workspace',2])await assert.rejects(previewCheckpoint(store,task,{checkpoint}),/válido/);
+ for(const checkpoint of [-1,'../workspace',2])await assert.rejects(previewCheckpoint(store,task,{checkpoint}),/Invalid/);
 });
 test('session affinity is opt-in, opaque, stable on restart and separates summaries',async t=>{
  const {runtime,task,store,directory}=await setup(t);runtime.settings({cacheAffinity:true,streaming:false});runtime.getSecret=()=> 'synthetic-key';const requests=[];runtime.request=async(_,options)=>{requests.push(JSON.parse(options.body));return reply();};
