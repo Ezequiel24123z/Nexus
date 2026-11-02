@@ -1,0 +1,92 @@
+/* Render de markdown, tablas y estado de generacion (estilo Codex).
+   Se importa desde main.jsx despues de style.css. */
+
+.formatted > :first-child{margin-top:0}
+.formatted > :last-child{margin-bottom:0}
+.formatted md-p,.formatted p{margin:0 0 10px;white-space:pre-wrap;overflow-wrap:anywhere}
+.formatted h3,.formatted h4,.formatted h5{margin:18px 0 8px;font-weight:600;letter-spacing:-.2px;line-height:1.35}
+.formatted h3{font-size:16px}
+.formatted h4{font-size:14px}
+.formatted h5{font-size:13px;color:#444}
+.formatted ul,.formatted ol{margin:0 0 10px;padding-left:22px}
+.formatted li{margin:3px 0;line-height:1.7}
+.formatted li > p{margin:0}
+.formatted blockquote{margin:10px 0;padding:4px 0 4px 14px;border-left:2px solid #e0e0e0;color:#666}
+.formatted blockquote p{margin:0 0 6px}
+.formatted hr{border:0;border-top:1px solid #ececec;margin:18px 0}
+.formatted a{color:#2a5db0;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
+.formatted code{background:#f1f1f1;border-radius:5px;padding:1px 5px;font:12px/1.5 Consolas,monospace;overflow-wrap:anywhere}
+.formatted pre code{background:transparent;border-radius:0;padding:0;font:12px/1.6 Consolas,monospace}
+
+/* Tablas: scroll horizontal propio y bordes legibles */
+.formatted .table-wrap{overflow:auto;margin:12px 0;border:1px solid #e9e9e9;border-radius:9px}
+.formatted .table-wrap{max-width:100%;overscroll-behavior-x:contain}
+.formatted .code-block{min-width:0;margin:12px 0;border:1px solid #e9e9e9;border-radius:9px;overflow:hidden}
+.formatted .code-actions{display:flex;justify-content:flex-end;background:#f7f7f7;padding:3px 7px;border-bottom:1px solid #e9e9e9;font-size:11px;color:#777}
+.formatted .code-block pre{margin:0;border:0;border-radius:0;white-space:pre;overflow:auto}
+.formatted img{max-width:100%;height:auto}
+.attachment-list{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px;max-height:170px;overflow:auto}
+.attachment-chip{display:flex;align-items:center;min-width:0;max-width:100%;border:1px solid #e3e3e3;border-radius:12px;background:#fafafa}
+.attachment-chip>button:first-child{justify-content:flex-start;text-align:left;min-width:0;gap:9px;padding:10px 12px}
+.attachment-chip strong{display:block;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:500}
+.attachment-chip small{display:block;font-size:10px}
+.attachment-chip svg{flex-shrink:0}
+.attachment-preview h2{overflow-wrap:anywhere;padding-right:24px}
+.attachment-preview img{display:block;max-width:100%;max-height:55vh;object-fit:contain;margin:auto}
+.attachment-preview pre{max-height:50vh;overflow:auto}
+.draft-status{display:flex;align-items:center;justify-content:flex-end;gap:6px;color:#888;font-size:10px;margin:7px 6px 0}
+.draft-status.error{color:#986c3c}
+.draft-status button{padding:2px 5px;text-decoration:underline;font-size:10px}
+.context-advice{background:#faf9f6;border:1px solid #eae7df;border-radius:10px;padding:10px 12px;margin:10px 0;font-size:12px;color:#665e4e;line-height:1.6}
+.context-advice p{margin:0 0 7px}.context-advice p:last-child{margin-bottom:0}
+.formatted table{border-collapse:collapse;width:100%;font-size:12.5px}
+.formatted th,.formatted td{border:0;border-bottom:1px solid #eeeeee;border-right:1px solid #f2f2f2;padding:8px 11px;text-align:left;vertical-align:top}
+.formatted th{background:#f8f8f7;font-weight:600;white-space:nowrap}
+.formatted tr > :last-child{border-right:0}
+.formatted tbody tr:last-child td{border-bottom:0}
+.formatted tbody tr:nth-child(even){background:#fcfcfc}
+
+/* Bloque de razonamiento (thinking) plegable */
+.reasoning{margin:0 0 12px;border:1px solid #ededed;border-radius:10px;background:#fafafa;overflow:hidden}
+.reasoning > summary{font-size:11px;color:#777;padding:8px 12px;letter-spacing:.3px;user-select:none}
+.reasoning > summary::marker{color:#bbb}
+.reasoning-body{padding:4px 14px 12px;font-size:12.5px;color:#6b6b6b;line-height:1.65;border-top:1px solid #efefef;max-height:340px;overflow:auto}
+.reasoning-body p{white-space:pre-wrap;margin:0 0 8px}
+.reasoning-body .formatted code{background:#f0f0f0}
+.reasoning-body .formatted pre{background:#f3f3f3;border-color:#e8e8e8}
+.activity-summary{display:flex;align-items:center;gap:8px;margin:0 0 10px;padding:8px 10px;border:1px solid #ececec;border-radius:9px;background:#fafafa;color:#666;font-size:12px}
+.activity-summary svg{color:#9a9a9a;animation:nexus-pulse 1.3s infinite ease-in-out}
+.model-explorer{margin:12px 0}.model-explorer>summary{font-size:12px;color:#555}.model-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.model-controls input,.model-controls select{margin:0}.model-list{display:grid;gap:6px;max-height:340px;overflow:auto}.model-choice{display:block;text-align:left;border:1px solid #e9e9e9;border-radius:8px;padding:9px 10px}.model-choice:hover,.model-choice.selected{border-color:#bdbdbd;background:#fafafa}.model-choice strong,.model-choice small,.model-choice span{display:block}.model-choice strong{font-size:12px;font-weight:600}.model-choice small,.model-choice span{font-size:10px;color:#888;margin-top:3px}.model-choice span{color:#777}
+
+/* Indicador "trabajando" con puntos animados */
+.working{display:inline-flex;align-items:center;gap:5px}
+.working i{width:4px;height:4px;border-radius:50%;background:#b9b9b9;animation:nexus-pulse 1.3s infinite ease-in-out}
+.working i:nth-child(2){animation-delay:.18s}
+.working i:nth-child(3){animation-delay:.36s}
+@keyframes nexus-pulse{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)}}
+
+/* Cursor parpadeante al final del ultimo bloque mientras se genera.
+   Solo afecta al .formatted hijo directo del mensaje en vivo, no al del razonamiento. */
+.message.live > .formatted > :last-child::after{content:"";display:inline-block;width:7px;height:1.05em;background:#333;margin-left:3px;vertical-align:-2px;animation:nexus-blink 1.05s steps(2,start) infinite}
+@keyframes nexus-blink{50%{opacity:0}}
+
+/* Aparicion suave de los bloques nuevos durante el streaming */
+.message.live > .formatted > :last-child{animation:nexus-fade .22s ease-out}
+@keyframes nexus-fade{from{opacity:.45;transform:translateY(1px)}to{opacity:1;transform:none}}
+
+/* Pasos: razonamiento plegado con vista previa y pulso mientras llega */
+.reasoning > summary{display:flex;align-items:baseline;gap:8px}
+.reasoning-label{white-space:nowrap}
+.reasoning-preview{color:#b6b6b6;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;text-align:right}
+.reasoning.live > summary .reasoning-label::after{content:'';display:inline-block;width:5px;height:5px;border-radius:50%;background:#b9b9b9;margin-left:6px;animation:nexus-pulse 1.3s infinite ease-in-out}
+.reasoning.live .formatted > :last-child{animation:nexus-fade .22s ease-out}
+.sources{margin:12px 0 0;border:1px solid #ececec;border-radius:9px;background:#fafafa;color:#666;font-size:12px}
+.sources > summary{padding:8px 11px;color:#666;font-size:11px;user-select:none}
+.sources ol{margin:0;padding:0 12px 10px 29px;border-top:1px solid #ededed}
+.sources li{padding:7px 0 0 2px;overflow-wrap:anywhere}
+.sources a{color:#2a5db0;text-decoration:none}
+.sources a:hover{text-decoration:underline}
+.sources small{display:block;margin-top:1px;color:#999;font-size:10px}
+@media(prefers-reduced-motion:reduce){
+  .working i,.message.live > .formatted > :last-child::after,.message.live > .formatted > :last-child{animation:none}
+}

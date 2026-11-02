@@ -1,0 +1,72 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/.vinext/
+/out/
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+next-env.d.ts
+/dist/
+/.wrangler/
+/.sites-runtime/
+/.agents/
+/.codex/
+/outputs/
+/work/
+
+# Sources only: exclude local profiles, credentials and generated results
+!.env.example
+**/node_modules/
+**/coverage/
+**/test-results/
+*.log
+*.jsonl
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+vault*.bin*
+workspace.json
+workspace.json.*
+storage-engine.json
+storage-engine.json.*
+drafts/
+uploads/
+tasks/
+backup-legacy-*/
+*.pfx
+*.p12
+*.key
+.nexus-scratch/
+CitiesDineroX2/
+nexus-operator.tar.gz

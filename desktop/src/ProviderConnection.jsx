@@ -1,0 +1,11 @@
+import React,{useState} from 'react';
+
+export default function ProviderConnection({settings,state,act,SecretField,reload}) {
+ const arli=settings.model?.startsWith('arliai/'),[checking,setChecking]=useState(false),[result,setResult]=useState('');
+ const check=async()=>{setChecking(true);setResult('');try{const data=await act('checkArli');if(data?.ok){setResult('Clave verificada: puedes consultar '+data.models.length+' modelos. La disponibilidad para generar respuestas puede variar.');await reload();}}finally{setChecking(false);}};
+ return <><label>Servicio de modelos<select aria-label="Servicio de modelos" value={arli?'arliai':'openrouter'} onChange={e=>{setResult('');act('settings',e.target.value==='arliai'?{model:'arliai/DeepSeek-V4.1-Flash-1017',reasoningEffort:'max',providerRouting:'auto',contextWindow:96000,concurrency:1}:{model:'deepseek/deepseek-v4.1-flash',reasoningEffort:'none'});}}><option value="arliai">Arli.ai</option><option value="openrouter">OpenRouter</option></select></label>
+ <span className="status">{(arli?state.providerKeys?.arliai:state.providerKeys?.openrouter)?'Clave guardada':'Sin clave de '+(arli?'Arli.ai':'OpenRouter')}</span>
+ <SecretField key={arli?'arliai':'openrouter'} name={arli?'ARLIAI_API_KEY':'OPENROUTER_API_KEY'} label={'Clave de '+(arli?'Arli.ai':'OpenRouter')} act={act}/>
+ {arli&&<><p className="hint">Recomendado para coding: DeepSeek-V4.1-Flash-1017, con razonamiento máximo. Arli.ai Plus: 128K de contexto total y una petición simultánea. NEXUS usa un techo de trabajo de 96K para reservar espacio para la respuesta.</p><div className="row"><button type="button" onClick={()=>act('settings',{model:'arliai/DeepSeek-V4.1-Flash-1017',reasoningEffort:'max'})}>Usar DeepSeek · coding</button><button type="button" onClick={()=>act('settings',{model:'arliai/GLM-4.6-Derestricted-v5',reasoningEffort:'high'})}>Usar GLM · Derestricted</button></div><button type="button" disabled={checking||!state.providerKeys?.arliai} onClick={check}>{checking?'Comprobando…':'Comprobar conexión Arli.ai'}</button>{result&&<p role="status">{result}</p>}<p className="hint">La comprobación consulta tu catálogo de cuenta y no genera respuestas. Las búsquedas web nativas de OpenRouter y su selección de proveedor sólo se aplican a modelos de OpenRouter.</p></>}
+ </>;
+}

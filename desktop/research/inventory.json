@@ -1,0 +1,71 @@
+{
+  "date": "2026-09-12",
+  "scope": "Public source snapshots for read-only research; not bundled in NEXUS",
+  "repositories": [
+    {
+      "name": "aider",
+      "repo": "https://github.com/Aider-AI/aider.git",
+      "commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+    },
+    {
+      "name": "browser-use",
+      "repo": "https://github.com/browser-use/browser-use.git",
+      "commit": "50f205533fe10ba35b553d2a3689c77b87bd5d0a"
+    },
+    {
+      "name": "cline",
+      "repo": "https://github.com/cline/cline.git",
+      "commit": "cfe9cadab99617d5013bf89f07b079d105057791"
+    },
+    {
+      "name": "codex",
+      "repo": "https://github.com/openai/codex.git",
+      "commit": "c4017a87aacc7558002b7cb510025e967c1d765e"
+    },
+    {
+      "name": "continue",
+      "repo": "https://github.com/continuedev/continue.git",
+      "commit": "5522c6f44ca0ac3528b37244818fbfa39b5af470"
+    },
+    {
+      "name": "goose",
+      "repo": "https://github.com/block/goose.git",
+      "commit": "50666ae0b9a51e260b52b7efbab2e4e020346e94"
+    },
+    {
+      "name": "hermes",
+      "repo": "https://github.com/NousResearch/hermes-agent.git",
+      "commit": "476d7223b594824545debcc29df0c53e4fb0c782"
+    },
+    {
+      "name": "interpreter",
+      "repo": "https://github.com/OpenInterpreter/open-interpreter.git",
+      "commit": "2885d0d8ba0fd8a036695c5abebbb9524dcca015"
+    },
+    {
+      "name": "librechat",
+      "repo": "https://github.com/danny-avila/LibreChat.git",
+      "commit": "1ef4aa9f140690493ced260bca8b9f4f257f9756"
+    },
+    {
+      "name": "openclaw",
+      "repo": "https://github.com/openclaw/openclaw.git",
+      "commit": "c1a39f89b4a24566cab603a48122cdfcc1631414"
+    },
+    {
+      "name": "opencode",
+      "repo": "https://github.com/anomalyco/opencode.git",
+      "commit": "95daf90670b7c039c436c85537da5fbfe2205b41"
+    },
+    {
+      "name": "openhands",
+      "repo": "https://github.com/OpenHands/OpenHands.git",
+      "commit": "de5a79b4ce578c56f5fef330551a0c1fb8bd12bc"
+    },
+    {
+      "name": "roo",
+      "repo": "https://github.com/RooCodeInc/Roo-Code.git",
+      "commit": "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16"
+    }
+  ]
+}
