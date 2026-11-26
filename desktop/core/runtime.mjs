@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { baseTools, executeTool, READ_ONLY_TOOL_NAMES } from './tools.mjs';
 import { ProcessManager, StatefulShellManager, discoverWorkspaceInstructions, expandSlashCommand, revertFileBackup } from './coding-engine.mjs';
@@ -91,8 +92,13 @@ export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
   }
   if (['write_file', 'replace_text', 'multi_edit', 'apply_patch', 'move_file'].includes(name)) {
     const targetPath = String(args?.path || args?.to || '');
-    if (task?.workspace && targetPath && /^(?:[A-Za-z]:\\|\/|\.\.)/.test(targetPath)) {
-      return { risky: true, reason: `File write outside workspace (${targetPath})` };
+    if (task?.workspace && targetPath) {
+      const wsRoot = path.resolve(task.workspace);
+      const resolvedTarget = path.resolve(wsRoot, targetPath);
+      const rel = path.relative(wsRoot, resolvedTarget);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return { risky: true, reason: `File write outside workspace (${targetPath})` };
+      }
     }
     return { risky: false, reason: '' };
   }
@@ -328,7 +334,7 @@ export class Runtime extends EventEmitter {
       if (this.active.size >= effectiveLimit) continue;
       if (task.status !== 'queued') continue;
       if (this.compacting.has(task.id)) continue;
-      const dependencies = task.dependsOn.map(id => this.store.task(id));
+      const dependencies = (task.dependsOn || []).map(id => this.store.state.tasks.find(t => t.id === id)).filter(Boolean);
       if (dependencies.some(t => t.status !== 'complete')) continue;
       if (task.workspace && [...this.active.keys()].some(id => {
         const other = this.store.task(id);
@@ -622,7 +628,10 @@ export class Runtime extends EventEmitter {
     this.flushFollowups(task);
     if (instruction?.trim()) {
       if (/^\/compact\b/i.test(instruction.trim())) {
-        void this.compact(task).catch(err => {
+        void (async () => {
+          if (this.store.state.settings.microCompaction !== false) await this.microCompactTask(task);
+          await this.compact(task);
+        })().catch(err => {
           task.error = err?.message || 'Compaction failed.';
           this.changed(task);
         });
@@ -1187,7 +1196,7 @@ export class Runtime extends EventEmitter {
     const started = Date.now();
     try {
       if (!baseTools.some(t => t.function.name === call.function.name) && !this.plugins?.findTool(call.function.name)) throw new Error('Unknown tool');
-      let args = JSON.parse(call.function.arguments);
+      let args = JSON.parse(call.function.arguments || '{}');
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid tool arguments');
       let name = call.function.name;
       if(name==='invoke_function'){

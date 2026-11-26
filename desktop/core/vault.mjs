@@ -10,11 +10,13 @@ function dpapiProtect(plaintext) {
   const b64 = Buffer.from(plaintext, 'utf8').toString('base64');
   const script = [
     'Add-Type -AssemblyName System.Security',
-    `$bytes = [Convert]::FromBase64String('${b64}')`,
+    '$b64 = [Console]::In.ReadToEnd().Trim()',
+    '$bytes = [Convert]::FromBase64String($b64)',
     '$enc = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)',
     '[Console]::Out.Write([Convert]::ToBase64String($enc))',
   ].join('; ');
   return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    input: b64,
     windowsHide: true,
     timeout: 15000,
     encoding: 'utf8',
@@ -22,13 +24,16 @@ function dpapiProtect(plaintext) {
 }
 
 function dpapiUnprotect(cipherBase64) {
+  const clean = String(cipherBase64 || '').replace(/[^A-Za-z0-9+/=]/g, '');
   const script = [
     'Add-Type -AssemblyName System.Security',
-    `$bytes = [Convert]::FromBase64String('${cipherBase64.replace(/[^A-Za-z0-9+/=]/g, '')}')`,
+    '$b64 = [Console]::In.ReadToEnd().Trim()',
+    '$bytes = [Convert]::FromBase64String($b64)',
     '$dec = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)',
     '[Console]::Out.Write([Text.Encoding]::UTF8.GetString($dec))',
   ].join('; ');
   return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    input: clean,
     windowsHide: true,
     timeout: 15000,
     encoding: 'utf8',
@@ -83,6 +88,18 @@ export class SecretVault {
     return Object.keys(this.secrets);
   }
 
+  rotateBackups(maxBackups = 5) {
+    try {
+      const copies = fs.readdirSync(this.directory)
+        .filter(name => /^vault-backup-.*\.dpapi$/i.test(name))
+        .map(name => path.join(this.directory, name))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+      for (const stale of copies.slice(maxBackups)) {
+        try { fs.unlinkSync(stale); } catch {}
+      }
+    } catch {}
+  }
+
   save() {
     fs.mkdirSync(this.directory, { recursive: true });
     const json = JSON.stringify(this.secrets);
@@ -90,17 +107,27 @@ export class SecretVault {
       try {
         const encrypted = dpapiProtect(json);
         if (fs.existsSync(this.dpapiFile)) {
-          try { fs.copyFileSync(this.dpapiFile, path.join(this.directory, 'vault-backup-' + stamp() + '.dpapi')); } catch {}
+          try {
+            fs.copyFileSync(this.dpapiFile, path.join(this.directory, 'vault-backup-' + stamp() + '.dpapi'));
+            this.rotateBackups(5);
+          } catch {}
         }
-        const tmp = this.dpapiFile + '.tmp';
+        const tmp = this.dpapiFile + '.' + process.pid + '.tmp';
         fs.writeFileSync(tmp, encrypted, 'utf8');
         fs.renameSync(tmp, this.dpapiFile);
+        if (fs.existsSync(this.plainFile)) {
+          try {
+            const plainTmp = this.plainFile + '.' + process.pid + '.tmp';
+            fs.writeFileSync(plainTmp, JSON.stringify(this.secrets, null, 2), 'utf8');
+            fs.renameSync(plainTmp, this.plainFile);
+          } catch {}
+        }
         return;
       } catch (err) {
         console.error('NEXUS: DPAPI encryption unavailable, falling back to local vault.plain.json:', err.message);
       }
     }
-    const tmp = this.plainFile + '.tmp';
+    const tmp = this.plainFile + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(this.secrets, null, 2), 'utf8');
     fs.renameSync(tmp, this.plainFile);
   }

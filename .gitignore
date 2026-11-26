@@ -56,6 +56,10 @@ next-env.d.ts
 *.db
 *.db-*
 vault*.bin*
+vault*.dpapi*
+vault.plain.json
+nexus.config.json
+desktop/tor/
 workspace.json
 workspace.json.*
 storage-engine.json

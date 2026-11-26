@@ -1,5 +1,5 @@
-// Resolución de la carpeta de datos de NEXUS.
-// Objetivo: un único almacén estable aunque el lanzador redirija %APPDATA% (p. ej. LocalCache de paquetes MSIX).
+// Resolve the canonical NEXUS data directory.
+// Goal: a single stable store even when a launcher redirects %APPDATA% (e.g., MSIX LocalCache).
 const path = require('node:path');
 
 function resolveDataDirectory({ platform = process.platform, env = process.env, fallbackAppData } = {}) {

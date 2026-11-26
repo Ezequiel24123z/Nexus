@@ -148,7 +148,7 @@ export async function multiEditFile(store, task, target, requestedPath, edits = 
 }
 
 export function nodeExecutable() {
-  return process.versions.electron ? 'node' : process.execPath;
+  return process.execPath;
 }
 
 export async function revertFileBackup(store, task, eventId) {
@@ -677,7 +677,7 @@ export async function fetchWebResource(urlInput, { extractText = true, offset = 
   try { parsed = new URL(urlInput); } catch { throw new Error('Invalid URL.'); }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS URLs are supported.');
   const response = await request(parsed.href, {
-    headers: { 'User-Agent': 'NEXUS-Agent/0.3 (+https://github.com/Ezequiel24123z/Nexus)' },
+    headers: { 'User-Agent': 'NEXUS-Agent/1.1 (+https://github.com/Ezequiel24123z/Nexus)' },
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
   });
   const contentType = response.headers.get('content-type') || '';
@@ -1263,7 +1263,7 @@ export async function inspectWebPage(urlInput, { extractLinks = true, extractFor
     return browserInspect(parsed.href, { extractLinks, extractForms, signal });
   }
   const response = await request(parsed.href, {
-    headers: { 'User-Agent': 'NEXUS-Agent/0.4 (+https://github.com/Ezequiel24123z/Nexus)' },
+    headers: { 'User-Agent': 'NEXUS-Agent/1.1 (+https://github.com/Ezequiel24123z/Nexus)' },
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
   });
   const html = await response.text();

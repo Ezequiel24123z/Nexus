@@ -228,17 +228,15 @@ export default function StudioView({ workspace, setWorkspace, act, notify, onOpe
       }).catch(() => {});
     }
     if (!window.nexus?.subscribeTerminal) return;
+    const activeTermId = termSession?.id;
     return window.nexus.subscribeTerminal(evt => {
-      setTermSession(cur => {
-        if (!cur || evt.id !== cur.id) return cur;
-        if (evt.type === 'data') {
-          setTermBuffer(prev => (prev + evt.chunk).slice(-120000));
-          requestAnimationFrame(() => termEndRef.current?.scrollIntoView({ block: 'end' }));
-        } else if (evt.type === 'exit') {
-          return { ...cur, status: 'exited', exitCode: evt.exitCode };
-        }
-        return cur;
-      });
+      if (!activeTermId || evt.id !== activeTermId) return;
+      if (evt.type === 'data') {
+        setTermBuffer(prev => (prev + evt.chunk).slice(-120000));
+        requestAnimationFrame(() => termEndRef.current?.scrollIntoView({ block: 'end' }));
+      } else if (evt.type === 'exit') {
+        setTermSession(cur => (cur && cur.id === activeTermId ? { ...cur, status: 'exited', exitCode: evt.exitCode } : cur));
+      }
     });
   }, [tab, termSession?.id]);
 

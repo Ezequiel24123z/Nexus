@@ -318,10 +318,12 @@ internal sealed class ConPtySession : IDisposable
     {
         try
         {
-            if (_hProcess != IntPtr.Zero && WaitForSingleObject(_hProcess, INFINITE) == WAIT_OBJECT_0)
+            IntPtr hProc = Volatile.Read(ref _hProcess);
+            if (hProc != IntPtr.Zero && WaitForSingleObject(hProc, INFINITE) == WAIT_OBJECT_0)
             {
+                if (_disposed) return;
                 uint code = 0;
-                GetExitCodeProcess(_hProcess, out code);
+                GetExitCodeProcess(hProc, out code);
                 Status = "exited";
                 ExitCode = unchecked((int)code);
                 onExit(ExitCode.Value);
@@ -378,11 +380,14 @@ internal sealed class ConPtySession : IDisposable
         if (_disposed) return;
         _disposed = true;
         Status = "closed";
-        try { if (_hProcess != IntPtr.Zero) TerminateProcess(_hProcess, 0); } catch { }
-        try { if (_hPC != IntPtr.Zero) { ClosePseudoConsole(_hPC); _hPC = IntPtr.Zero; } } catch { }
+        IntPtr hPC = Interlocked.Exchange(ref _hPC, IntPtr.Zero);
+        IntPtr hProc = Interlocked.Exchange(ref _hProcess, IntPtr.Zero);
+        IntPtr hThr = Interlocked.Exchange(ref _hThread, IntPtr.Zero);
+        try { if (hPC != IntPtr.Zero) ClosePseudoConsole(hPC); } catch { }
+        try { if (hProc != IntPtr.Zero) TerminateProcess(hProc, 0); } catch { }
         try { _inputStream.Dispose(); } catch { }
         try { _outputStream.Dispose(); } catch { }
-        try { if (_hThread != IntPtr.Zero) { CloseHandle(_hThread); _hThread = IntPtr.Zero; } } catch { }
-        try { if (_hProcess != IntPtr.Zero) { CloseHandle(_hProcess); _hProcess = IntPtr.Zero; } } catch { }
+        try { if (hThr != IntPtr.Zero) CloseHandle(hThr); } catch { }
+        try { if (hProc != IntPtr.Zero) CloseHandle(hProc); } catch { }
     }
 }

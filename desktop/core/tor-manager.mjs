@@ -246,16 +246,17 @@ export class TorManager extends EventEmitter {
       const geoip6 = this.resolveDataFile(bin, 'geoip6');
       const cookieFile = path.join(this.torDataDir, 'control_auth_cookie');
       const torrcPath = path.join(this.torDataDir, 'torrc');
+      const quoteTorPath = p => '"' + String(p).replace(/\\/g, '/').replace(/"/g, '\\"') + '"';
       const torrcLines = [
         `SocksPort 127.0.0.1:${this.socksPort} IsolateDestAddr`,
         `ControlPort 127.0.0.1:${this.controlPort}`,
         'CookieAuthentication 1',
-        `CookieAuthFile ${cookieFile}`,
-        `DataDirectory ${this.torDataDir}`,
+        `CookieAuthFile ${quoteTorPath(cookieFile)}`,
+        `DataDirectory ${quoteTorPath(this.torDataDir)}`,
         'ClientOnly 1',
         'AvoidDiskWrites 1',
-        ...(geoip ? [`GeoIPFile ${geoip}`] : []),
-        ...(geoip6 ? [`GeoIPv6File ${geoip6}`] : []),
+        ...(geoip ? [`GeoIPFile ${quoteTorPath(geoip)}`] : []),
+        ...(geoip6 ? [`GeoIPv6File ${quoteTorPath(geoip6)}`] : []),
       ];
       await fsp.writeFile(torrcPath, torrcLines.join('\n') + '\n', 'utf8');
 
@@ -268,9 +269,10 @@ export class TorManager extends EventEmitter {
 
       let resolveBoot, rejectBoot;
       const bootPromise = new Promise((res, rej) => { resolveBoot = res; rejectBoot = rej; });
-      const bootTimer = setTimeout(() => {
+      if (!waitForBootstrap) bootPromise.catch(() => {});
+      const bootTimer = waitForBootstrap ? setTimeout(() => {
         rejectBoot(new Error(`Tor bootstrap timed out at ${this.bootstrapPct}% (${this.bootstrapSummary || 'network may block direct Tor relays'}).`));
-      }, timeoutMs);
+      }, timeoutMs) : null;
 
       const handleLine = rawLine => {
         const line = String(rawLine || '').trim();
