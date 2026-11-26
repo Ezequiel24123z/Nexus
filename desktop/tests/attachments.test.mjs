@@ -93,10 +93,16 @@ test('the tool loop reads an attachment into a bounded result and completes with
  assert.ok(task.workspace.startsWith(store.directoryFor(id)));await runtime.run(task,new AbortController().signal);
  assert.equal(requests,2);assert.equal(task.status,'complete');assert.equal(task.result,'Comprobado.');
 });
-test('renderer bridge exposes attachment and web link methods while rejecting unknown operations',async()=>{
- let bridge;const sent=[];
- const code=await fs.readFile(new URL('../preload.cjs',import.meta.url),'utf8');
- vm.runInNewContext(code,{require:name=>{assert.equal(name,'electron');return {contextBridge:{exposeInMainWorld:(_,value)=>bridge=value},ipcRenderer:{invoke:(...args)=>{sent.push(args);return Promise.resolve(true);}}};}});
- for(const method of ['chooseAttachments','previewAttachment','openExternal','searchChat','messageWindow','taskResults','previewResult','watchChat','storageInfo','migrateStorage','exportStorage','inspectRecovery','restoreRecovery','capabilitiesPage','getCapability','saveCapability','connectorsPage','getConnector','updateConnector','mcpToolsPage','previewOpenApi','importOpenApi','inspectContext','contextSection','inspectCosts','checkpointPreview'])await bridge.invoke(method,{id:'example'});
- assert.equal(sent.length,26);await assert.rejects(bridge.invoke('exec'));
+test('standalone core server exposes attachment, search, storage, capability, and inspector APIs while rejecting unknown operations',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'nexus-server-api-'));
+ t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const {createNexusServer}=await import('../core/server.mjs');
+ const srv=await createNexusServer({dataDir:dir,port:0});
+ t.after(()=>srv.close());
+ assert.ok(await srv.invoke('snapshot'));
+ assert.ok(await srv.invoke('storageInfo'));
+ assert.ok(await srv.invoke('capabilitiesPage',{}));
+ assert.ok(await srv.invoke('connectorsPage',{}));
+ assert.ok(await srv.invoke('hostInfo'));
+ await assert.rejects(srv.invoke('nonexistent_exec'),/Unknown operation/);
 });

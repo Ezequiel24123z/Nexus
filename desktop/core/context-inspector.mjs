@@ -15,7 +15,7 @@ function printable(value) {
 }
 function plan(runtime,task) {
   const {messages,sections}=runtime.buildContext(task,{hydrate:false,inspect:true});
-  const tools=requestTools(runtime.effectiveSettings?runtime.effectiveSettings(task):{...runtime.store.state.settings,model:task.model});
+  const tools=requestTools(runtime.effectiveSettings?runtime.effectiveSettings(task):{...runtime.store.state.settings,model:task.model}, runtime.plugins, task.loadedToolsets);
   sections.push({id:'tools',label:'Available Tools',reason:'Tool schemas sent alongside generation. Catalog contracts are queried on demand.',value:tools,count:tools.length});
   const fingerprint=crypto.createHash('sha256').update(printable({messages,tools})).digest('hex');
   return {sections,fingerprint,total:runtime.estimate(task,messages)+runtime.estimate(task,tools)};
@@ -23,11 +23,14 @@ function plan(runtime,task) {
 export function inspectContext(runtime,task) {
   const current=plan(runtime,task),settings=runtime.store.state.settings;
   const sections=current.sections.map(({value,...section})=>({...section,tokens:runtime.estimate(task,value),characters:printable(value).length}));
-  const threshold=Math.floor(settings.contextWindow*settings.compressionPercent/100);
-  return {at:new Date().toISOString(),fingerprint:current.fingerprint,sections,total:current.total,threshold,ceiling:settings.contextWindow,estimated:true,
+  const ceiling=task.contextWindow || settings.contextWindow;
+  const threshold=Math.floor(ceiling*settings.compressionPercent/100);
+  const microEvents=(task.events||[]).filter(e=>e.kind==='micro_compaction');
+  return {at:new Date().toISOString(),fingerprint:current.fingerprint,sections,total:current.total,threshold,ceiling,estimated:true,
     lastReportedInput:(task.calls||[]).findLast(call=>call.kind==='generation'&&known(call.input))?.input??(task.lastInputTokens||null),needsCompression:Math.max(current.total,task.lastInputTokens||0)>=threshold,
-    live:runtime.active.has(task.id)||runtime.compacting.has(task.id),affinity:settings.cacheAffinity===true,
+    live:runtime.active.has(task.id)||runtime.compacting.has(task.id),affinity:settings.cacheAffinity===true,promptCaching:settings.promptCaching!==false,lazyToolLoading:settings.lazyToolLoading===true,loadedToolsets:task.loadedToolsets||[],
     compression:task.lastCompression||null,compressions:task.compressions||0,
+    microCompactions:{count:microEvents.length,tokensFreed:microEvents.reduce((s,e)=>s+(e.detail?.estimatedTokensFreed||0),0)},
     checkpoints:(task.events||[]).filter(event=>event.kind==='compression').slice(-15).reverse().map(event=>({at:event.at,checkpoint:event.detail.checkpoint,before:event.detail.before??null,after:event.detail.after??null,truncated:!!event.detail.truncated,cost:event.detail.cost??null,unknownCosts:event.detail.unknownCosts??null})),
     note:'Snapshot of the current context before the next model call. Local token estimate, not exact tokenizer output; images and server web tools may add provider-specific overhead.'};
 }

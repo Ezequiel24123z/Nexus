@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {readArtifact} from './artifacts.mjs';
+import { proxiedFetch, resolveEffectiveProxyUrl } from './privacy-proxy.mjs';
 import {catalogPage,functionTargets} from './capabilities.mjs';
 import {
   readFileWithRanges,
@@ -19,9 +20,16 @@ import {
   executeHttpRequest,
   runCodeDiagnostics,
   inspectWebPage,
+  wrapUtf8Ps,
+  createUnifiedDiff,
+  buildDirectoryTree,
+  deleteFileWithBackup,
+  moveFileWithBackup,
+  searchWebDuckDuckGo,
 } from './coding-engine.mjs';
 
 export const READ_ONLY_TOOL_NAMES = new Set([
+  'load_toolset',
   'search_capabilities',
   'get_capability',
   'list_attachments',
@@ -29,7 +37,9 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   'list_mcp_servers',
   'list_mcp_tools',
   'list_files',
+  'dir_tree',
   'read_file',
+  'batch_read_files',
   'search_files',
   'glob_files',
   'grep_search',
@@ -44,9 +54,46 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   'list_connectors',
   'get_connector',
   'todo_read',
+  'web_search',
   'web_fetch',
   'system_info',
+  'list_sessions',
+  'read_session',
 ]);
+
+export const CORE_TOOL_NAMES = new Set([
+  'load_toolset',
+  'list_files',
+  'dir_tree',
+  'read_file',
+  'batch_read_files',
+  'glob_files',
+  'grep_search',
+  'code_outline',
+  'write_file',
+  'replace_text',
+  'multi_edit',
+  'apply_patch',
+  'run_command',
+  'todo_write',
+  'todo_read',
+  'document_progress',
+  'read_artifact',
+  'read_checkpoint',
+]);
+
+export const TOOLSET_GROUPS = {
+  git: ['git_operation', 'delete_file', 'move_file', 'run_diagnostics'],
+  shell_processes: ['shell_session', 'manage_process', 'system_info'],
+  web_browser: ['web_search', 'web_fetch', 'browser_inspect', 'http_request'],
+  sessions: ['spawn_session', 'list_sessions', 'send_session_message', 'read_session', 'delegate_subagent'],
+  capabilities_mcp: ['search_capabilities', 'get_capability', 'save_capability', 'invoke_function', 'list_mcp_servers', 'list_mcp_tools', 'invoke_mcp', 'scaffold_mcp_server'],
+  connectors: ['list_connectors', 'get_connector', 'create_connector', 'invoke_connector', 'list_effects', 'reconcile_effect', 'verify_effect', 'retry_effect'],
+  memory_history: ['memory_store', 'search_journal', 'search_history', 'list_attachments', 'read_attachment', 'search_files'],
+  desktop: ['desktop_screenshot', 'desktop_action'],
+  automations_evolve: ['manage_automation', 'self_improve', 'create_dynamic_tool'],
+  plugins: [],
+};
 
 export async function workspacePath(root, requested = '.', allowMissing = false) {
   const realRoot = await fs.realpath(root);
@@ -90,6 +137,7 @@ export function command(executable, args, { cwd, signal, timeout = 60000 } = {})
 const def = (name, description, properties, required = []) => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties, required, additionalProperties: false } } });
 const str = description => ({ type: 'string', description });
 export const baseTools = [
+  def('load_toolset', 'Dynamically activate optional tool groups on demand to save context tokens. Available groups: git (git/delete/move/diagnostics), shell_processes (stateful shell/background processes/system_info), web_browser (web_search/web_fetch/browser_inspect/http_request), sessions (spawn_session/inter-session messaging/subagents), capabilities_mcp (skills/functions/MCP), connectors (REST connectors/effects), memory_history (memories/attachments/history search), desktop (Windows screen/mouse/keyboard), automations_evolve (cron automations/self_improve/create_dynamic_tool), plugins (installed JS plugins), or "all".', { toolsets: { type: 'array', items: { type: 'string', enum: ['git', 'shell_processes', 'web_browser', 'sessions', 'capabilities_mcp', 'connectors', 'memory_history', 'desktop', 'automations_evolve', 'plugins', 'all'] } } }, ['toolsets']),
   def('search_capabilities','Search reusable local skills or functions by name, description, and tags. Query the catalog first before recreating a procedure. Returns paged metadata only.',{query:str('Search text'),kind:{type:'string',enum:['all','skill','function']},offset:{type:'integer',minimum:0}}),
   def('get_capability','Load on demand the full instructions of a skill or a function and its tool schema. Does not execute the function.',{id:str('Identifier found in search_capabilities')},['id']),
   def('save_capability','Create or update a reusable local skill or function. For updates pass id and revision from get_capability. Functions wrap an existing tool with default arguments. Never store raw secret values.',{id:str('ID only when updating'),revision:{type:'integer',minimum:1},kind:{type:'string',enum:['skill','function']},name:str('Descriptive name'),description:str('When to use it'),tags:{type:'array',items:{type:'string'}},enabled:{type:'boolean'},instructions:str('Skill instructions'),tool:{type:'string',enum:functionTargets},defaults:{type:'object',additionalProperties:true}},['kind','name','description']),
@@ -100,7 +148,9 @@ export const baseTools = [
   def('list_mcp_tools','Search MCP tools with paged metadata. Pass tool to load the full input schema of a single selected tool.',{server:str('Server name'),query:str('Search query'),offset:{type:'integer',minimum:0},tool:str('Exact tool name to retrieve full schema')},['server']),
   def('invoke_mcp','Execute an MCP tool using its discovered input schema.',{server:str('Server name'),tool:str('Tool name'),input:{type:'object',additionalProperties:true}},['server','tool']),
   def('list_files', 'List directory entries. In autonomous or unrestricted mode supports absolute paths outside the project.', { path: str('Relative or absolute directory path') }),
+  def('dir_tree', 'Return a compact indented directory tree (skipping node_modules/.git) up to maxDepth levels for rapid repo orientation.', { path: str('Optional relative or absolute directory (default ".")'), maxDepth: { type: 'integer', minimum: 1, maximum: 8 }, maxEntries: { type: 'integer', minimum: 10, maximum: 800 } }),
   def('read_file', 'Read a UTF-8 file (up to 100 KB whole, or pass startLine and endLine to inspect line ranges of files up to 10 MB with line numbers).', { path: str('Relative or absolute path'), startLine: { type: 'integer', minimum: 1, description: 'Optional 1-based start line' }, endLine: { type: 'integer', minimum: 1, description: 'Optional 1-based inclusive end line' } }, ['path']),
+  def('batch_read_files', 'Read up to 10 files (or line ranges) in one call to cut exploration round-trips.', { files: { type: 'array', items: { type: 'object', properties: { path: str('File path'), startLine: { type: 'integer', minimum: 1 }, endLine: { type: 'integer', minimum: 1 } }, required: ['path'], additionalProperties: false } } }, ['files']),
   def('search_files', 'Search literal text across project files, skipping dependencies and binaries. Returns file paths and line numbers.', { query:str('Literal text'), path:str('Optional relative subfolder') }, ['query']),
   def('glob_files', 'Fast file discovery by glob pattern (e.g. "**/*.ts", "src/**/*.{jsx,css}", "*.json").', { pattern: str('Glob pattern to match'), path: str('Optional relative subdirectory') }, ['pattern']),
   def('grep_search', 'Ripgrep-style code search supporting regular expressions, case sensitivity, file glob filtering, and surrounding context lines.', { query: str('Search string or regular expression'), path: str('Optional relative subdirectory'), glob: str('Optional file glob filter, e.g. "*.mjs" or "src/**/*.jsx"'), isRegex: { type: 'boolean', description: 'Treat query as a regular expression' }, caseSensitive: { type: 'boolean', description: 'Case-sensitive matching' }, contextLines: { type: 'integer', minimum: 0, maximum: 5, description: 'Number of context lines before and after each match' } }, ['query']),
@@ -111,7 +161,9 @@ export const baseTools = [
   def('replace_text', 'Replace an exact, unique text block in a file. Fails if oldText does not match exactly once. Creates an automatic backup.', { path: str('File path'), oldText: str('Exact text to replace'), newText: str('Replacement text'), reason: str('Reason for change') }, ['path', 'oldText', 'newText', 'reason']),
   def('multi_edit', 'Apply multiple sequential exact text replacements to a single file atomically in one operation. Creates a backup before modifying.', { path: str('File path'), edits: { type: 'array', items: { type: 'object', properties: { oldText: str('Exact text to find'), newText: str('Replacement text') }, required: ['oldText', 'newText'], additionalProperties: false } }, reason: str('Reason for changes') }, ['path', 'edits', 'reason']),
   def('apply_patch', 'Apply a patch to a file using either <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks or unified diff @@ hunks.', { path: str('File path'), patch: str('Patch content'), reason: str('Reason for patch') }, ['path', 'patch', 'reason']),
-  def('git_operation', 'Execute structured Git operations in the workspace: status, diff, log, branch, stage, unstage, commit, worktree_list, worktree_add, or worktree_remove.', { operation: { type: 'string', enum: ['status', 'diff', 'log', 'branch', 'stage', 'unstage', 'commit', 'worktree_list', 'worktree_add', 'worktree_remove'] }, staged: { type: 'boolean', description: 'For diff: inspect staged changes' }, target: str('Optional file path for diff/stage/unstage'), paths: { type: 'array', items: { type: 'string' }, description: 'File paths for stage/unstage' }, message: str('Commit message when operation is commit'), stageAll: { type: 'boolean', description: 'Stage all changes before commit' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, path: str('Target directory for worktree_add or worktree_remove'), branch: str('Branch name for worktree_add') }, ['operation']),
+  def('delete_file', 'Delete a file while saving an automatic backup copy so the user can revert in 1 click.', { path: str('File path to delete'), reason: str('Reason for deletion') }, ['path', 'reason']),
+  def('move_file', 'Rename or move a file with automatic backup and journal tracking.', { from: str('Source file path'), to: str('Destination file path'), reason: str('Reason for move') }, ['from', 'to', 'reason']),
+  def('git_operation', 'Execute structured Git operations in the workspace (or custom cwd in autonomous/unrestricted mode): status, diff, log, branch, checkout, checkout_new (creates a new branch via git checkout -b), discard, stash, pull, push, stage, unstage, commit, worktree_list, worktree_add, or worktree_remove.', { operation: { type: 'string', enum: ['status', 'diff', 'log', 'branch', 'checkout', 'checkout_new', 'discard', 'stash', 'pull', 'push', 'stage', 'unstage', 'commit', 'worktree_list', 'worktree_add', 'worktree_remove'] }, cwd: str('Optional repository directory path (in autonomous/unrestricted mode)'), staged: { type: 'boolean', description: 'For diff: inspect staged changes' }, target: str('Optional file path for diff/stage/unstage/discard'), paths: { type: 'array', items: { type: 'string' }, description: 'File paths for stage/unstage' }, message: str('Commit or stash message'), stageAll: { type: 'boolean', description: 'Stage all changes before commit' }, create: { type: 'boolean', description: 'Create new branch on checkout (or use operation: checkout_new)' }, createBranch: { type: 'boolean', description: 'Alias for create on checkout' }, pop: { type: 'boolean', description: 'Pop latest stash' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, path: str('Target directory for worktree_add or worktree_remove'), branch: str('Branch name for checkout, checkout_new, or worktree_add') }, ['operation']),
   def('run_command', 'Execute a PowerShell command with the user Windows permissions. Unsandboxed. No automatic timeout; user can pause.', { command: str('PowerShell command'), reason: str('Purpose of command') }, ['command', 'reason']),
   def('shell_session', 'Execute a command in a persistent stateful shell session for this task that preserves working directory (cd) and environment variables across calls.', { command: str('Command to run in the persistent session'), env: { type: 'object', additionalProperties: true, description: 'Optional environment variables to set or persist' }, reason: str('Purpose of command') }, ['command']),
   def('run_diagnostics', 'Run fast syntax and type diagnostics (node --check, JSON validation) across a file or workspace directory.', { path: str('Optional relative file or directory path (default ".")') }),
@@ -121,8 +173,15 @@ export const baseTools = [
   def('todo_write', 'Create or update the structured task checklist (plan) for this session to track multi-step engineering progress.', { todos: { type: 'array', items: { type: 'object', properties: { id: str('Short kebab-case ID'), title: str('Actionable task description'), status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'blocked'] }, priority: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['id', 'title', 'status'], additionalProperties: false } } }, ['todos']),
   def('todo_read', 'Read the current structured task checklist for this session.', {}),
   def('memory_store', 'Manage persistent agent memories across sessions (project conventions, architecture facts, user preferences).', { action: { type: 'string', enum: ['list', 'remember', 'forget'] }, key: str('Memory key or short topic'), value: str('Fact or convention to remember'), scope: { type: 'string', enum: ['project', 'global'], description: 'Scope of memory (defaults to project if in a workspace, else global)' } }, ['action']),
+  def('web_search', 'Search the live web using built-in DuckDuckGo search (works on every provider without needing an API key). Returns titles, URLs, and snippets.', { query: str('Search query'), maxResults: { type: 'integer', minimum: 1, maximum: 15 } }, ['query']),
   def('web_fetch', 'Fetch an HTTP/HTTPS URL and extract clean readable text/markdown or JSON content with pagination.', { url: str('HTTP or HTTPS URL'), extractText: { type: 'boolean', description: 'Convert HTML to clean readable text (default true)' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 100, maximum: 24000 } }, ['url']),
+  def('manage_automation', 'Create, list, toggle, trigger, or delete local scheduled/cron automations that run autonomously in NEXUS.', { action: { type: 'string', enum: ['list', 'create', 'toggle', 'run', 'delete'] }, id: str('Automation ID (required for toggle, run, delete)'), name: str('Automation name (required for create)'), prompt: str('Task prompt to execute (required for create)'), workspace: str('Optional workspace directory for the automation'), scheduleType: { type: 'string', enum: ['interval', 'daily', 'weekly', 'cron', 'once'] }, everyMinutes: { type: 'integer', minimum: 1 }, hour: { type: 'integer', minimum: 0, maximum: 23 }, minute: { type: 'integer', minimum: 0, maximum: 59 }, weekday: { type: 'integer', minimum: 0, maximum: 6 }, cronExpression: str('5-field cron expression'), runAt: str('ISO timestamp for once'), enabled: { type: 'boolean' }, model: str('Optional model ID'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted', 'agent', 'architect', 'explore'] } }, ['action']),
   def('delegate_subagent', 'Spawn an isolated sub-agent with its own clean context window to research a question, review code, or execute a bounded sub-task, returning a concise report.', { objective: str('Clear, self-contained task or research question for the sub-agent'), mode: { type: 'string', enum: ['explore', 'architect', 'agent'], description: 'Operating mode for the sub-agent (default explore)' }, maxSteps: { type: 'integer', minimum: 1, maximum: 12, description: 'Maximum tool steps for the sub-agent (default 6)' } }, ['objective']),
+  def('spawn_session', 'Spawn a real persistent nested child session under the current session. Runs independently (and in parallel across separate folders/worktrees) and can exchange messages with parent/peer sessions.', { title: str('Short title for the child session'), prompt: str('Complete self-contained kickoff objective for the child session'), workspace: str('Optional workspace or git worktree path (defaults to current session workspace)'), model: str('Optional model ID override'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted'] }, notifyParentOnIdle: { type: 'boolean', description: 'Automatically notify this parent session when the child completes (default true)' } }, ['prompt']),
+  def('list_sessions', 'List the parent session, nested child sessions, and peer workspace sessions with their IDs, titles, statuses, and latest output previews.', { scope: { type: 'string', enum: ['tree', 'all'], description: 'tree = parent/children/siblings (default), all = all sessions' } }),
+  def('send_session_message', 'Send a message directly to another NEXUS session (child, parent, or peer) to delegate follow-ups, steer active work, or report results. Wakes the target session automatically.', { sessionId: str('Target session ID from spawn_session or list_sessions'), message: str('Message content to deliver to the target session') }, ['sessionId', 'message']),
+  def('read_session', 'Read status, recent messages, todos, and result of a nested child or peer session. Set wait: true to wait for the session to finish.', { sessionId: str('Target session ID'), wait: { type: 'boolean', description: 'Wait until the target session finishes or errors (default false)' }, timeoutSeconds: { type: 'integer', minimum: 1, maximum: 300, description: 'Max seconds to wait when wait is true (default 60)' } }, ['sessionId']),
+  def('create_dynamic_tool', 'Self-evolution tool: author and hot-register a brand-new JavaScript tool directly inside NEXUS so you and future sessions can call it immediately without restarting.', { name: str('Lowercase snake_case tool name (e.g. parse_log_errors)'), description: str('What this tool does'), readOnly: { type: 'boolean', description: 'True if tool does not mutate files or external systems' }, parameters: { type: 'object', description: 'JSON Schema object for tool parameters', additionalProperties: true }, handlerCode: str('Async JS function body using (args, { fs, fsSync, path, os, net, dns, crypto, execFileAsync, require, fetch, workspace }) where fs supports both async promises (await fs.readFile) and common sync helpers (fs.existsSync, fs.statSync, fs.readFileSync); returns a JSON-serializable result') }, ['name', 'description', 'handlerCode']),
   def('system_info', 'Inspect the host operating system, hardware resources, working directory, and installed developer runtimes (node, git, python, gh).', {}),
   def('document_progress', 'Record architectural decisions, modified files, test verification results, and next steps. Call after major milestones and before finishing.', { decisions: str('Decisions and rationale'), changes: str('Modified files and summary'), verification: str('Tests executed and results'), next: str('Remaining work and risks') }, ['decisions', 'changes', 'verification', 'next']),
   def('list_effects', 'List recent external side effects and their recoverable state: observed, uncertain, or pending reconciliation.', {}),
@@ -182,6 +241,23 @@ async function readCheckpoint(store, task, args = {}) {
 
 export async function executeTool(runtime, task, name, args, signal, effect) {
   const store = runtime.store;
+  if (name === 'load_toolset') {
+    const requested = Array.isArray(args.toolsets) ? args.toolsets.filter(Boolean) : [];
+    task.loadedToolsets = [...new Set([...(task.loadedToolsets || []), ...requested])];
+    const activated = [];
+    for (const grp of requested) {
+      if (grp === 'all') {
+        for (const t of baseTools) activated.push(t.function.name);
+        if (runtime.plugins) for (const p of runtime.plugins.list()) activated.push(...(p.toolNames || []));
+      } else if (grp === 'plugins') {
+        if (runtime.plugins) for (const p of runtime.plugins.list()) activated.push(...(p.toolNames || []));
+      } else if (TOOLSET_GROUPS[grp]) {
+        activated.push(...TOOLSET_GROUPS[grp]);
+      }
+    }
+    runtime.changed(task);
+    return { loaded: requested, activeToolsets: task.loadedToolsets, activatedTools: [...new Set(activated)], note: 'These tools are now active and callable on your next step.' };
+  }
   if(name==='search_capabilities')return runtime.capabilities.list({query:args.query,kind:args.kind,offset:args.offset,limit:20});
   if(name==='get_capability'){const entry=runtime.capabilities.get(args.id);return {...entry,...(entry.kind==='function'?{schema:baseTools.find(tool=>tool.function.name===entry.tool)?.function.parameters}:{})};}
   if(name==='save_capability'){const entry=runtime.capabilities.save(args);runtime.emit('change');return {saved:true,id:entry.id,revision:entry.revision};}
@@ -262,11 +338,41 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     }
     throw new Error('Unsupported memory_store action.');
   }
-  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, request: runtime.request, signal });
-  if(name==='http_request')return executeHttpRequest(args, { request: runtime.request, signal });
-  if(name==='browser_inspect')return inspectWebPage(args.url, { extractLinks: args.extractLinks !== false, extractForms: args.extractForms !== false, renderJs: Boolean(args.renderJs), browserInspect: runtime.browserInspect, request: runtime.request, signal });
+  const toolFetch = (url, opts) => {
+    const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, runtime.tor) : '';
+    if (proxyUrl && runtime.request === fetch) return proxiedFetch(url, opts, proxyUrl);
+    return runtime.request(url, opts);
+  };
+  if(name==='web_search')return searchWebDuckDuckGo(args.query, { maxResults: args.maxResults, request: toolFetch, signal });
+  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, request: toolFetch, signal });
+  if(name==='http_request')return executeHttpRequest(args, { request: toolFetch, signal });
+  if(name==='browser_inspect')return inspectWebPage(args.url, { extractLinks: args.extractLinks !== false, extractForms: args.extractForms !== false, renderJs: Boolean(args.renderJs), browserInspect: runtime.browserInspect, request: toolFetch, signal });
+  if(name==='manage_automation'){
+    if(!runtime.automations)throw new Error('Automations scheduler is not attached to this runtime.');
+    if(args.action==='list')return { automations: runtime.automations.list() };
+    if(args.action==='create')return runtime.automations.save({ ...args, workspace: args.workspace || task.workspace || '' });
+    if(['toggle','run','delete'].includes(args.action) && !args.id) throw new Error(`manage_automation action "${args.action}" requires the automation "id" returned by action "list" or "create".`);
+    if(args.action==='toggle')return runtime.automations.toggle(args.id, args.enabled);
+    if(args.action==='run')return runtime.automations.runNow(args.id);
+    if(args.action==='delete')return runtime.automations.remove(args.id);
+    throw new Error('Unsupported manage_automation action.');
+  }
   if(name==='system_info')return inspectSystemEnvironment(task.workspace);
   if(name==='delegate_subagent')return runtime.runSubagent(task, args, signal);
+  if(name==='spawn_session')return runtime.spawnChildSession(task, args);
+  if(name==='list_sessions')return runtime.listSessionsFor(task, args);
+  if(name==='send_session_message')return runtime.sendSessionMessage(task, args);
+  if(name==='read_session')return runtime.readSession(args, signal);
+  if(name==='create_dynamic_tool'){
+    const plugin = await runtime.plugins.createSingleTool(args);
+    store.journal(task, 'dynamic_tool_created', { tool: args.name, pluginId: plugin?.id });
+    runtime.changed(task);
+    return { created: true, tool: args.name, pluginId: plugin?.id, availableImmediately: true };
+  }
+  // Check hot-loaded dynamic plugin tools
+  if(runtime.plugins?.findTool(name)){
+    return runtime.plugins.executeTool(name, args, { task, workspace: task.workspace || process.cwd(), store, runtime });
+  }
   if(name==='scaffold_mcp_server'){
     const res = await scaffoldMcpServer(store, runtime.mcp, args);
     store.journal(task, 'mcp_scaffolded', { server: res.server, tools: res.tools });
@@ -306,24 +412,57 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     if (!store.state.settings.desktopEnabled) throw new Error('Desktop control is disabled in Settings.');
     return runtime.desktop(name, args, signal);
   }
-  if (!task.workspace) throw new Error('Select a project workspace folder to use file, Git, or terminal tools.');
-  if (name === 'run_command') return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', args.command], { cwd: task.workspace, signal, timeout:0 });
-  if (name === 'shell_session') return runtime.shells.exec(task.id, args.command, { defaultCwd: task.workspace, envOverrides: args.env, signal, timeout: 60000 });
-  if (name === 'git_operation') return executeGitOperation(task.workspace, args, signal);
-  const unrestricted = store.state.settings.autonomous || task.agentMode === 'unrestricted';
+  const effectiveMode = task.agentMode || store.state.settings.agentMode || 'autopilot';
+  const unrestricted = effectiveMode === 'unrestricted' || store.state.settings.autonomous;
+  const effectiveWorkspace = task.workspace || (unrestricted ? process.cwd() : '');
+  if (!effectiveWorkspace) throw new Error('Select a project workspace folder to use file, Git, or terminal tools.');
+  if (name === 'run_command') return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(args.command)], { cwd: effectiveWorkspace, signal, timeout:0 });
+  if (name === 'shell_session') return runtime.shells.exec(task.id, args.command, { defaultCwd: effectiveWorkspace, envOverrides: args.env, signal, timeout: 60000 });
+  if (name === 'git_operation') {
+    const mutatingGitOps = new Set(['commit', 'checkout', 'checkout_new', 'discard', 'stash', 'pull', 'push', 'stage', 'unstage', 'worktree_add', 'worktree_remove']);
+    if (!task.workspace && mutatingGitOps.has(args.operation) && !args.cwd) {
+      throw new Error(`Mutating git_operation "${args.operation}" requires an explicit "cwd" path when the chat has no linked project workspace (prevents accidentally mutating the default host repo).`);
+    }
+    const gitCwd = (unrestricted && args.cwd) ? path.resolve(effectiveWorkspace, args.cwd) : effectiveWorkspace;
+    return executeGitOperation(gitCwd, args, signal);
+  }
   const resolvePath = unrestricted ? async(root,requested='.')=>path.resolve(root,requested) : workspacePath;
+  if (name === 'dir_tree') {
+    return buildDirectoryTree(effectiveWorkspace, args.path || '.', { maxDepth: args.maxDepth, maxEntries: args.maxEntries, resolvePath: unrestricted ? null : workspacePath, signal });
+  }
+  if (name === 'batch_read_files') {
+    if (!Array.isArray(args.files) || !args.files.length) throw new Error('Provide a non-empty files array.');
+    const items = await Promise.all(args.files.slice(0, 10).map(async spec => {
+      try {
+        const resolved = await resolvePath(effectiveWorkspace, spec.path, false);
+        return await readFileWithRanges(resolved, spec.path, { startLine: spec.startLine, endLine: spec.endLine });
+      } catch (err) {
+        return { path: spec.path, error: err.message };
+      }
+    }));
+    return { count: items.length, files: items };
+  }
+  if (name === 'move_file') {
+    const src = await resolvePath(effectiveWorkspace, args.from, false);
+    const dst = await resolvePath(effectiveWorkspace, args.to, true);
+    return moveFileWithBackup(store, task, src, dst, args.from, args.to, args.reason);
+  }
+  if (name === 'delete_file') {
+    const delTarget = await resolvePath(effectiveWorkspace, args.path, false);
+    return deleteFileWithBackup(store, task, delTarget, args.path, args.reason);
+  }
   if (name === 'run_diagnostics') {
-    return runCodeDiagnostics(task.workspace, args.path || '.', { resolvePath: unrestricted ? null : workspacePath, signal });
+    return runCodeDiagnostics(effectiveWorkspace, args.path || '.', { resolvePath: unrestricted ? null : workspacePath, signal });
   }
   if (name === 'glob_files') {
-    const searchRoot = args.path ? await resolvePath(task.workspace, args.path, false) : task.workspace;
+    const searchRoot = args.path ? await resolvePath(effectiveWorkspace, args.path, false) : effectiveWorkspace;
     return globWorkspaceFiles(searchRoot, args.pattern, { resolvePath: unrestricted ? null : workspacePath, signal });
   }
   if (name === 'code_outline') {
-    return extractCodeOutline(task.workspace, args.path || '.', { resolvePath: unrestricted ? null : workspacePath });
+    return extractCodeOutline(effectiveWorkspace, args.path || '.', { resolvePath: unrestricted ? null : workspacePath });
   }
   if (name === 'grep_search') {
-    const searchRoot = args.path ? await resolvePath(task.workspace, args.path, false) : task.workspace;
+    const searchRoot = args.path ? await resolvePath(effectiveWorkspace, args.path, false) : effectiveWorkspace;
     return grepWorkspaceFiles(searchRoot, {
       query: args.query,
       isRegex: Boolean(args.isRegex),
@@ -334,24 +473,26 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
       signal,
     });
   }
-  const target = await resolvePath(task.workspace, args.path, name === 'write_file' || name === 'apply_patch');
+  const target = await resolvePath(effectiveWorkspace, args.path, name === 'write_file' || name === 'apply_patch');
   if (name === 'list_files') {
     return (await fs.readdir(target, { withFileTypes: true })).slice(0, 500).map(entry => ({ name: entry.name, directory: entry.isDirectory(), link: entry.isSymbolicLink() }));
   }
   if (name === 'search_files') {
     if(typeof args.query !== 'string' || !args.query.trim()) throw new Error('Provide text to search for.');
     const matches = []; let visited = 0;
+    const relToRoot = path.relative(effectiveWorkspace, target);
+    const displayBase = (!relToRoot || (!relToRoot.startsWith('..') && !path.isAbsolute(relToRoot))) ? effectiveWorkspace : target;
     const walk = async directory => {
       for(const entry of await fs.readdir(directory,{withFileTypes:true})) {
         signal.throwIfAborted();
         if(matches.length>=100 || visited>=2000)return;
         if(entry.isSymbolicLink() || ['node_modules','.git','dist','release','.next'].includes(entry.name))continue;
-        const filename = await resolvePath(task.workspace,path.relative(task.workspace,path.join(directory,entry.name)));
+        const filename = await resolvePath(effectiveWorkspace,path.relative(effectiveWorkspace,path.join(directory,entry.name)));
         if(entry.isDirectory()){await walk(filename);continue;}
         visited++;
         if((await fs.stat(filename)).size>200000)continue;
         const text=await fs.readFile(filename,'utf8');if(text.includes('\u0000'))continue;
-        text.split(/\r?\n/).forEach((line,index)=>{if(matches.length<100 && line.toLowerCase().includes(args.query.toLowerCase()))matches.push({path:path.relative(task.workspace,filename),line:index+1,text:line.slice(0,400)});});
+        text.split(/\r?\n/).forEach((line,index)=>{if(matches.length<100 && line.toLowerCase().includes(args.query.toLowerCase()))matches.push({path:path.relative(displayBase,filename).replace(/\\/g,'/'),line:index+1,text:line.slice(0,400)});});
       }
     };
     await walk(target);return {matches,visited,bounded:visited>=2000||matches.length>=100};
@@ -372,17 +513,19 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
       if (!args.oldText || previous === null || previous.split(args.oldText).length !== 2) throw new Error('oldText must match exactly once in the target file.');
       content = previous.replace(args.oldText, () => args.newText);
     }
-    if (typeof content !== 'string' || Buffer.byteLength(content) > 500000) throw new Error('Invalid content or file size exceeds 500 KB.');
+    const maxWriteBytes = unrestricted ? 5 * 1024 * 1024 : 500000;
+    if (typeof content !== 'string' || Buffer.byteLength(content) > maxWriteBytes) throw new Error(`Invalid content or file size exceeds ${Math.round(maxWriteBytes / 1000)} KB.`);
     let backup = null;
     if (previous !== null) {
       backup = path.join(store.directoryFor(task.id), 'backup-' + crypto.randomUUID() + '.txt');
       await fs.writeFile(backup, previous);
     }
+    const diffInfo = createUnifiedDiff(previous ?? '', content, args.path);
     store.journal(task, 'write_intent', { path: target, reason: args.reason, backup, existed: previous !== null });
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, content);
-    store.journal(task, 'file_change', { path: target, reason: args.reason, backup, bytes: Buffer.byteLength(content) });
-    return { written: args.path, backup, bytes: Buffer.byteLength(content) };
+    store.journal(task, 'file_change', { path: target, reason: args.reason, backup, bytes: Buffer.byteLength(content), addedLines: diffInfo.addedLines, removedLines: diffInfo.removedLines });
+    return { written: args.path, backup, bytes: Buffer.byteLength(content), ...diffInfo };
   }
   throw new Error('Unknown tool: ' + name);
 }

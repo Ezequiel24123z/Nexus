@@ -1,166 +1,502 @@
-import React,{useState,useEffect,useLayoutEffect,useRef} from 'react';
-import {createRoot} from 'react-dom/client';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import {Plus,Search,Settings2,Folder,FolderOpen,MessageSquare,Layers3,Network,ArrowUp,ArrowDown,Square,Pin,Pause,Play,Download,X,Activity,ChevronRight,FileText,RefreshCw,Sun,Moon,CheckCircle2,Circle,Clock,AlertCircle} from 'lucide-react';
-import './style.css';
-import './markdown.css';
-import './chat-polish.css';
-import './chat-workspace.css';
-import './workspace-experience.css';
-import CapabilityPanel from './CapabilityPanel.jsx';
-import ConnectorPanel from './ConnectorPanel.jsx';
-import {AppearancePanel,SettingsNav,CommandMenu,useAppearance} from './WorkspaceExperience.jsx';
-import ChatModelPicker from './ChatModelPicker.jsx';
-import ProviderConnection,{detectProviderId} from './ProviderConnection.jsx';
-import ChatPanel from './ChatPanel.jsx';
-import ContextInspector from './ContextInspector.jsx';
-import StoragePanel from './StoragePanel.jsx';
-import McpPanel from './McpPanel.jsx';
-import ChatSettings from './ChatSettings.jsx';
-import CodeGitStudio from './CodeGitStudio.jsx';
-import {mergeById} from './chat-state.mjs';
-import Attachments from './Attachments.jsx';
+import React, { useEffect, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import {
+  Plus, Search, Settings2, Folder, FolderOpen, MessageSquare, BookOpen, ListTodo,
+  Network, Plug, Swords, PanelLeft, Sun, Moon, Pin, Trash2, GitFork, RefreshCw, X,
+  ChevronRight, Globe, Clock, Sparkles
+} from 'lucide-react';
+import { installNexusBridge } from './bridge.mjs';
+import './styles/tokens.css';
+import './styles/app.css';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
+import CommandPalette from './components/CommandPalette.jsx';
+import ChatView from './components/ChatView.jsx';
+import ArenaView from './components/ArenaView.jsx';
+import StudioView from './components/StudioView.jsx';
+import LibraryView from './components/LibraryView.jsx';
+import GalleryView from './components/GalleryView.jsx';
+import ConnectorsView from './components/ConnectorsView.jsx';
+import McpView from './components/McpView.jsx';
+import TasksView from './components/TasksView.jsx';
+import SettingsView from './components/SettingsView.jsx';
+import PrivateBrowserView from './components/PrivateBrowserView.jsx';
+import AutomationsView from './components/AutomationsView.jsx';
+import Modal from './components/Modal.jsx';
 import useDrafts from './useDrafts.jsx';
-import useSmoothStream from './useSmoothStream.jsx';
-const api=(method,args)=>window.nexus.invoke(method,args);
-const labels={queued:'Queued',running:'Working',approval:'Awaiting approval',paused:'Paused',failed:'Review',complete:'Completed'};
-const providerNames={openrouter:'OpenRouter',arliai:'Arli.ai',openai:'OpenAI',copilot:'GitHub Copilot',anthropic:'Anthropic',custom:'Local'};
-const money=v=>v==null?'Unavailable':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:6}).format(v);
-const count=v=>v==null?'—':new Intl.NumberFormat('en-US').format(v);
-const pct=v=>v==null?'—':(100*v).toFixed(1)+'%';
-const pretty=v=>typeof v==='string'?v:JSON.stringify(v,null,2);
-function App(){
- const appearance=useAppearance();
- const [state,setState]=useState(null),[view,setView]=useState('chat'),[selected,setSelected]=useState(null),[projectId,setProjectId]=useState('');
- const [query,setQuery]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('');
- const draftManager=useDrafts(setError);
- const [uploading,setUploading]=useState(false);
- const draftKey=selected?'task:'+selected:'new:'+(projectId||'');
- const draft=draftManager.get(draftKey),prompt=draft.text,pendingAttachments=draft.attachments;
- const contextRef=useRef(draftKey);contextRef.current=draftKey;
- const setPrompt=text=>draftManager.update(draftKey,{text});
- const removeAttachment=id=>draftManager.update(draftKey,{attachments:draftManager.get(draftKey).attachments.filter(item=>item.id!==id)});
- const chooseAttachments=async()=>{const key=draftKey;setUploading(true);try{const result=await api('chooseAttachments');if(result.attachments.length)draftManager.update(key,{attachments:[...draftManager.get(key).attachments,...result.attachments]});if(result.errors.length)setError(result.errors.join('\n'));}catch(e){setError(e.message);}finally{setUploading(false);}};
- const [models,setModels]=useState([]),[balance,setBalance]=useState(null),[balanceBusy,setBalanceBusy]=useState(false),[busy,setBusy]=useState(false);
- const [modal,setModal]=useState(null),[project,setProject]=useState({name:'',workspace:'',instructions:''}),[workspace,setWorkspace]=useState('');
- const [bulk,setBulk]=useState(''),[chain,setChain]=useState(true),[dependency,setDependency]=useState(''),[tab,setTab]=useState('chat');
- const [arenaPrompt,setArenaPrompt]=useState(''),[arenaModelA,setArenaModelA]=useState('deepseek/deepseek-v4.1-flash'),[arenaModelB,setArenaModelB]=useState('arliai/DeepSeek-V4.1-Flash-1017');
- const [files,setFiles]=useState([]),[filePath,setFilePath]=useState('.'),[file,setFile]=useState(null),[fileRoot,setFileRoot]=useState('');
- const [loaded,setLoaded]=useState({id:null,conversation:[],conversationStart:0,events:[],eventsStart:0});
- const [panel,setPanel]=useState(null),[targetMessage,setTargetMessage]=useState(null);
- const navigateRequest=useRef(0),latestState=useRef(state);latestState.current=state;
- const scrollRef=useRef(null),conversationRef=useRef(null),composerRef=useRef(null),stickRef=useRef(true);const [stick,setStick]=useState(true);stickRef.current=stick;
- const act=async(method,args)=>{try{return await api(method,args);}catch(e){setError(e.message.replace(/^Error invoking remote method .*?: /,''));return null;}};
- const refreshBalance=async()=>{setBalanceBusy(true);try{setBalance(await api('balance'));}catch(e){setError(e.message);}finally{setBalanceBusy(false);}};
- useEffect(()=>{api('snapshot').then(setState).catch(e=>setError(e.message));const off=window.nexus.subscribe(setState);api('models',{sort:'intelligence-high-to-low'}).then(setModels).catch(()=>{});void refreshBalance();const timer=setInterval(refreshBalance,60000);return()=>{off();clearInterval(timer);};},[]);
- useEffect(()=>{const key=e=>{if(e.key==='Escape'){setModal(null);setPanel(null);}if(e.ctrlKey&&e.key==='n'){e.preventDefault();setSelected(null);setView('chat');}if(e.ctrlKey&&e.key==='f'&&selected&&view==='chat'&&!document.querySelector('[role=dialog]')){e.preventDefault();setPanel('search');}};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key);},[selected,view]);
- useEffect(()=>{if(!state||!selected)return;const remote=state.tasks.find(t=>t.id===selected);if(!remote||!Array.isArray(remote.conversation))return;setLoaded(previous=>previous.id!==selected?{id:selected,conversation:remote.conversation,conversationStart:remote.conversationStart,events:remote.events,eventsStart:remote.eventsStart}:{...previous,conversation:previous.windowed?mergeById(previous.conversation,remote.conversation.filter(message=>previous.conversation.some(item=>item.id===message.id))):mergeById(previous.conversation,remote.conversation),conversationStart:previous.windowed?previous.conversationStart:Math.min(previous.conversationStart,remote.conversationStart),events:mergeById(previous.events,remote.events),eventsStart:Math.min(previous.eventsStart,remote.eventsStart)});},[state,selected]);
- useEffect(()=>{let current=true;api('watchChat',{id:view==='chat'?selected:null}).then(next=>{if(current)setState(next);}).catch(e=>{if(current)setError(e.message);});return()=>{current=false;};},[selected,view]);
- useEffect(()=>{const el=scrollRef.current;if(!el||!stick)return;el.scrollTop=el.scrollHeight;},[state,loaded,stick]);
- useEffect(()=>{navigateRequest.current++;setTargetMessage(null);const el=scrollRef.current;if(el)el.scrollTop=el.scrollHeight;stickRef.current=true;setStick(true);},[selected]);
- useLayoutEffect(()=>{if(!targetMessage)return;const element=document.getElementById('message-'+targetMessage);if(element){element.scrollIntoView({block:'center'});element.focus({preventScroll:true});}},[targetMessage,loaded.windowed]);
- useLayoutEffect(()=>{const el=composerRef.current;if(!el)return;el.style.height='auto';el.style.height=Math.min(190,Math.max(62,el.scrollHeight))+'px';},[prompt,selected,view,state!==null,draftManager.ready]);
- useEffect(()=>{const content=conversationRef.current,container=scrollRef.current;if(!content||!container)return;const observer=new ResizeObserver(()=>{if(stickRef.current)container.scrollTop=container.scrollHeight;});observer.observe(content);observer.observe(container);return()=>observer.disconnect();},[selected,view,tab,state!==null,draftManager.ready]);
- if(!state||!draftManager.ready)return <div className="loading">{error||'Launching NEXUS…'}</div>;
- const s=state.settings,task=state.tasks.find(t=>t.id===selected),currentProject=state.projects.find(p=>p.id===projectId);
- const activeProvider=detectProviderId(s.model),arli=activeProvider==='arliai',activeModels=models.filter(m=>detectProviderId(m.id)===activeProvider);
- const reloadModels=()=>api('models',{sort:'intelligence-high-to-low'}).then(setModels);
- const conversation=loaded.id===task?.id?loaded.conversation:(task?.conversation||[]),events=loaded.id===task?.id?loaded.events:(task?.events||[]);
- const conversationStart=loaded.id===task?.id?loaded.conversationStart:(task?.conversationStart||0),eventsStart=loaded.id===task?.id?loaded.eventsStart:(task?.eventsStart||0);
- const setting=(key,value)=>act('settings',{[key]:value});
- const tasks=state.tasks.filter(t=>(!projectId||t.projectId===projectId)&&(t.title+' '+t.prompt).toLowerCase().includes(query.toLowerCase())).sort((a,b)=>Number(!!b.pinned)-Number(!!a.pinned));
- const goLatest=()=>{navigateRequest.current++;setTargetMessage(null);const current=latestState.current.tasks.find(item=>item.id===selected);if(!current)return;setLoaded(previous=>previous.id!==current.id?previous:{...previous,windowed:false,conversation:previous.windowed?current.conversation:mergeById(previous.conversation,current.conversation),conversationStart:previous.windowed?current.conversationStart:Math.min(previous.conversationStart,current.conversationStart),conversationEnd:current.conversationTotal});stickRef.current=true;setStick(true);setTab('chat');const el=scrollRef.current;if(el)el.scrollTop=el.scrollHeight;};
- const jumpMessage=async messageId=>{const id=task.id,token=++navigateRequest.current;const page=await act('messageWindow',{id,messageId});if(!page||token!==navigateRequest.current||contextRef.current!=='task:'+id)return;stickRef.current=false;setStick(false);setTab('chat');setLoaded(previous=>({...previous,id,windowed:true,conversation:page.items,conversationStart:page.start,conversationEnd:page.end}));setTargetMessage(messageId);if(window.innerWidth<=1250)setPanel(null);};
- const loadNewer=async()=>{const id=task.id,token=navigateRequest.current;const page=await act('taskPage',{id,collection:'conversation',before:Math.min(task.conversationTotal,loaded.conversationEnd+120),limit:Math.min(120,task.conversationTotal-loaded.conversationEnd)});if(page&&token===navigateRequest.current&&contextRef.current==='task:'+id)setLoaded(previous=>({...previous,conversation:mergeById(previous.conversation,page.items),conversationEnd:page.start+page.items.length}));};
- const openTask=id=>{setSelected(id);setView('chat');setTab('chat');};
- const newChat=()=>{setSelected(null);setView('chat');};
- const choose=async()=>await act('chooseWorkspace');
- const submit=async e=>{e.preventDefault();if(busy||uploading||(!prompt.trim()&&!pendingAttachments.length))return;const key=draftKey,revision=draft.revision;setBusy(true);try{const attachmentIds=pendingAttachments.map(item=>item.id);await draftManager.flush();if(task)await api('resume',{id:task.id,instruction:prompt,attachmentIds});else{const id=await api('createTask',{prompt,attachmentIds,workspace:currentProject?.workspace||draft.workspace||workspace,projectId:projectId||null});if(contextRef.current===key)setSelected(id);}try{await draftManager.clear(key,revision);}catch{setError('Message sent, but its saved draft could not be cleared.');}if(contextRef.current===key){if(task)goLatest();else setStick(true);}}catch(e){setError(e.message);}finally{setBusy(false);}};
- const loadFiles=async(root,location='.')=>{if(!root)return;const entries=await act('files',{workspace:root,path:location});if(entries){setFiles(entries);setFileRoot(root);setFilePath(location);setFile(null);}};
- const loadOlder=async collection=>{if(!task)return;const before=collection==='conversation'?conversationStart:eventsStart;const page=await act('taskPage',{id:task.id,collection,before,limit:120});if(!page)return;setLoaded(previous=>previous.id!==task.id?previous:collection==='conversation'?{...previous,conversation:mergeById(page.items,previous.conversation),conversationStart:page.start}:{...previous,events:mergeById(page.items,previous.events),eventsStart:page.start});};
- const pinMessage=async message=>{const updated=await act('pinMessage',{id:task.id,messageId:message.id,pinned:!message.pinned});if(updated!==null)setLoaded(previous=>previous.id!==task.id?previous:{...previous,conversation:previous.conversation.map(item=>item.id===message.id?{...item,pinned:!message.pinned}:item)});};
- const active=state.tasks.filter(t=>['running','approval'].includes(t.status)).length;
- const activeTaskProvider=providerNames[detectProviderId(task?.model||s.model)]||'OpenRouter';
- const isDark=appearance.preferences.theme==='dark';
- return <div className="shell">
- <aside className="sidebar">
-  <div className="brand"><span className="brand-mark">N</span><strong>NEXUS</strong><span className="local-label">AGENT IDE</span></div>
-  <button className="nav-item" onClick={newChat}><Plus size={18}/>New chat<kbd>Ctrl N</kbd></button>
-  <label className="search"><Search size={16}/><input aria-label="Search chats" placeholder="Search chats" value={query} onChange={e=>setQuery(e.target.value)}/></label>
-  <nav>{[['library',Layers3,'Library'],['queue',Layers3,'Tasks'],['files',FolderOpen,'Files'],['connectors',Network,'Connectors'],['mcp',Layers3,'MCP Extensions']].map(([id,Icon,text])=><button key={id} className={'nav-item '+(view===id?'active':'')} onClick={()=>{setView(id);if(id==='files')void loadFiles(task?.workspace||currentProject?.workspace||workspace);}}><Icon size={17}/>{text}{id==='queue'&&active>0&&<small>{active} active</small>}</button>)}</nav>
-  <div className="sidebar-library"><div className="side-heading">Projects<button aria-label="New project" onClick={()=>{setProject({name:'',workspace:'',instructions:''});setModal('project');}}><Plus size={15}/></button></div>
-  <button className={'nav-item '+(!projectId?'selected':'')} onClick={()=>setProjectId('')}><MessageSquare size={16}/>All chats</button>
-  {state.projects.map(p=><button className={'nav-item '+(projectId===p.id?'selected':'')} key={p.id} onClick={()=>{setProjectId(p.id);newChat();}}><Folder size={16}/><span>{p.name}</span></button>)}
-  <div className="side-heading">{currentProject?.name||'Recent chats'}<small>{tasks.length}</small></div>
-  <div className="recent-tasks">{tasks.map(t=><button className={'chat-link '+(selected===t.id?'selected':'')} key={t.id} onClick={()=>openTask(t.id)}><i className={'dot '+t.status}/><span>{t.title}</span>{t.pinned&&<Pin size={12}/>}</button>)}{!tasks.length&&<p className="hint">A workspace for your next engineering mission.</p>}</div></div>
-  <div className="sidebar-footer"><div className="balance-line"><span>{activeProvider==='openrouter'?'OpenRouter Balance':providerNames[activeProvider]+' · Active'}</span><button aria-label="Refresh balance" disabled={balanceBusy} onClick={refreshBalance}><RefreshCw size={13}/></button></div><strong className="balance-value">{arli?'Plus · 128K':activeProvider!=='openrouter'?providerNames[activeProvider]:money(balance?.remaining)}</strong>{balance?.keyRemaining!=null&&<small>Key limit: {money(balance.keyRemaining)}</small>}<button className={'nav-item '+(view==='settings'?'selected':'')} onClick={()=>setView('settings')}><Settings2 size={17}/>Settings</button></div>
- </aside>
- <main className="main">
-  <header className="topbar"><div><span className="muted">NEXUS</span><ChevronRight size={14}/><strong>{view==='chat'?(task?.title||currentProject?.name||'New chat'):({library:'Library',settings:'Settings',queue:'Tasks',files:'Files',connectors:'Connectors',mcp:'MCP Extensions'}[view])}</strong></div><div><CommandMenu state={state} navigate={id=>{setView(id);if(id==='files')void loadFiles(task?.workspace||currentProject?.workspace||workspace);}} openTask={openTask} newChat={newChat} appearance={appearance}/><button type="button" title={isDark?'Switch to Light Theme':'Switch to Dark Theme'} aria-label="Toggle color theme" onClick={()=>appearance.update('theme',isDark?'light':'dark')}>{isDark?<Sun size={16}/>:<Moon size={16}/>}</button><span className="engine-badge">{activeTaskProvider} · {(task?.agentMode||s.agentMode||'agent').toUpperCase()} · {s.autonomous?'Autonomous':'With approvals'}</span>{currentProject&&<button title="Edit project" onClick={()=>{setProject({...currentProject});setModal('project');}}><Settings2 size={16}/></button>}</div></header>
-  {error&&<div className="alert error" role="alert">{error}<button aria-label="Dismiss error" onClick={()=>setError('')}><X size={16}/></button></div>}{notice&&<div className="alert">{notice}<button aria-label="Dismiss notice" onClick={()=>setNotice('')}><X size={16}/></button></div>}
-  {view==='chat'&&<div className={'chat-workspace '+(panel&&task?'has-panel':'')}><div className="chat-page">
-   {task&&<div className="chat-toolbar"><div className="tabs">{[['chat','Chat'],['activity','Activity'],['memory','Memory'],['pins','Pinned']].map(([id,text])=><button role="tab" aria-selected={tab===id} key={id} className={tab===id?'active':''} onClick={()=>setTab(id)}>{text}</button>)}</div><div className="row"><span className={'status '+task.status}>{labels[task.status]}</span><button aria-label="Search in this chat" aria-pressed={panel==='search'} title="Search in this chat · Ctrl F" onClick={()=>setPanel(panel==='search'?null:'search')}><Search size={16}/></button><button aria-label="View chat results" aria-pressed={panel==='results'} title="Chat results" onClick={()=>setPanel(panel==='results'?null:'results')}><FileText size={16}/></button><button aria-label="Inspect context and spend" title="Context, cache & spend" onClick={()=>setModal('inspector')}><Activity size={16}/></button><button title={task.pinned?'Unpin chat':'Pin chat'} onClick={()=>act('updateChat',{id:task.id,pinned:!task.pinned})}><Pin size={16} fill={task.pinned?'currentColor':'none'}/></button><button title="Chat settings" onClick={()=>setModal('chat')}><Settings2 size={16}/></button><button title="Export conversation and journal" onClick={()=>act('exportTask',{id:task.id})}><Download size={16}/></button>{(task.compacting||['running','queued','approval'].includes(task.status))?<button title="Pause task" onClick={()=>act('pause',{id:task.id})}><Pause size={16}/></button>:task.status!=='complete'&&<button title="Resume task" onClick={()=>act('resume',{id:task.id})}><Play size={16}/></button>}</div></div>}
-   {task?.todos?.length>0&&<TodoTracker todos={task.todos}/>}
-   <div className="chat-scroll" ref={scrollRef} onScroll={e=>{const el=e.currentTarget;const following=!loaded.windowed&&el.scrollHeight-el.scrollTop-el.clientHeight<100;stickRef.current=following;setStick(following);}}>{!task?<div className="welcome"><span className="welcome-mark">N</span><h1>What are we building today?</h1><p>Autonomous local agentic coding. Multi-provider models. Unrestricted environment control.</p><div className="suggestions">{['Audit, refactor, and test my codebase','Explore architecture and create an implementation plan','Automate a local workflow, Git branch, or API integration'].map(text=><button key={text} onClick={()=>setPrompt(text)}>{text}<ChevronRight size={15}/></button>)}</div>{!state.hasKey&&<button className="text-button" onClick={()=>setView('settings')}>Configure model connection to begin →</button>}</div>:<div className="conversation" ref={conversationRef}>
-    {(tab==='chat'||tab==='pins')&&<>{loaded.windowed&&<div className="history-window-note">Viewing a slice of history. <button onClick={goLatest}>Return to recent messages</button></div>}{tab==='chat'&&conversationStart>0&&<button className="secondary" onClick={()=>loadOlder('conversation')}>Load earlier messages</button>}{conversation.filter(m=>tab!=='pins'||m.pinned).map(m=><article tabIndex={-1} className={'message '+m.role+(targetMessage===m.id?' search-target':'')} id={'message-'+m.id} key={m.id}><div className="message-label">{m.role==='user'?'You':'NEXUS'}{m.recovered&&<span className="recovered-label">Recovered · incomplete</span>}{m.pinned&&<span><Pin size={12}/>Pinned in context</span>}</div>{m.reasoning&&<Reasoning text={m.reasoning} step={m.step}/>}{m.content?<Formatted text={m.content}/>:null}{m.attachments?.length?<Attachments items={m.attachments}/>:null}{m.sources?.length?<Sources sources={m.sources}/>:null}<div className="message-actions">{m.content&&<CopyText text={m.content} label="Copy message"/>}<button title={m.pinned?'Unpin message':'Pin message in context'} onClick={()=>pinMessage(m)}><Pin size={14}/>{m.pinned?'Unpin':'Pin'}</button>{m.telemetry&&<span>{money(m.telemetry.cost)}{m.telemetry.unknownCosts?' · partial':''} · {count(m.telemetry.total)} cumulative tokens this turn</span>}</div></article>)}</>}
-    {tab==='chat'&&!loaded.windowed&&(task.compacting||['running','approval'].includes(task.status))&&(task.liveActivity||task.liveReasoning||task.liveText)&&<article className="message assistant live"><div className="message-label"><span className="working">NEXUS · {task.compacting?'Compacting context':'Working'}<i/><i/><i/></span></div>{task.liveActivity&&<ActivitySummary text={task.liveActivity}/>} {task.liveReasoning&&<Reasoning text={task.liveReasoning} live/>}{task.liveText&&<StreamingFormatted text={task.liveText}/>}</article>}
-    {tab==='chat'&&loaded.windowed&&loaded.conversationEnd<task.conversationTotal&&<button className="secondary history-newer" onClick={loadNewer}>Load newer messages</button>}
-    {tab==='activity'&&<>{task.effects?.length>0&&<Effects effects={task.effects}/>} {eventsStart>0&&<button className="secondary" onClick={()=>loadOlder('events')}>Load earlier activity</button>}<Events events={events}/></>}{tab==='memory'&&<section><h2>Continuity Memory</h2><p className="hint">Originals are preserved in checkpoints. Summaries may omit low-level details; the journal and checkpoints allow full retrieval. Pinned messages are always injected verbatim.</p><Formatted text={task.summary||'This conversation has not been compacted yet.'}/><button className="secondary" onClick={()=>act('openJournal',{id:task.id})}><FolderOpen size={15}/>Open journal, originals, and checkpoints</button></section>}
-    {task.error&&<div className="alert error">{task.error}</div>}{state.approvals.filter(a=>a.taskId===task.id).map(a=><div className="card" key={a.id}><h3>{a.name}</h3><pre>{pretty(a.args)}</pre><button className="secondary" onClick={()=>act('approve',{id:a.id,allowed:true})}>Execute</button><button onClick={()=>act('approve',{id:a.id,allowed:false})}>Decline</button></div>)}
-   </div>}</div>
-   {task&&!stick&&tab==='chat'&&<div className="jump-latest"><button onClick={goLatest}><ArrowDown size={15}/>Jump to bottom</button></div>}
-   <div className="composer-area">{task&&<Telemetry task={task} windowSize={s.contextWindow}/>}<ChatModelPicker key={task?.id||'new'} task={task} settings={s} models={models} act={act}/><form className="composer" onSubmit={submit}><Attachments items={pendingAttachments} remove={removeAttachment} disabled={busy||uploading}/><textarea ref={composerRef} disabled={busy} aria-label="Message" placeholder={task?(task.compacting||task.status==='running'||task.status==='approval'?'Write a follow-up; it will be delivered on the next step.':'Continue the conversation.'):'Ask, architect, refactor, or delegate a task.'} value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();if(!busy)e.currentTarget.form.requestSubmit();}}}/><div className="composer-bottom"><div className="row"><button type="button" aria-label="Attach files" disabled={busy||uploading} onClick={chooseAttachments}><Plus size={18}/></button>{uploading&&<small>Preparing files…</small>}<button type="button" title="Choose workspace folder" onClick={async()=>{const p=await choose();if(p){setWorkspace(p);draftManager.update(draftKey,{workspace:p});}}}><FolderOpen size={18}/></button><span className="path-label">{task?.workspace||currentProject?.workspace||draft.workspace||workspace||'No folder'}</span></div><div className="row">{task&&(task.compacting||['running','approval'].includes(task.status))&&<button type="button" className="pause-response" aria-label="Pause response" title="Pause response" onClick={()=>act('pause',{id:task.id})}><Square size={12} fill="currentColor"/></button>}<button className="send" aria-label="Send message" disabled={busy||uploading||(!prompt.trim()&&!pendingAttachments.length)}><ArrowUp size={19}/></button></div></div></form>{(prompt||pendingAttachments.length>0||draftManager.status[draftKey]==='error')&&<div className={'draft-status '+(draftManager.status[draftKey]||'saved')} role="status">{draftManager.status[draftKey]==='saving'?'Saving draft…':draftManager.status[draftKey]==='error'?<><span>Could not save draft.</span><button onClick={()=>draftManager.retry(draftKey)}>Retry save</button></>:'Draft saved on this device'}</div>}   <div className="composer-caption"><span>{task?.model||s.model||'Select a model in Settings'}</span><span className="slash-hints">{['/init','/review','/architect','/diagnostics','/mcp-create','/self-improve'].map(cmd=><button key={cmd} type="button" className="slash-chip" onClick={()=>setPrompt(prompt?prompt+' '+cmd:cmd+' ')}>{cmd}</button>)} · Enter to send · Shift+Enter for new line</span></div></div>
-  </div>{task&&panel&&<ChatPanel key={task.id+panel} task={task} mode={panel} close={()=>setPanel(null)} jump={jumpMessage}/>}</div>}
-  {view==='library'&&<CapabilityPanel state={state} navigate={setView}/>}
-  {view==='settings'&&<div className="page settings-page"><h1>Your Workspace, Your Rules</h1><p className="subtitle">Configure providers, models, autonomy, and storage. Keys are encrypted locally with your Windows account.</p><SettingsNav/><div className="settings-grid"><AppearancePanel appearance={appearance}/>
-   <section className="card"><h2>Model & Connection</h2><ProviderConnection settings={s} state={state} act={act} SecretField={SecretField} reload={reloadModels}/><ModelExplorer models={activeModels} current={s.model} select={model=>act('settings',{model})} reload={sort=>api('models',{sort}).then(setModels).catch(e=>setError(e.message))}/><ReasoningControl model={models.find(model=>model.id===s.model)} value={s.reasoningEffort} save={value=>setting('reasoningEffort',value)}/>{activeProvider==='openrouter'&&<ProviderRouting value={s.providerRouting} save={value=>setting('providerRouting',value)}/>}<p className="hint">Catalogs are queried from the selected provider service. In Arli.ai, the published context is the native model maximum; your account plan may cap it. Unreported token costs are shown as unknown. Switching models does not alter your operating context ceiling.</p></section>
-   <section className="card"><h2>Real-Time Web Search</h2>{activeProvider!=='openrouter'&&<p className="hint">Native server web search requires an OpenRouter model. Other providers can still fetch any URL via the local <code>web_fetch</code> tool.</p>}<Toggle label="Allow model web search" hint="The model decides when to search the web. OpenRouter returns structured citations and Markdown links." checked={s.webSearchEnabled} save={value=>setting('webSearchEnabled',value)}/><WebSearchSettings settings={s} save={setting}/><p className="hint">Auto uses native provider search if supported and falls back to Exa. Web search requests appear in telemetry when reported.</p></section>
-   <section className="card"><h2>Balance & Credentials</h2><div className="big-value">{money(balance?.remaining)}</div><p className="hint">OpenRouter account balance. Requires a separate management key; it is never used for message generation.</p><SecretField name="OPENROUTER_MANAGEMENT_KEY" label="Management key (optional)" act={act}/><button className="secondary" disabled={balanceBusy} onClick={refreshBalance}><RefreshCw size={14}/>Check balance</button><p className="hint">Key allowance remaining: {balance?.keyUnlimited?'Unlimited key':money(balance?.keyRemaining)}. Distinct from total account balance.</p>{balance?.errors?.map(e=><p className="hint" key={e}>{e}</p>)}{balance?.at&&<small>Last checked: {new Date(balance.at).toLocaleTimeString()}</small>}</section>
-   <section className="card wide"><h2>Global Instructions</h2><p className="hint">Sent to the model in every task alongside project instructions, auto-discovered repository rules (NEXUS.md / CLAUDE.md / AGENTS.md), pinned messages, and continuity state. Changes take effect on the next call.</p><TextSetting value={s.globalInstructions} save={v=>setting('globalInstructions',v)} label="Global instructions" rows={7}/></section>
-   <section className="card"><h2>Autonomy & Execution</h2><Toggle label="Real-time streaming" hint="Display tokens as they arrive. Disable if a custom endpoint does not support SSE streaming." checked={s.streaming} save={v=>setting('streaming',v)}/><Toggle label="Autonomous mode" hint="Execute file edits, shell commands, Git operations, connectors, and desktop actions without per-action prompts using your Windows permissions." checked={s.autonomous} save={v=>setting('autonomous',v)}/><Toggle label="Desktop control" hint="Screenshots, mouse clicks, and keyboard input. Serialized so only one agent controls the desktop at a time." checked={s.desktopEnabled} save={v=>setting('desktopEnabled',v)}/><div className="two"><NumberField label="Concurrent agents" value={s.concurrency} min={1} max={64} save={v=>setting('concurrency',v)}/><NumberField label="Max steps (0 = unlimited)" value={s.maxSteps} min={0} max={1000000} save={v=>setting('maxSteps',v)}/></div><p className="hint">Pause anytime from the chat. Tasks in the same folder serialize automatically; separate workspaces run in parallel. NEXUS imposes no content filters or artificial caps.</p></section>
-   <section className="card"><h2>Context Compaction</h2><label>Trigger at {s.compressionPercent}%<input aria-label="Context compaction threshold" type="range" min="10" max="95" value={s.compressionPercent} onChange={e=>setting('compressionPercent',+e.target.value)}/></label><div className="range-labels"><span>10% · earlier</span><span>95% · later</span></div><div className="two"><NumberField label="Operating context ceiling" value={s.contextWindow} min={8000} max={10000000} save={v=>setting('contextWindow',v)}/><NumberField label="Max output per call (0 = provider)" value={s.maxOutput} min={0} max={1000000} save={v=>setting('maxOutput',v)}/></div><p className="hint">At 0, NEXUS omits max_tokens so the model and provider deliver their native output ceiling. Compaction calls retain a dedicated technical ceiling so summaries complete reliably.</p><Toggle label="Per-conversation provider affinity (experimental)" hint="Sends an opaque session hash to OpenRouter. Generation and compaction use separate sessions to improve prompt cache hit rates." checked={!!s.cacheAffinity} save={value=>setting('cacheAffinity',value)}/></section>
-   <section className="card"><h2>Connector Secrets</h2><ConnectorSecret act={act}/></section><section className="card"><h2>Data & Continuity</h2><p>Chats, projects, journals, originals, and checkpoints are stored locally on your machine. Only required context is sent to the selected model provider.</p><p className="hint">File backups do not undo arbitrary shell commands or external API mutations. Pinned messages consume context budget—pin only what matters.</p></section><StoragePanel state={state} act={act}/>
-  </div></div>}
-  {view==='queue'&&<div className="page"><div className="page-heading"><div><h1>Tasks</h1><p className="subtitle">{active} running · up to {s.concurrency} concurrent</p></div><div className="row"><button className="secondary" onClick={()=>setModal('arena')}>Compare models (Arena)</button><button className="primary" onClick={()=>setModal('batch')}><Plus size={16}/>Create batch</button></div></div>{state.tasks.map(t=><div className="task-row" key={t.id}><button onClick={()=>openTask(t.id)}><i className={'dot '+t.status}/><div><strong>{t.title}</strong><small>{t.dependsOn.length?'After: '+state.tasks.find(d=>d.id===t.dependsOn[0])?.title:'Independent'} · {t.model} · {t.workspace||'No folder'}</small></div></button><span>{labels[t.status]}</span><button title="Pause" onClick={()=>act('pause',{id:t.id})}><Pause size={16}/></button></div>)}{!state.tasks.length&&<p>Your queued tasks and dependency chains will appear here.</p>}</div>}
-  {view==='files'&&<div className="page"><div className="page-heading"><div><h1>Files & Git Studio</h1><p className="subtitle">{fileRoot||'Select a local workspace folder'}</p></div><button className="secondary" onClick={async()=>{const root=await choose();if(root){setWorkspace(root);void loadFiles(root);}}}><FolderOpen size={16}/>Choose folder</button></div><div className="file-layout"><div className="file-tree"><button onClick={()=>loadFiles(fileRoot,'.')}>/ {filePath}</button>{files.map(f=><button key={f.name} onClick={async()=>{const p=(filePath==='.'?'':filePath+'/')+f.name;if(f.directory)void loadFiles(fileRoot,p);else{const content=await act('readFile',{workspace:fileRoot,path:p});if(content!==null)setFile({path:p,content});}}}>{f.directory?<Folder size={16}/>:<FileText size={16}/>} {f.name}</button>)}</div><div className="file-preview">{file?<><strong>{file.path}</strong><pre>{file.content}</pre></>:<p className="hint">Select a file to inspect its contents.</p>}</div></div><CodeGitStudio workspace={fileRoot||task?.workspace||currentProject?.workspace||workspace} onNotice={setNotice} onError={setError}/></div>}
-  {view==='connectors'&&<ConnectorPanel act={act} count={state.connectorCount??state.connectors.length}/>}
- {view==='mcp'&&<McpPanel state={state} act={act}/>}
- </main>
- {modal==='chat'&&task&&<ChatSettings task={task} state={state} act={act} close={()=>setModal(null)}/>}
- {modal==='inspector'&&task&&<ContextInspector taskId={task.id} close={()=>setModal(null)}/>}
- {['project','batch','arena'].includes(modal)&&<div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-label={modal==='project'?'Project':modal==='arena'?'Model Arena':'Task batch'}><button className="modal-close" aria-label="Close" onClick={()=>setModal(null)}><X size={20}/></button>{modal==='project'?<form onSubmit={async e=>{e.preventDefault();const id=await act('saveProject',project);if(id){setProjectId(id);setModal(null);}}}><h2>{project.id?'Edit Project':'New Project'}</h2><label>Name<input autoFocus required value={project.name} onChange={e=>setProject({...project,name:e.target.value})}/></label><button className="secondary" type="button" onClick={async()=>{const root=await choose();if(root)setProject({...project,workspace:root});}}><FolderOpen size={16}/>{project.workspace||'Link local workspace folder'}</button><label>Project instructions<textarea rows={6} value={project.instructions} onChange={e=>setProject({...project,instructions:e.target.value})}/></label><div className="row"><button className="primary">Save project</button>{project.id&&<button type="button" onClick={async()=>{if(await act('removeProject',{id:project.id})){setProjectId('');setModal(null);setNotice('Project removed. Chats and files are preserved.');}}}>Remove project (keep chats)</button>}</div></form>:modal==='arena'?<form onSubmit={async e=>{e.preventDefault();setBusy(true);try{const res=await api('createArena',{prompt:arenaPrompt,models:[arenaModelA,arenaModelB],projectId:projectId||null});if(res?.ids?.length){setModal(null);setArenaPrompt('');setNotice('Launched parallel Model Arena comparison.');}}catch(err){setError(err.message);}finally{setBusy(false);}}}><h2>Multi-Model Arena Comparison</h2><p className="hint">Dispatch the exact same prompt to two models in parallel to compare reasoning, speed, token cost, and code quality side by side.</p><div className="two"><label>Model A<input required value={arenaModelA} onChange={e=>setArenaModelA(e.target.value)}/></label><label>Model B<input required value={arenaModelB} onChange={e=>setArenaModelB(e.target.value)}/></label></div><label>Shared Prompt<textarea required rows={5} value={arenaPrompt} onChange={e=>setArenaPrompt(e.target.value)} placeholder="Enter a coding, architecture, or analysis challenge…"/></label><button className="primary" disabled={busy}>Launch Parallel Arena</button></form>:<form onSubmit={async e=>{e.preventDefault();setBusy(true);try{let dep=dependency;for(const text of bulk.split('\n').map(x=>x.trim()).filter(Boolean)){const id=await api('createTask',{prompt:text,workspace:currentProject?.workspace||workspace,projectId:projectId||null,dependsOn:dep?[dep]:[]});if(chain)dep=id;}setModal(null);setBulk('');}catch(e){setError(e.message);}finally{setBusy(false);}}}><h2>Create Task Batch</h2><label>One task per line<textarea required rows={7} value={bulk} onChange={e=>setBulk(e.target.value)}/></label><label>Start after<select value={dependency} onChange={e=>setDependency(e.target.value)}><option value="">No dependency</option>{state.tasks.map(t=><option key={t.id} value={t.id}>{t.title}</option>)}</select></label><Toggle label="Execute sequentially" hint="Each task receives the output of the previous one. When disabled, tasks can run in parallel." checked={chain} save={setChain}/><button type="button" className="secondary" onClick={async()=>{const root=await choose();if(root)setWorkspace(root);}}>{currentProject?.workspace||workspace||'Select folder'}</button><button className="primary" disabled={busy}>Add to queue</button></form>}</section></div>}
- </div>;
+import { mergeById } from './chat-state.mjs';
+import { detectProviderId, providerLabel, formatMoney, cleanError, normalizeAutonomyId, AUTONOMY_LEVELS } from './lib/format.mjs';
+
+installNexusBridge();
+const api = (method, args) => window.nexus.invoke(method, args);
+
+function useAppearance() {
+  const [preferences, setPreferences] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('nexus-appearance') || '{}');
+      return {
+        density: saved.density === 'compact' ? 'compact' : 'comfortable',
+        motion: saved.motion === 'reduced' ? 'reduced' : 'system',
+        theme: ['dark', 'light', 'slate', 'system'].includes(saved.theme) ? saved.theme : 'dark',
+      };
+    } catch {
+      return { density: 'comfortable', motion: 'system', theme: 'dark' };
+    }
+  });
+
+  const [resolvedTheme, setResolvedTheme] = useState('dark');
+
+  useEffect(() => {
+    const mq = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const apply = () => {
+      const resolved = preferences.theme === 'system' ? (mq?.matches ? 'dark' : 'light') : preferences.theme;
+      setResolvedTheme(resolved);
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.dataset.density = preferences.density;
+      document.documentElement.dataset.motion = preferences.motion;
+      window.dispatchEvent(new Event('nexus-appearance'));
+      void api('setNativeTheme', { theme: resolved }).catch(() => {});
+    };
+    apply();
+    mq?.addEventListener?.('change', apply);
+    return () => mq?.removeEventListener?.('change', apply);
+  }, [preferences]);
+
+  const update = (key, value) => {
+    setPreferences(prev => {
+      const next = { ...prev, [key]: value };
+      try { localStorage.setItem('nexus-appearance', JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  return { preferences, resolvedTheme, update };
 }
-function TodoTracker({todos=[]}){
- const completed=todos.filter(t=>t.status==='completed').length;
- return <details className="todo-tracker" open={todos.some(t=>t.status==='in_progress')}>
-  <summary><span><strong>Task Plan</strong> · {completed}/{todos.length} completed</span><progress value={completed} max={todos.length}/></summary>
-  <div className="todo-list">{todos.map(t=><div key={t.id} className={'todo-item '+t.status}>{t.status==='completed'?<CheckCircle2 size={14}/>:t.status==='in_progress'?<Clock size={14}/>:t.status==='blocked'?<AlertCircle size={14}/>:<Circle size={14}/>}<span>{t.title}</span><small>{t.status.replace('_',' ')}</small></div>)}</div>
- </details>;
+
+function App() {
+  const appearance = useAppearance();
+  const [state, setState] = useState(null);
+  const [view, setView] = useState('chat');
+  const [selected, setSelected] = useState(null);
+  const [projectId, setProjectId] = useState('');
+  const [workspace, setWorkspace] = useState('');
+  const [query, setQuery] = useState('');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [models, setModels] = useState([]);
+  const [balance, setBalance] = useState(null);
+  const [balanceBusy, setBalanceBusy] = useState(false);
+  const [toasts, setToasts] = useState([]);
+  const [projectModal, setProjectModal] = useState(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [loaded, setLoaded] = useState({ id: null, conversation: [], conversationStart: 0, events: [], eventsStart: 0 });
+  const toastSeq = useRef(0);
+
+  const notify = (message, kind = 'info') => {
+    const id = ++toastSeq.current;
+    setToasts(prev => [...prev.slice(-3), { id, message: String(message), kind }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), kind === 'error' ? 7000 : 3800);
+  };
+
+  const draftManager = useDrafts(msg => notify(msg, 'error'));
+  const draftKey = selected ? 'task:' + selected : 'new:' + (projectId || '');
+
+  const act = async (method, args) => {
+    try {
+      return await api(method, args);
+    } catch (e) {
+      notify(cleanError(e), 'error');
+      return null;
+    }
+  };
+
+  const reloadModels = () => api('models', { sort: 'intelligence-high-to-low' }).then(setModels).catch(() => {});
+  const refreshBalance = async () => {
+    setBalanceBusy(true);
+    try { setBalance(await api('balance')); } catch {}
+    finally { setBalanceBusy(false); }
+  };
+
+  useEffect(() => {
+    api('snapshot').then(setState).catch(e => notify(cleanError(e), 'error'));
+    const off = window.nexus.subscribe(setState);
+    void reloadModels();
+    void refreshBalance();
+    const timer = setInterval(refreshBalance, 60000);
+    return () => { off(); clearInterval(timer); };
+  }, []);
+
+  // Live Custom CSS & Accent Color injection from Settings / nexus.config.json
+  useEffect(() => {
+    let styleEl = document.getElementById('nexus-user-css');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'nexus-user-css';
+      document.head.appendChild(styleEl);
+    }
+    const accent = state?.settings?.accentColor;
+    const accentCss = accent ? `:root, html[data-theme="dark"], html[data-theme="light"], html[data-theme="slate"] { --accent: ${accent}; --accent-hover: ${accent}; }\n` : '';
+    styleEl.textContent = accentCss + (state?.settings?.customCss || '');
+  }, [state?.settings?.customCss, state?.settings?.accentColor]);
+
+  // Sync tray preference with native host
+  useEffect(() => {
+    if (state?.settings?.minimizeToTray !== undefined) {
+      void api('setTrayMode', { enabled: Boolean(state.settings.minimizeToTray) }).catch(() => {});
+    }
+  }, [state?.settings?.minimizeToTray]);
+
+  // Global keyboard shortcuts (Ctrl+N new chat, Ctrl+B toggle sidebar)
+  useEffect(() => {
+    const onKey = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') { e.preventDefault(); setSelected(null); setView('chat'); }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') { e.preventDefault(); setSidebarCollapsed(c => !c); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // Watch active chat on core server
+  useEffect(() => {
+    let live = true;
+    api('watchChat', { id: view === 'chat' ? selected : null })
+      .then(next => { if (live) setState(next); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [selected, view]);
+
+  // Merge incoming chat snapshot into loaded history
+  useEffect(() => {
+    if (!state || !selected) return;
+    const remote = state.tasks.find(t => t.id === selected);
+    if (!remote || !Array.isArray(remote.conversation)) return;
+    setLoaded(prev => prev.id !== selected
+      ? { id: selected, conversation: remote.conversation, conversationStart: remote.conversationStart, events: remote.events, eventsStart: remote.eventsStart }
+      : {
+          ...prev,
+          conversation: prev.windowed
+            ? mergeById(prev.conversation, remote.conversation.filter(m => prev.conversation.some(i => i.id === m.id)))
+            : mergeById(prev.conversation, remote.conversation),
+          conversationStart: prev.windowed ? prev.conversationStart : Math.min(prev.conversationStart, remote.conversationStart),
+          events: mergeById(prev.events, remote.events),
+          eventsStart: Math.min(prev.eventsStart, remote.eventsStart),
+        });
+  }, [state, selected]);
+
+  if (!state || !draftManager.ready) {
+    return (
+      <div style={{ height: '100vh', display: 'grid', placeItems: 'center', color: 'var(--ink-muted)' }}>
+        <div className="row"><span className="brand-mark">N</span><span>Launching NEXUS…</span></div>
+      </div>
+    );
+  }
+
+  const s = state.settings;
+  const task = state.tasks.find(t => t.id === selected) || null;
+  const currentProject = state.projects.find(p => p.id === projectId) || null;
+  const activeWorkspace = task?.workspace || currentProject?.workspace || workspace;
+  const activeProvider = detectProviderId(task?.model || s.model, s.customProviders);
+  const activeCount = state.tasks.filter(t => ['running', 'approval', 'queued'].includes(t.status)).length;
+  const visibleTasks = state.tasks
+    .filter(t => (!projectId || t.projectId === projectId) && (t.title + ' ' + t.prompt).toLowerCase().includes(query.toLowerCase()))
+    .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
+
+  const openTask = id => { setSelected(id); setView('chat'); };
+  const newChat = () => { setSelected(null); setView('chat'); };
+  const isDark = appearance.resolvedTheme !== 'light';
+
+  const navItems = [
+    ['browser', Globe, 'Private Browser'],
+    ['gallery', Sparkles, 'Skills & Plugins'],
+    ['arena', Swords, 'Model Arena'],
+    ['files', FolderOpen, 'Code & Git Studio'],
+    ['automations', Clock, 'Automations'],
+    ['queue', ListTodo, 'Tasks'],
+    ['library', BookOpen, 'Library'],
+    ['connectors', Network, 'Connectors'],
+    ['mcp', Plug, 'MCP Extensions'],
+  ];
+
+  const viewTitle = {
+    chat: task?.title || currentProject?.name || 'New Chat',
+    browser: 'Private Browser',
+    gallery: 'Skills & Plugins Gallery',
+    arena: 'Model Arena',
+    files: 'Code & Git Studio',
+    automations: 'Automations',
+    queue: 'Tasks',
+    library: 'Library',
+    connectors: 'Connectors',
+    mcp: 'MCP Extensions',
+    settings: 'Settings',
+  }[view];
+
+  const autonomyId = normalizeAutonomyId(task?.agentMode || s.agentMode);
+  const autonomyShort = AUTONOMY_LEVELS.find(l => l.id === autonomyId)?.short || autonomyId;
+  const enabledAutomations = (state.automations || []).filter(a => a.enabled).length;
+
+  return (
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <aside className="sidebar" aria-label="Main navigation">
+        <div className="brand-bar">
+          <span className="brand-mark">N</span>
+          <strong>NEXUS</strong>
+          <span className="brand-tag">NATIVE</span>
+        </div>
+
+        <button type="button" className="new-chat-btn" onClick={newChat}>
+          <Plus size={15} />
+          <span>New Chat</span>
+          <kbd>Ctrl N</kbd>
+        </button>
+
+        <div className="sidebar-search">
+          <Search size={14} />
+          <input aria-label="Search chats" placeholder="Search chats…" value={query} onChange={e => setQuery(e.target.value)} />
+        </div>
+
+        <nav className="sidebar-nav">
+          {navItems.map(([id, Icon, label]) => (
+            <button key={id} type="button" className={`nav-btn ${view === id ? 'active' : ''}`} onClick={() => setView(id)}>
+              <Icon size={15} />
+              <span>{label}</span>
+              {id === 'queue' && activeCount > 0 && <span className="nav-badge tabular">{activeCount}</span>}
+              {id === 'automations' && enabledAutomations > 0 && <span className="nav-badge tabular">{enabledAutomations}</span>}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-scroll">
+          <div className="side-section-head">
+            <span>Projects</span>
+            <button type="button" aria-label="New project" title="New project" onClick={() => setProjectModal({ name: '', workspace: '', instructions: '' })}><Plus size={13} /></button>
+          </div>
+          <button type="button" className={`nav-btn ${!projectId && view === 'chat' ? 'active' : ''}`} onClick={() => { setProjectId(''); newChat(); }}>
+            <MessageSquare size={14} /><span>All Chats</span>
+          </button>
+          {state.projects.map(p => (
+            <div key={p.id} className={`chat-item ${projectId === p.id ? 'selected' : ''}`}>
+              <button type="button" className="chat-item-main" title={p.workspace || 'No linked root folder'} onClick={() => { setProjectId(p.id); if (p.workspace) setWorkspace(p.workspace); newChat(); }}>
+                <Folder size={14} style={{ color: projectId === p.id ? 'var(--accent)' : 'var(--ink-muted)', flexShrink: 0 }} />
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <span style={{ display: 'block' }}>{p.name}</span>
+                  {p.workspace && <small className="hint mono" style={{ display: 'block', fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.workspace.split(/[\\/]/).slice(-2).join('\\')}</small>}
+                </div>
+              </button>
+              <div className="chat-item-actions">
+                <button type="button" title="Edit project" onClick={() => setProjectModal({ ...p })}><Settings2 size={11} /></button>
+              </div>
+            </div>
+          ))}
+
+          <div className="side-section-head">
+            <span>{currentProject?.name || 'Sessions'}</span>
+            <span className="tabular">{visibleTasks.length}</span>
+          </div>
+          {(() => {
+            const byId = new Map(visibleTasks.map(t => [t.id, t]));
+            const childrenOf = new Map();
+            const roots = [];
+            for (const t of visibleTasks) {
+              if (t.parentTaskId && byId.has(t.parentTaskId)) {
+                if (!childrenOf.has(t.parentTaskId)) childrenOf.set(t.parentTaskId, []);
+                childrenOf.get(t.parentTaskId).push(t);
+              } else {
+                roots.push(t);
+              }
+            }
+            const renderTaskRow = (t, depth = 0) => {
+              const kids = childrenOf.get(t.id) || [];
+              return (
+                <React.Fragment key={t.id}>
+                  <div className={`chat-item ${selected === t.id && view === 'chat' ? 'selected' : ''} ${depth > 0 ? 'nested-item' : ''}`} style={depth > 0 ? { marginLeft: Math.min(depth * 14, 28) } : undefined}>
+                    <button type="button" className="chat-item-main" onClick={() => openTask(t.id)}>
+                      <i className={`status-dot ${t.status}`} />
+                      <span>{t.title}</span>
+                      {kids.length > 0 && <small className="tag-chip tabular" style={{ fontSize: 9.5, padding: '0 5px' }}>{kids.length}</small>}
+                      {t.pinned && <Pin size={11} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
+                    </button>
+                    <div className="chat-item-actions">
+                      <button type="button" title={t.pinned ? 'Unpin' : 'Pin'} onClick={() => act('updateChat', { id: t.id, pinned: !t.pinned })}><Pin size={11} /></button>
+                      <button type="button" title="Fork chat" onClick={async () => { const r = await act('forkTask', { id: t.id }); if (r?.id) openTask(r.id); }}><GitFork size={11} /></button>
+                      <button type="button" title="Delete chat" onClick={async () => {
+                        if (await act('deleteTask', { id: t.id })) {
+                          if (selected === t.id) setSelected(null);
+                          notify('Chat deleted.', 'ok');
+                        }
+                      }}><Trash2 size={11} /></button>
+                    </div>
+                  </div>
+                  {kids.map(child => renderTaskRow(child, depth + 1))}
+                </React.Fragment>
+              );
+            };
+            return roots.map(r => renderTaskRow(r, 0));
+          })()}
+          {!visibleTasks.length && <p className="hint" style={{ padding: '6px 10px' }}>Start a new chat or create a Project rooted in a folder.</p>}
+        </div>
+
+        <div className="sidebar-footer">
+          <div className="provider-foot">
+            <div>
+              <span>{providerLabel(activeProvider, s.customProviders)}</span>
+              <strong className="tabular">{activeProvider === 'openrouter' ? formatMoney(balance?.remaining) : (state.providerKeys?.[activeProvider] ? 'Connected' : 'Configure key')}</strong>
+            </div>
+            <button type="button" className="btn-icon" aria-label="Refresh balance" disabled={balanceBusy} onClick={refreshBalance}><RefreshCw size={13} className={balanceBusy ? 'spin' : ''} /></button>
+          </div>
+          <button type="button" className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
+            <Settings2 size={15} /><span>Settings & Config</span>
+          </button>
+        </div>
+      </aside>
+
+      <main className="main-col">
+        <header className="topbar">
+          <div className="topbar-left">
+            <button type="button" className="btn-icon" title="Toggle sidebar · Ctrl+B" aria-label="Toggle sidebar" onClick={() => setSidebarCollapsed(c => !c)}><PanelLeft size={16} /></button>
+            <span className="topbar-crumb">NEXUS</span>
+            <ChevronRight size={13} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />
+            <span className="topbar-title">{viewTitle}</span>
+          </div>
+
+          <div className="topbar-right">
+            <CommandPalette
+              state={state}
+              navigate={setView}
+              openTask={openTask}
+              newChat={newChat}
+              appearance={appearance}
+              toggleSidebar={() => setSidebarCollapsed(c => !c)}
+              onAction={method => act(method)}
+              onOpenChange={setPaletteOpen}
+            />
+            <button
+              type="button"
+              className="btn-icon"
+              title={isDark ? 'Switch to Studio Paper (Light)' : 'Switch to Obsidian (Dark)'}
+              aria-label="Toggle color theme"
+              onClick={() => appearance.update('theme', isDark ? 'light' : 'dark')}
+            >
+              {isDark ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
+            <span className={`pill ${autonomyId === 'unrestricted' ? 'warn' : autonomyId === 'semi-autopilot' ? 'info' : ''}`}>
+              {providerLabel(activeProvider, s.customProviders)} · {autonomyShort}
+            </span>
+            {currentProject && (
+              <button type="button" className="btn-icon" title="Edit project" onClick={() => setProjectModal({ ...currentProject })}><Settings2 size={15} /></button>
+            )}
+          </div>
+        </header>
+
+        {view === 'chat' && (
+          <ChatView
+            state={state}
+            task={task}
+            currentProject={currentProject}
+            projectId={projectId}
+            workspace={workspace}
+            setWorkspace={setWorkspace}
+            models={models}
+            draftManager={draftManager}
+            draftKey={draftKey}
+            loaded={loaded}
+            setLoaded={setLoaded}
+            act={act}
+            notify={notify}
+            openTask={openTask}
+            navigate={setView}
+            overlayOpen={paletteOpen || Boolean(projectModal)}
+          />
+        )}
+        {view === 'browser' && (
+          <PrivateBrowserView
+            state={state}
+            act={act}
+            notify={notify}
+            modalOpen={paletteOpen || Boolean(projectModal)}
+            onSendToChat={text => {
+              draftManager.update(draftKey, { text });
+              setView('chat');
+              notify('Page content copied into your chat composer.', 'ok');
+            }}
+            onAttachScreenshot={(att, url) => {
+              const cur = draftManager.get(draftKey);
+              draftManager.update(draftKey, {
+                attachments: [...(cur.attachments || []), att],
+                text: cur.text || `Inspect this screenshot from ${url}:`,
+              });
+              setView('chat');
+            }}
+          />
+        )}
+        {view === 'gallery' && <GalleryView act={act} notify={notify} navigate={setView} />}
+        {view === 'arena' && <ArenaView state={state} models={models} workspace={activeWorkspace} setWorkspace={setWorkspace} projectId={projectId} openTask={openTask} act={act} notify={notify} />}
+        {view === 'files' && <StudioView workspace={activeWorkspace} setWorkspace={setWorkspace} act={act} notify={notify} onOpenInChat={path => { setWorkspace(path); newChat(); }} />}
+        {view === 'automations' && <AutomationsView state={state} workspace={activeWorkspace} models={models} act={act} notify={notify} openTask={openTask} />}
+        {view === 'queue' && <TasksView state={state} projectId={projectId} workspace={activeWorkspace} setWorkspace={setWorkspace} openTask={openTask} navigate={setView} act={act} notify={notify} />}
+        {view === 'library' && <LibraryView state={state} act={act} notify={notify} navigate={setView} />}
+        {view === 'connectors' && <ConnectorsView act={act} count={state.connectorCount ?? state.connectors.length} notify={notify} />}
+        {view === 'mcp' && <McpView state={state} workspace={activeWorkspace} act={act} notify={notify} />}
+        {view === 'settings' && (
+          <SettingsView
+            state={state}
+            appearance={appearance}
+            models={models}
+            reloadModels={reloadModels}
+            balance={balance}
+            balanceBusy={balanceBusy}
+            refreshBalance={refreshBalance}
+            act={act}
+            notify={notify}
+          />
+        )}
+      </main>
+
+      {projectModal && (
+        <Modal label={projectModal.id ? 'Edit Project' : 'New Project'} close={() => setProjectModal(null)}>
+          <h2>{projectModal.id ? 'Edit Project' : 'New Project'}</h2>
+          <form onSubmit={async e => {
+            e.preventDefault();
+            const id = await act('saveProject', projectModal);
+            if (id) { setProjectId(id); setProjectModal(null); notify('Project saved.', 'ok'); }
+          }}>
+            <label className="field"><span>Project Name</span><input required value={projectModal.name} onChange={e => setProjectModal({ ...projectModal, name: e.target.value })} placeholder="e.g. Nexus Core, Trading Bot, Client WebApp" /></label>
+            <label className="field">
+              <span>Project Root Folder</span>
+              <div className="row">
+                <input className="mono" style={{ flex: 1 }} value={projectModal.workspace || ''} onChange={e => setProjectModal({ ...projectModal, workspace: e.target.value })} placeholder="C:\Projects\my-app (auto-loads NEXUS.md, CLAUDE.md, .nexus/skills/*/SKILL.md)" />
+                <button type="button" className="btn-secondary" onClick={async () => { const p = await act('chooseWorkspace'); if (p) setProjectModal({ ...projectModal, workspace: p }); }}>
+                  <FolderOpen size={14} /> Browse
+                </button>
+              </div>
+            </label>
+            <label className="field"><span>Project Instructions</span><textarea rows={5} value={projectModal.instructions} onChange={e => setProjectModal({ ...projectModal, instructions: e.target.value })} placeholder="Domain conventions, build steps, or architecture guidelines…" /></label>
+            <div className="row-between" style={{ marginTop: 14 }}>
+              {projectModal.id ? (
+                <button type="button" className="btn-danger" onClick={async () => { if (await act('removeProject', { id: projectModal.id })) { setProjectId(''); setProjectModal(null); notify('Project removed (chats kept).', 'info'); } }}>Remove Project</button>
+              ) : <span />}
+              <div className="row">
+                <button type="button" className="btn-secondary" onClick={() => setProjectModal(null)}>Cancel</button>
+                <button className="btn-primary">Save Project</button>
+              </div>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      <div className="toast-stack" aria-live="polite">
+        {toasts.map(t => (
+          <div key={t.id} className={`toast ${t.kind}`} role={t.kind === 'error' ? 'alert' : 'status'}>
+            <div className="toast-msg">{t.message}</div>
+            <button type="button" className="btn-icon" style={{ width: 22, height: 22 }} onClick={() => setToasts(prev => prev.filter(x => x.id !== t.id))}><X size={13} /></button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
-function Telemetry({task,windowSize}){const t=task.telemetry||{},last=task.lastTurnTelemetry||{},c=task.lastCompression,lastCall=task.calls?.at(-1),router=lastCall?.router;const route=router?.provider_name||router?.provider||router?.provider_name_slug||'Not reported';return <details className="telemetry"><summary><Activity size={14}/><span>Session {money(t.cost)}{t.unknownCosts?' · partial':''}</span><span>Context ≈ {count(task.contextTokens)}</span><span>Cache hit {pct(t.cacheHitRate)}</span></summary><div className="telemetry-grid">{[['Session cost',money(t.cost)+(t.unknownCosts?' (partial)':'')],['Last turn',money(last.cost)+(last.unknownCosts?' (partial)':'')],['Last call',money(lastCall?.cost)],['Last call provider',route],['Web searches',count(t.webSearchRequests)],['Cumulative tokens',count(t.total)],['Input / output',count(t.input)+' / '+count(t.output)],['Cached tokens read',count(t.cached)],['Cache write tokens',count(t.cacheWrite)],['Reasoning tokens',count(t.reasoning)],['Cache hit (tokens)',pct(t.cacheHitRate)],['Reported cache coverage',pct(t.cacheCoverage)],['Estimated current context',count(task.contextTokens)+' / '+count(windowSize)],['Next execution',task.needsCompression?'Will compact before calling':'Within threshold'],['Before / after compaction',c?'≈ '+count(c.before)+' / '+count(c.after):'No compaction'],['Archived / retained tail',c?count(c.archivedMessages||0)+' / '+count(c.retainedMessages||0):'No compaction'],['Compactions / calls',task.compressions+' / '+(t.calls||0)],['Cumulative API latency',t.latencyMs==null?'—':(t.latencyMs/1000).toFixed(1)+' s']].map(([label,value])=><div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div><p className="hint">Costs reported in USD; includes compaction calls. Cache hit = cached tokens / input tokens across comparable calls. "Partial" indicates calls without provider-reported cost.</p></details>;}
-function SecretField({name,label,act}){const [value,setValue]=useState(''),[saved,setSaved]=useState(false);return <form onSubmit={async e=>{e.preventDefault();if(await act('saveKey',{name,value})){setValue('');setSaved(true);}}}><label>{label}<input type="password" autoComplete="off" value={value} onChange={e=>setValue(e.target.value)} placeholder="Stored encrypted locally; never exposed to the model"/></label><div className="row"><button className="secondary" disabled={!value.trim()}>Save</button><button type="button" onClick={async()=>{await act('saveKey',{name,value:''});setSaved(false);}}>Clear saved key</button>{saved&&<small>Saved</small>}</div></form>;}
-const modelPrice=value=>{const amount=Number(value);return Number.isFinite(amount)?'$'+(amount*1000000).toFixed(amount*1000000<.01?4:2)+'/M':'—';};
-function ModelExplorer({models,current,select,reload}){const [sort,setSort]=useState('intelligence-high-to-low');const [search,setSearch]=useState('');const visible=models.filter(model=>!search||[model.id,model.name].join(' ').toLowerCase().includes(search.toLowerCase())).slice(0,8);const choose=model=>select(model.id);return <><label>Model<input list="models" value={current} onChange={e=>select(e.target.value)} placeholder="Search or enter provider/model"/><datalist id="models">{models.map(model=><option key={model.id} value={model.id}>{model.name}{model.tools?' · tools':''}</option>)}</datalist></label><details className="model-explorer"><summary>Discover models and providers</summary><div className="model-controls"><select value={sort} onChange={e=>{setSort(e.target.value);reload(e.target.value);}}><option value="intelligence-high-to-low">Highest capability</option><option value="pricing-low-to-high">Lowest price</option><option value="throughput-high-to-low">Highest throughput</option><option value="latency-low-to-high">Lowest latency</option><option value="context-high-to-low">Largest context</option><option value="most-popular">Most popular</option><option value="newest">Newest</option></select><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filter catalog"/></div><div className="model-list">{visible.map(model=><button type="button" className={'model-choice '+(model.id===current?'selected':'')} key={model.id} onClick={()=>choose(model)}><strong>{model.name}</strong><small>{model.id.split('/')[0]} · {model.context?.toLocaleString()||'—'} ctx · in {modelPrice(model.pricing?.prompt)} · out {modelPrice(model.pricing?.completion)}</small><span>{model.tools?'Tools':''}{model.vision?' · Vision':''}{model.reasoning?' · Thinking':''}</span></button>)}{!visible.length&&<p className="hint">No matching models in loaded catalog.</p>}</div></details></>;}
-function ReasoningControl({model,value,save}){const available=model?.reasoning?.supported_efforts;const mandatory=model?.reasoning?.mandatory;const options=[['none','Disabled · lower cost'],['minimal','Minimal'],['low','Low'],['medium','Medium'],['high','High'],['xhigh','Very high'],['max','Maximum'],['auto','Model default']];return <label>Thinking / reasoning<select value={value} onChange={e=>save(e.target.value)}>{options.map(([id,label])=><option key={id} value={id} disabled={Array.isArray(available)&&id!=='auto'&&!available.includes(id)}>{label}</option>)}</select><span className="hint">{model?(mandatory?'This model requires reasoning.':Array.isArray(available)?'Supported levels: '+available.join(', ')+'.':'Provider did not publish specific levels; NEXUS will request the chosen level.'):'Select a model to inspect its reasoning capabilities.'}</span></label>;}
-function ProviderRouting({value='auto',save}){return <label>Provider routing priority<select aria-label="Provider priority" value={value} onChange={e=>save(e.target.value)}><option value="auto">OpenRouter automatic</option><option value="price">Lowest price</option><option value="throughput">Highest throughput</option><option value="latency">Lowest latency</option></select><span className="hint">OpenRouter routes across compatible upstream providers. The selected route is recorded in call telemetry.</span></label>;}
-function WebSearchSettings({settings,save}){if(!settings.webSearchEnabled)return null;return <><label>Web search engine<select aria-label="Web search engine" value={settings.webSearchEngine} onChange={e=>save('webSearchEngine',e.target.value)}>{[['auto','Automatic'],['native','Provider native'],['exa','Exa'],['parallel','Parallel'],['perplexity','Perplexity'],['firecrawl','Firecrawl (BYOK)']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><label>Context per result<select aria-label="Web search context" value={settings.webSearchContext} onChange={e=>save('webSearchContext',e.target.value)}><option value="low">Low · lower cost</option><option value="medium">Medium</option><option value="high">High · more detail</option></select></label><div className="two"><NumberField label="Results per search" value={settings.webMaxResults} min={1} max={25} save={value=>save('webMaxResults',value)}/><NumberField label="Searches per call (0 = provider)" value={settings.webMaxUses} min={0} max={30} save={value=>save('webMaxUses',value)}/></div></>;}
-function ConnectorSecret({act}){const [name,setName]=useState('CONNECTOR_API');return <><label>Secret name<input value={name} onChange={e=>setName(e.target.value.toUpperCase())}/></label><SecretField name={name} label="Token" act={act}/></>;}
-function TextSetting({value,save,label,rows=4}){const [draft,setDraft]=useState(value);useEffect(()=>setDraft(value),[value]);return <><textarea aria-label={label} rows={rows} value={draft} onChange={e=>setDraft(e.target.value)}/><button className="secondary" disabled={draft===value} onClick={()=>save(draft)}>Save instructions</button></>;}
-function NumberField({label,value,min,max,save}){return <label>{label}<input type="number" key={value} defaultValue={value} min={min} max={max} onBlur={e=>{if(+e.target.value!==value)save(+e.target.value);}}/></label>;}
-function Toggle({label,hint,checked,save}){return <label className="toggle"><div><strong>{label}</strong><p className="hint">{hint}</p></div><input type="checkbox" role="switch" checked={checked} onChange={e=>save(e.target.checked)}/></label>;}
-function WebLink({href,children}){const [error,setError]=useState('');return <><a href={href} onClick={async event=>{event.preventDefault();setError('');try{await api('openExternal',{url:href});}catch{setError('Could not open link.');}}}>{children}</a>{error&&<small role="status"> {error}</small>}</>;}
-function CopyText({text,label='Copy'}){const [status,setStatus]=useState('');useEffect(()=>{setStatus('');},[text]);useEffect(()=>{if(!status)return;const timer=setTimeout(()=>setStatus(''),1800);return()=>clearTimeout(timer);},[status]);return <button type="button" onClick={async()=>{try{await navigator.clipboard.writeText(text);setStatus('Copied');}catch{setStatus('Could not copy');}}} aria-label={label} title={label}><span role="status">{status||label}</span></button>;}
-const markdownPlugins=[remarkGfm];
-const markdownComponents={a:({href,children})=><WebLink href={href}>{children}</WebLink>,table:({children})=><div className="table-wrap" tabIndex={0} role="region" aria-label="Horizontally scrollable table"><table>{children}</table></div>,pre:({children})=><div className="code-block"><div className="code-actions"><span className="code-language">{children?.props?.className?.replace('language-','')||'text'}</span><CopyText text={String(children?.props?.children??'')} label="Copy code"/></div><pre>{children}</pre></div>};
-const RichMarkdown=React.memo(function RichMarkdown({text}){return <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents}>{String(text??'')}</ReactMarkdown>;});
-const Formatted=React.memo(function Formatted({text}){return <div className="formatted"><RichMarkdown text={text}/></div>;});
-function StreamingFormatted({text}){const shown=useSmoothStream(text);return <Formatted text={shown}/>;}
-const safeWebUrl=value=>{try{const url=new URL(value);return ['http:','https:'].includes(url.protocol)?url:null;}catch{return null;}};
-function Sources({sources}){const visible=sources.map(source=>({source,url:safeWebUrl(source?.url)})).filter(item=>item.url);if(!visible.length)return null;return <details className="sources"><summary>Cited sources · {visible.length}</summary><ol>{visible.map(({source,url})=><li key={url.href}><WebLink href={url.href}>{typeof source.title==='string'?source.title:url.hostname}</WebLink><small>{url.hostname}</small></li>)}</ol></details>;}
-function ActivitySummary({text}){return <div className="activity-summary"><Activity size={14}/><span>{text}</span></div>;}
-function Reasoning({text,step,live}){if(!text)return null;const preview=String(text).trim().slice(0,80);return <details className={'reasoning'+(live?' live':'')}><summary><span className="reasoning-label">{step?('Step '+step+' · Reasoning summary'):'Reasoning summary'}{live?' in progress':''}</span>{preview?<span className="reasoning-preview">{preview}</span>:null}</summary><div className="reasoning-body"><RichMarkdown text={text}/></div></details>;}
-function Events({events}){return <div className="events">{events.map(e=><details key={e.id}><summary><Activity size={14}/><strong>{e.kind}</strong><span>{e.detail?.name||e.detail?.path||''}</span><time>{new Date(e.at).toLocaleTimeString()}</time></summary><pre>{pretty(e.detail)}</pre></details>)}</div>;}
-function Effects({effects}){return <section className="card"><h3>Recent External Effects</h3><p className="hint">Uncertain external actions are never replayed automatically after a pause: inspect and reconcile them with concrete evidence.</p>{effects.slice().reverse().map(effect=><details key={effect.id}><summary><strong>{effect.tool}</strong><span className={'status '+effect.status}>{effect.status}</span><time>{new Date(effect.updatedAt).toLocaleTimeString()}</time></summary><pre>{pretty({id:effect.id,args:effect.args,artifact:effect.artifact,evidence:effect.evidence,note:effect.note,error:effect.error})}</pre></details>)}</section>;}
-createRoot(document.getElementById('root')).render(<App/>);
+
+createRoot(document.getElementById('root')).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
+

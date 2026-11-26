@@ -3,7 +3,8 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const limit = 6000;
+const limit = 12000;
+const NEVER_REWRAP = new Set(['read_artifact', 'read_checkpoint', 'read_attachment']);
 const stringify = value => JSON.stringify(value);
 
 // Large external outputs are durable artifacts, not an ever-growing prompt or UI payload.
@@ -11,16 +12,24 @@ const stringify = value => JSON.stringify(value);
 export async function materializeToolResult(store, task, name, result) {
   const serialized = stringify(result);
   const bytes = Buffer.byteLength(serialized, 'utf8');
-  if (bytes <= limit) return { journal:result, model:serialized, artifact:null };
+  if (NEVER_REWRAP.has(name) || bytes <= limit) return { journal:result, model:serialized, artifact:null };
   const id = crypto.randomUUID();
   const directory = path.join(store.directoryFor(task.id), 'artifacts');
   await fs.mkdir(directory, {recursive:true});
   const filename = path.join(directory, id + '.json');
   await fs.writeFile(filename, serialized, 'utf8');
   const artifact = {id, name, bytes, sha256:crypto.createHash('sha256').update(serialized).digest('hex'), format:'json'};
-  const preview = serialized.slice(0, 900);
-  const reference = {artifact, preview, truncated:true, hint:'Full output saved locally. Use read_artifact with this id, offset, and length to retrieve only the required slice.'};
+  const preview = serialized.slice(0, 1800);
+  const reference = {artifact, preview, truncated:true, hint:'Full output saved locally. Use read_artifact with this id, offset, and length (up to 24000) to retrieve slices without re-wrapping.'};
   return {journal:reference, model:stringify(reference), artifact};
+}
+
+export async function saveRawArtifact(store, task, name, serialized) {
+  const id = crypto.randomUUID();
+  const directory = path.join(store.directoryFor(task.id), 'artifacts');
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, id + '.json'), serialized, 'utf8');
+  return { id, name, bytes: Buffer.byteLength(serialized, 'utf8') };
 }
 
 export async function readArtifact(store, task, id, offset = 0, length = 8000) {

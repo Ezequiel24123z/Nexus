@@ -1,72 +1,33 @@
 {
   "name": "nexus-desktop",
-  "version": "0.4.0",
-  "description": "NEXUS Autonomous Agentic Coding & Personal Operator IDE",
+  "version": "1.1.0",
+  "description": "NEXUS Autonomous Standalone Agentic Coding, Private Browser & Personal Operator Workstation (Native Windows WebView2, Zero Electron)",
   "author": "NEXUS",
   "repository": "https://github.com/Ezequiel24123z/Nexus",
   "private": true,
   "type": "module",
-  "main": "main.cjs",
   "scripts": {
-    "build": "vite build",
-    "start": "electron .",
-    "postinstall": "node node_modules/electron/install.js",
-    "test": "node --test tests/*.test.mjs",
-    "test:live": "electron tests/run-live-from-vault.cjs tests/live-openrouter.mjs",
-    "test:live-cache": "electron tests/run-live-from-vault.cjs tests/live-cache.mjs",
-    "test:live-compaction": "electron tests/run-live-from-vault.cjs tests/live-openrouter.mjs compaction",
-    "test:live-orchestration": "electron tests/run-live-from-vault.cjs tests/live-orchestration.mjs",
-    "test:live-native-output": "electron tests/run-live-from-vault.cjs tests/live-native-output.mjs",
-    "test:live-recovery": "electron tests/run-live-from-vault.cjs tests/live-recovery.mjs",
-    "package": "npm run build && electron-builder --win dir",
-    "dist:portable": "npm run build && electron-builder --win portable"
+    "build:ui": "vite build",
+    "build:native": "dotnet build native-host/NEXUS.csproj -c Release -o release/NEXUS --nologo",
+    "build": "npm run build:ui && npm run build:native",
+    "dist:portable": "npm run build && node tools/build-portable.mjs",
+    "start": "node tools/launch.mjs",
+    "start:web": "node core/server.mjs --standalone --open",
+    "start:headless": "node core/server.mjs --standalone",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "eventsource-parser": "4.1.0",
+    "katex": "^0.19.1",
     "lucide-react": "^1.31.0",
+    "mermaid": "^12.3.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
-    "electron": "44.3.0",
-    "electron-builder": "26.15.3",
     "vite": "8.3.0"
-  },
-  "build": {
-    "appId": "app.nexus.operator",
-    "productName": "NEXUS",
-    "compression": "store",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "ui/**",
-      "main.cjs",
-      "preload.cjs",
-      "core/**",
-      "native/**",
-      "package.json",
-      "!node_modules/lucide-react/**",
-      "!node_modules/react/**",
-      "!node_modules/react-dom/**",
-      "!node_modules/react-markdown/**",
-      "!node_modules/remark-gfm/**"
-    ],
-    "asarUnpack": [
-      "native/**"
-    ],
-    "win": {
-      "target": [
-        "portable",
-        "dir"
-      ],
-      "signAndEditExecutable": false
-    },
-    "portable": {
-      "artifactName": "NEXUS-Portable.exe"
-    }
   }
 }

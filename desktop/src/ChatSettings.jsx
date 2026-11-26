@@ -1,14 +1,69 @@
-import React,{useState} from 'react';
-import {X} from 'lucide-react';
-import {contextAdvice} from './context-advice.mjs';
-export default function ChatSettings({task,state,act,close}){
- const [form,setForm]=useState({title:task.title,model:task.model,projectId:task.projectId||''});
- const [compacting,setCompacting]=useState(false);
- const advice=contextAdvice(task,state.settings),number=value=>new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(value);
- return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-label="Chat settings"><button className="modal-close" aria-label="Close" onClick={close}><X size={20}/></button><h2>Chat Settings</h2><form onSubmit={async e=>{e.preventDefault();if(await act('updateChat',{id:task.id,...form}))close();}}><label>Title<input value={form.title} onChange={e=>setForm({...form,title:e.target.value})} required/></label><label>Project<select value={form.projectId} onChange={e=>setForm({...form,projectId:e.target.value})}><option value="">No project</option>{state.projects.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label><p className="hint">Switching project updates its project instructions while keeping this chat's working directory intact.</p><label>Model for subsequent turns<input value={form.model} required onChange={e=>setForm({...form,model:e.target.value})}/></label><p className="hint">Pause the task before changing models. Ensure the configured context ceiling is compatible with the selected model.</p>
-<p className="hint">Compacting stores a continuity capsule and preserves original messages in checkpoints. It consumes one model call; subsequent savings depend on conversation length and prompt caching.</p>
-<div className="context-advice" role="note" aria-label="Compaction efficiency"><p>Estimated context: {advice.current===null?'Unavailable':number(advice.current)} tokens. Automatic threshold: {advice.threshold===null?'Unavailable':number(advice.threshold)}.</p>{advice.short&&<p>In a short chat, compacting may save very little or even increase context size. You can wait for the automatic threshold or compact now if needed.</p>}{advice.saved&&<p>Last compaction: {advice.saved.tokens>0?`reduced ${number(advice.saved.tokens)} tokens (${advice.saved.percent.toFixed(1)}%)`:advice.saved.tokens===0?'did not reduce context':`increased by ${number(-advice.saved.tokens)} tokens`}. These are estimates, not guaranteed monetary savings.</p>}</div>
-<button type="button" disabled={compacting||task.compacting||['running','approval','queued'].includes(task.status)} onClick={async()=>{setCompacting(true);try{if(await act('compact',{id:task.id}))close();}finally{setCompacting(false);}}}>{compacting||task.compacting?'Saving continuity…':'Compact context now'}</button>
-{(compacting||task.compacting)&&<button type="button" onClick={()=>act('pause',{id:task.id})}>Pause compaction</button>}
-<button className="primary" disabled={compacting||task.compacting}>Save changes</button></form></section></div>;
+import React, { useState } from 'react';
+import Modal from './components/Modal.jsx';
+import { contextAdvice } from './context-advice.mjs';
+
+export default function ChatSettings({ task, state, act, close }) {
+  const [form, setForm] = useState({
+    title: task.title,
+    model: task.model,
+    projectId: task.projectId || '',
+    temperature: task.temperature ?? '',
+    systemPromptOverride: task.systemPromptOverride || '',
+  });
+  const [compacting, setCompacting] = useState(false);
+  const advice = contextAdvice(task, state.settings);
+  const num = v => new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(v);
+
+  return (
+    <Modal label="Chat Settings" close={close}>
+      <h2>Chat Settings</h2>
+      <form onSubmit={async e => {
+        e.preventDefault();
+        const payload = {
+          id: task.id,
+          title: form.title,
+          model: form.model,
+          projectId: form.projectId,
+          temperature: form.temperature === '' ? null : Number(form.temperature),
+          systemPromptOverride: form.systemPromptOverride,
+        };
+        if (await act('updateChat', payload)) close();
+      }}>
+        <label className="field"><span>Title</span><input value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} required /></label>
+        <div className="grid-2">
+          <label className="field">
+            <span>Project</span>
+            <select value={form.projectId} onChange={e => setForm({ ...form, projectId: e.target.value })}>
+              <option value="">No project</option>
+              {state.projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}
+            </select>
+          </label>
+          <label className="field">
+            <span>Temperature Override (0–2)</span>
+            <input type="number" step="0.05" min="0" max="2" placeholder="Inherit global" value={form.temperature} onChange={e => setForm({ ...form, temperature: e.target.value })} />
+          </label>
+        </div>
+        <label className="field"><span>Model for Subsequent Turns</span><input value={form.model} required onChange={e => setForm({ ...form, model: e.target.value })} /></label>
+        <label className="field"><span>Per-Chat System Prompt Override (optional)</span><textarea rows={4} placeholder="Leave blank to inherit global instructions…" value={form.systemPromptOverride} onChange={e => setForm({ ...form, systemPromptOverride: e.target.value })} /></label>
+
+        <div className="panel-card" style={{ padding: 12, marginTop: 12 }}>
+          <p className="hint tabular" style={{ margin: 0 }}>Estimated context: {advice.current == null ? 'Unavailable' : num(advice.current)} tok · Auto threshold: {advice.threshold == null ? 'Unavailable' : num(advice.threshold)} tok.</p>
+          {advice.saved && <p className="hint tabular" style={{ margin: '4px 0 0' }}>Last compaction: {advice.saved.tokens > 0 ? `reduced ${num(advice.saved.tokens)} tok (${advice.saved.percent.toFixed(1)}%)` : `delta ${num(-advice.saved.tokens)} tok`}.</p>}
+          <div className="row" style={{ marginTop: 10 }}>
+            <button type="button" className="btn-secondary" disabled={compacting || task.compacting || ['running', 'approval', 'queued'].includes(task.status)} onClick={async () => {
+              setCompacting(true);
+              try { if (await act('compact', { id: task.id })) close(); }
+              finally { setCompacting(false); }
+            }}>{compacting || task.compacting ? 'Compacting…' : 'Compact Context Now'}</button>
+            {(compacting || task.compacting) && <button type="button" className="btn-danger" onClick={() => act('pause', { id: task.id })}>Pause Compaction</button>}
+          </div>
+        </div>
+
+        <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
+          <button type="button" className="btn-secondary" onClick={close}>Cancel</button>
+          <button className="btn-primary" disabled={compacting || task.compacting}>Save Changes</button>
+        </div>
+      </form>
+    </Modal>
+  );
 }

@@ -1,18 +1,51 @@
-import React,{useState} from 'react';
-export default function RecoveryPanel({act}){
- const [busy,setBusy]=useState(false),[preview,setPreview]=useState(null),[result,setResult]=useState(null);
- const inspect=async()=>{setBusy(true);setPreview(null);setResult(null);try{setPreview(await act('inspectRecovery'));}finally{setBusy(false);}};
- const restore=async()=>{setBusy(true);try{const value=await act('restoreRecovery',{token:preview.token});if(value){setResult(value);setPreview(null);}}finally{setBusy(false);}};
- return <section className="card wide recovery-panel" aria-label="Backup recovery" aria-busy={busy}>
-  <h2>Recover a Backup</h2><p className="hint">Verify an exported JSON or SQLite backup and stage its state into a new isolated folder. Your active session is never overwritten.</p>
-  <button className="secondary" disabled={busy} onClick={inspect}>{busy?'Checking…':'Select backup to review'}</button>
-  {busy&&<p role="status" className="hint">Processing in background worker. Do not close the application until it finishes.</p>}
-  {preview&&<div className="recovery-preview"><h3>{preview.name}</h3><p className="hint">Modified: {new Date(preview.modifiedAt).toLocaleString()} · {(preview.bytes/1024/1024).toFixed(2)} MiB. File timestamp does not guarantee all latest changes are included.</p>
-   <dl className="recovery-counts"><div><dt>Chats</dt><dd>{preview.chats}</dd></div><div><dt>Visible messages</dt><dd>{preview.messages}</dd></div><div><dt>Projects</dt><dd>{preview.projects}</dd></div><div><dt>Format</dt><dd>{preview.format.toUpperCase()}</dd></div></dl>
-   {preview.interrupted>0&&<p>{preview.interrupted} interrupted tasks will be placed in paused state.</p>}
-   <ul className="hint">{preview.warnings.map(warning=><li key={warning}>{warning}</li>)}</ul>
-   <div className="row"><button className="primary" disabled={busy} onClick={restore}>Restore into new folder</button><button disabled={busy} onClick={()=>setPreview(null)}>Cancel review</button></div>
-  </div>}
-  {result&&<div role="status" className="recovery-result"><h3>State recovered and verified</h3><p>{result.chats} chats saved in:</p><p className="recovery-path">{result.directory}</p><p className="hint">Not automatically activated, and attachments, project files, or credentials were not copied. Keep originals. Review recovery-report.json and paths before using this directory.</p></div>}
- </section>;
+import React, { useState } from 'react';
+
+export default function RecoveryPanel({ act }) {
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const inspect = async () => {
+    setBusy(true); setPreview(null); setResult(null);
+    try { setPreview(await act('inspectRecovery')); }
+    finally { setBusy(false); }
+  };
+
+  const restore = async () => {
+    setBusy(true);
+    try {
+      const value = await act('restoreRecovery', { token: preview.token });
+      if (value) { setResult(value); setPreview(null); }
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <section className="panel-card wide" aria-label="Backup recovery" aria-busy={busy}>
+      <h2>Isolated Backup Verification & Recovery</h2>
+      <p className="hint">Verify any exported JSON or SQLite backup in a background worker and restore into a new isolated folder without overwriting your live workspace.</p>
+      <button type="button" className="btn-secondary" disabled={busy} onClick={inspect}>{busy ? 'Checking…' : 'Select Backup to Verify'}</button>
+      {preview && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border-subtle)', paddingTop: 12 }}>
+          <h3>{preview.name}</h3>
+          <div className="stat-strip" style={{ marginTop: 10 }}>
+            <div className="stat-tile"><small>Chats</small><strong>{preview.chats}</strong></div>
+            <div className="stat-tile"><small>Messages</small><strong>{preview.messages}</strong></div>
+            <div className="stat-tile"><small>Projects</small><strong>{preview.projects}</strong></div>
+            <div className="stat-tile"><small>Format</small><strong>{preview.format.toUpperCase()}</strong></div>
+          </div>
+          <div className="row">
+            <button type="button" className="btn-primary" disabled={busy} onClick={restore}>Restore into New Folder</button>
+            <button type="button" className="btn-secondary" disabled={busy} onClick={() => setPreview(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {result && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border-subtle)', paddingTop: 12 }}>
+          <h3 style={{ color: 'var(--ok-fg)' }}>Backup Restored & Verified</h3>
+          <p className="hint">{result.chats} chats staged in:</p>
+          <pre className="pre-box">{result.directory}</pre>
+        </div>
+      )}
+    </section>
+  );
 }

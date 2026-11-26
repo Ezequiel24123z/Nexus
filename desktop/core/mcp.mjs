@@ -17,8 +17,16 @@ export function validateServer(server){
  for(const reference of [...Object.values(server.envSecrets||{}),server.secretRef].filter(Boolean))if(typeof reference!=='string'||!/^CONNECTOR_[A-Z0-9_]+$/.test(reference))throw new Error('Use CONNECTOR_ secret references for credentials');
 }
 export class McpManager extends EventEmitter{
- constructor(store,getSecret){super();this.store=store;this.getSecret=getSecret;this.sessions=new Map();this.pending=new Map();this.statuses=new Map();this.closed=false;}
- status({compact=false}={}){return Object.fromEntries([...this.statuses].map(([name,status])=>[name,compact?{...status,tools:(status.tools||[]).slice(0,20).map(tool=>({name:tool.name,description:String(tool.description||'').slice(0,600)})),toolCount:status.tools?.length||0}:status]));}
+ constructor(store,getSecret){super();this.store=store;this.getSecret=getSecret;this.sessions=new Map();this.pending=new Map();this.statuses=new Map();this.logs=new Map();this.closed=false;}
+ appendLog(name,chunk){
+  const text=String(chunk||'').trimEnd();
+  if(!text)return;
+  const list=this.logs.get(name)||[];
+  for(const line of text.split(/\r?\n/))if(line)list.push(`[${new Date().toLocaleTimeString()}] ${line.slice(0,400)}`);
+  this.logs.set(name,list.slice(-80));
+ }
+ getLogs(name){return this.logs.get(name)||[];}
+ status({compact=false}={}){return Object.fromEntries([...this.statuses].map(([name,status])=>[name,{...(compact?{...status,tools:(status.tools||[]).slice(0,20).map(tool=>({name:tool.name,description:String(tool.description||'').slice(0,600)})),toolCount:status.tools?.length||0}:status),logs:(this.logs.get(name)||[]).slice(-20)}]));}
  mark(name,data){this.statuses.set(name,data);this.emit('change');}
  async connect(name){
   if(this.closed)throw new Error('MCP manager closed');
@@ -29,31 +37,36 @@ export class McpManager extends EventEmitter{
  }
  async open(name){
   const server=this.store.state.mcpServers.find(s=>s.name===name);if(!server)throw new Error('MCP server not found');validateServer(server);
-  this.mark(name,{status:'connecting',tools:[]});
-  const client=new Client({name:'nexus-desktop',version:'0.2.0'},{capabilities:{}});
+  this.mark(name,{status:'connecting',tools:[],resources:[],prompts:[]});
+  const client=new Client({name:'nexus-desktop',version:'1.0.0'},{capabilities:{}});
   const secret=ref=>{const v=this.getSecret(ref);if(!v)throw new Error('Configure secret '+ref);return v;};
   try{
    let transport;
    if(server.transport==='stdio'){
-    const env=getDefaultEnvironment();for(const [key,ref] of Object.entries(server.envSecrets||{}))env[key]=secret(ref);
+    const env={...getDefaultEnvironment()};
+    if(server.env && typeof server.env==='object')for(const [k,v] of Object.entries(server.env))env[k]=String(v);
+    for(const [key,ref] of Object.entries(server.envSecrets||{}))env[key]=secret(ref);
     transport=new StdioClientTransport({command:server.command,args:server.args,cwd:server.cwd||undefined,env,stderr:'pipe'});
-    transport.stderr?.on('data',()=>{}); // Do not persist server stderr: it may contain credentials.
+    transport.stderr?.on('data',chunk=>{this.appendLog(name,chunk);this.emit('change');});
    }else transport=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{redirect:'error',headers:server.secretRef?{Authorization:'Bearer '+secret(server.secretRef)}:{}}});
    await client.connect(transport,{timeout:30000});
    if(this.closed){await client.close();throw new Error('MCP manager closed');}
    const catalog=[];let cursor;const cursors=new Set();
    do{const result=await client.listTools(cursor?{cursor}:{},{timeout:30000});catalog.push(...result.tools);cursor=result.nextCursor;if(cursor&&cursors.has(cursor))throw new Error('Invalid MCP pagination');if(cursor)cursors.add(cursor);}while(cursor);
-   const session={client,catalog};this.sessions.set(name,session);
-   client.onclose=()=>{if(this.sessions.get(name)===session){this.sessions.delete(name);this.mark(name,{status:'disconnected',tools:[]});}};
-   this.mark(name,{status:'connected',tools:catalog.map(t=>({name:t.name,description:t.description}))});return session;
-  }catch(e){await client.close().catch(()=>{});this.mark(name,{status:'error',tools:[],error:'Could not connect. Check executable, arguments, credentials, and server availability.'});throw new Error('MCP connection failed: '+name);}
+   let resources=[],prompts=[];
+   try{const r=await client.listResources({},{timeout:8000});resources=(r?.resources||[]).slice(0,50).map(item=>({uri:item.uri,name:item.name,description:item.description||''}));}catch{}
+   try{const p=await client.listPrompts({},{timeout:8000});prompts=(p?.prompts||[]).slice(0,50).map(item=>({name:item.name,description:item.description||''}));}catch{}
+   const session={client,catalog,resources,prompts};this.sessions.set(name,session);
+   client.onclose=()=>{if(this.sessions.get(name)===session){this.sessions.delete(name);this.mark(name,{status:'disconnected',tools:[],resources:[],prompts:[]});}};
+   this.mark(name,{status:'connected',tools:catalog.map(t=>({name:t.name,description:t.description})),resources,prompts});return session;
+  }catch(e){await client.close().catch(()=>{});const detail=e?.message?String(e.message).slice(0,220):'';this.appendLog(name,'Connection error: '+detail);this.mark(name,{status:'error',tools:[],resources:[],prompts:[],error:detail||'Could not connect. Check executable, arguments, credentials, and server availability.'});throw new Error('MCP connection failed: '+name+(detail?' ('+detail+')':''));}
  }
  async list(name){const session=await this.connect(name);return session.catalog;}
  async call(name,tool,args,signal){signal?.throwIfAborted();const session=await this.connect(name);signal?.throwIfAborted();if(!session.catalog.some(t=>t.name===tool))throw new Error('Tool not advertised by MCP server');return session.client.callTool({name:tool,arguments:args||{}},undefined,{signal,timeout:300000});}
  async disconnect(name){
   // Await an in-flight handshake so removing a server cannot leave an orphan process.
   if(this.pending.has(name))await this.pending.get(name).catch(()=>{});
-  const session=this.sessions.get(name);this.sessions.delete(name);if(session)await session.client.close();this.mark(name,{status:'disconnected',tools:[]});
+  const session=this.sessions.get(name);this.sessions.delete(name);if(session)await session.client.close();this.mark(name,{status:'disconnected',tools:[],resources:[],prompts:[]});
  }
  async close(){this.closed=true;await Promise.allSettled([...new Set([...this.sessions.keys(),...this.pending.keys()])].map(name=>this.disconnect(name)));}
 }

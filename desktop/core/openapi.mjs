@@ -68,7 +68,7 @@ function authentication(document,operation,resolve,secretRef) {
     try {const scheme=resolve(document.components?.securitySchemes?.[names[0]]);return scheme.type==='http'&&String(scheme.scheme).toLowerCase()==='bearer';}catch{return false;}
   });
   if(!compatible)fail('Unsupported authentication scheme: currently public access or HTTP Bearer is supported.');
-  if(!/^CONNECTOR_[A-Z0-9_]+$/.test(secretRef||''))fail('Esta operación necesita una referencia Bearer CONNECTOR_ configurada.');
+  if(!/^CONNECTOR_[A-Z0-9_]+$/.test(secretRef||''))fail('This operation requires a configured CONNECTOR_ Bearer secret reference.');
   return secretRef;
 }
 

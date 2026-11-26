@@ -3,7 +3,7 @@ import {createRequire} from 'node:module';
 import {performance} from 'node:perf_hooks';
 const require=createRequire(import.meta.url);
 const collections=['messages','conversation','events','calls','effects'];
-const transient=new Set(['liveText','liveReasoning','liveActivity']);
+const transient=new Set(['liveText','liveReasoning','liveActivity','liveTools','liveSubagents','sessionAutoApprove']);
 
 export function persistedState(state){
  return JSON.parse(JSON.stringify({...state,tasks:state.tasks.map(task=>Object.fromEntries(Object.entries(task).filter(([key])=>!transient.has(key))))}));
