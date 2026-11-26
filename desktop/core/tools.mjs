@@ -6,6 +6,17 @@ import {readArtifact} from './artifacts.mjs';
 import { proxiedFetch, resolveEffectiveProxyUrl } from './privacy-proxy.mjs';
 import {catalogPage,functionTargets} from './capabilities.mjs';
 import {
+  MEMORY_CATEGORIES,
+  MEMORY_PRIORITIES,
+  upsertMemory,
+  removeMemory,
+  searchMemories,
+  selectMemoriesForContext,
+  formatMemoriesForPrompt,
+  sortMemories,
+  normalizeMemories,
+} from './memory.mjs';
+import {
   readFileWithRanges,
   multiEditFile,
   applyPatchToFile,
@@ -59,6 +70,8 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   'system_info',
   'list_sessions',
   'read_session',
+  'desktop_windows',
+  'desktop_ui_tree',
 ]);
 
 export const CORE_TOOL_NAMES = new Set([
@@ -77,6 +90,7 @@ export const CORE_TOOL_NAMES = new Set([
   'run_command',
   'todo_write',
   'todo_read',
+  'memory_store',
   'document_progress',
   'read_artifact',
   'read_checkpoint',
@@ -90,7 +104,7 @@ export const TOOLSET_GROUPS = {
   capabilities_mcp: ['search_capabilities', 'get_capability', 'save_capability', 'invoke_function', 'list_mcp_servers', 'list_mcp_tools', 'invoke_mcp', 'scaffold_mcp_server'],
   connectors: ['list_connectors', 'get_connector', 'create_connector', 'invoke_connector', 'list_effects', 'reconcile_effect', 'verify_effect', 'retry_effect'],
   memory_history: ['memory_store', 'search_journal', 'search_history', 'list_attachments', 'read_attachment', 'search_files'],
-  desktop: ['desktop_screenshot', 'desktop_action'],
+  desktop: ['desktop_windows', 'desktop_ui_tree', 'desktop_screenshot', 'desktop_action'],
   automations_evolve: ['manage_automation', 'self_improve', 'create_dynamic_tool'],
   plugins: [],
 };
@@ -168,11 +182,11 @@ export const baseTools = [
   def('shell_session', 'Execute a command in a persistent stateful shell session for this task that preserves working directory (cd) and environment variables across calls.', { command: str('Command to run in the persistent session'), env: { type: 'object', additionalProperties: true, description: 'Optional environment variables to set or persist' }, reason: str('Purpose of command') }, ['command']),
   def('run_diagnostics', 'Run fast syntax and type diagnostics (node --check, JSON validation) across a file or workspace directory.', { path: str('Optional relative file or directory path (default ".")') }),
   def('http_request', 'Send a direct, unrestricted HTTP or HTTPS request (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS) to any local, LAN, or external endpoint with custom headers and body.', { url: str('HTTP or HTTPS URL'), method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] }, headers: { type: 'object', additionalProperties: true }, body: { type: ['string', 'object'], additionalProperties: true } }, ['url']),
-  def('browser_inspect', 'Inspect a web page or local dev server URL, extracting title, readable text, links, forms, and optionally rendering JavaScript via headless browser.', { url: str('HTTP or HTTPS URL'), renderJs: { type: 'boolean', description: 'Render dynamic JavaScript in an offscreen browser window when available' }, extractLinks: { type: 'boolean' }, extractForms: { type: 'boolean' } }, ['url']),
+  def('browser_inspect', 'Inspect or interact with a web page or local dev server. With renderJs: true (or actions/waitForSelector/captureScreenshot), renders full JavaScript inside native Windows Edge WebView2, extracts headings/links/forms/interactive CSS selectors, and can execute click/type/select/scroll/wait/eval steps.', { url: str('HTTP or HTTPS URL'), renderJs: { type: 'boolean', description: 'Execute JavaScript in headless native Edge WebView2 (recommended for SPAs and dynamic pages)' }, waitMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Milliseconds to wait after page load for JS rendering (default 1200)' }, waitForSelector: str('Optional CSS selector to wait for before extracting content'), actions: { type: 'array', description: 'Optional sequential DOM actions to execute before extraction', items: { type: 'object', properties: { type: { type: 'string', enum: ['click', 'type', 'select', 'scroll', 'wait', 'eval'] }, selector: str('CSS selector for click/type/select/wait'), text: str('Text to type'), value: str('Option value for select'), y: { type: 'integer', description: 'Vertical pixels for scroll' }, ms: { type: 'integer', minimum: 50, maximum: 12000 }, script: str('JS function body for eval') }, required: ['type'], additionalProperties: false } }, useAccountSession: { type: 'boolean', description: 'Reuse NEXUS Account Mode browser profile cookies instead of ephemeral InPrivate' }, captureScreenshot: { type: 'boolean', description: 'Also capture and attach a PNG screenshot of the rendered page' }, extractLinks: { type: 'boolean' }, extractForms: { type: 'boolean' } }, ['url']),
   def('manage_process', 'Start, inspect, read output from, list, or stop long-running background processes (dev servers, watchers, builds).', { action: { type: 'string', enum: ['start', 'status', 'output', 'stop', 'list'] }, id: str('Process ID for status/output/stop'), command: str('Shell command when action is start'), label: str('Short label for the background process') }, ['action']),
   def('todo_write', 'Create or update the structured task checklist (plan) for this session to track multi-step engineering progress.', { todos: { type: 'array', items: { type: 'object', properties: { id: str('Short kebab-case ID'), title: str('Actionable task description'), status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'blocked'] }, priority: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['id', 'title', 'status'], additionalProperties: false } } }, ['todos']),
   def('todo_read', 'Read the current structured task checklist for this session.', {}),
-  def('memory_store', 'Manage persistent agent memories across sessions (project conventions, architecture facts, user preferences).', { action: { type: 'string', enum: ['list', 'remember', 'forget'] }, key: str('Memory key or short topic'), value: str('Fact or convention to remember'), scope: { type: 'string', enum: ['project', 'global'], description: 'Scope of memory (defaults to project if in a workspace, else global)' } }, ['action']),
+  def('memory_store', 'Manage persistent structured user & project memories across sessions: user priorities, preferences, working style, hard constraints, workflows, personal profile, and project facts.', { action: { type: 'string', enum: ['list', 'search', 'remember', 'update', 'forget', 'profile'] }, id: str('Memory ID for update/forget'), key: str('Short descriptive topic/key'), value: str('Detailed preference, priority, constraint, workflow, or fact to remember'), category: { type: 'string', enum: MEMORY_CATEGORIES, description: 'priority | preference | constraint | workflow | profile | fact' }, priority: { type: 'string', enum: MEMORY_PRIORITIES, description: 'critical | high | normal | low' }, scope: { type: 'string', enum: ['project', 'global'], description: 'Scope (global for user-wide preferences/priorities, project for workspace-specific rules)' }, tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for fast recall' }, pinned: { type: 'boolean', description: 'Pin to always inject verbatim into context' }, query: str('Search query for action="search"') }, ['action']),
   def('web_search', 'Search the live web using built-in DuckDuckGo search (works on every provider without needing an API key). Returns titles, URLs, and snippets.', { query: str('Search query'), maxResults: { type: 'integer', minimum: 1, maximum: 15 } }, ['query']),
   def('web_fetch', 'Fetch an HTTP/HTTPS URL and extract clean readable text/markdown or JSON content with pagination.', { url: str('HTTP or HTTPS URL'), extractText: { type: 'boolean', description: 'Convert HTML to clean readable text (default true)' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 100, maximum: 24000 } }, ['url']),
   def('manage_automation', 'Create, list, toggle, trigger, or delete local scheduled/cron automations that run autonomously in NEXUS.', { action: { type: 'string', enum: ['list', 'create', 'toggle', 'run', 'delete'] }, id: str('Automation ID (required for toggle, run, delete)'), name: str('Automation name (required for create)'), prompt: str('Task prompt to execute (required for create)'), workspace: str('Optional workspace directory for the automation'), scheduleType: { type: 'string', enum: ['interval', 'daily', 'weekly', 'cron', 'once'] }, everyMinutes: { type: 'integer', minimum: 1 }, hour: { type: 'integer', minimum: 0, maximum: 23 }, minute: { type: 'integer', minimum: 0, maximum: 59 }, weekday: { type: 'integer', minimum: 0, maximum: 6 }, cronExpression: str('5-field cron expression'), runAt: str('ISO timestamp for once'), enabled: { type: 'boolean' }, model: str('Optional model ID'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted', 'agent', 'architect', 'explore'] } }, ['action']),
@@ -196,8 +210,10 @@ export const baseTools = [
   def('invoke_connector', 'Call a configured REST connector. The call is recorded in the effect ledger and journal.', { name: str('Connector name'), input: { type: 'object', additionalProperties: true } }, ['name']),
   def('verify_effect', 'Verify an uncertain connector effect using its configured reconciliation URL.', {id:str('Effect ID')}, ['id']),
   def('retry_effect', 'Retry an uncertain connector effect only if the connector declares Idempotency-Key support, preserving the original operation key.', {id:str('Effect ID')}, ['id']),
-  def('desktop_screenshot', 'Capture the primary screen and deliver it to the model. Use the returned physical scale factor when computing click coordinates.', {}),
-  def('desktop_action', 'Control Windows mouse and keyboard. Always inspect a recent screenshot first and verify the result.', { action: { type:'string', enum:['click','double_click','type','key','scroll'] }, x:{type:'integer'}, y:{type:'integer'}, text:str('Literal text or key chord: ENTER, TAB, ESC, CTRL+A, CTRL+C, CTRL+V, ALT+TAB'), amount:{type:'integer'} }, ['action']),
+  def('desktop_windows', 'List connected monitors and visible Windows desktop windows (hwnd, title, processName, bounds, active) before inspecting or capturing a specific window privately.', {}),
+  def('desktop_ui_tree', 'Inspect the Windows UI Automation accessibility tree of a specific window (or foreground window) to discover real buttons, inputs, tabs, text values, and exact clickable center (x, y) coordinates without capturing a screenshot.', { windowTitle: str('Optional window title or process name substring'), hwnd: { type: 'integer', description: 'Optional native window handle (hwnd) from desktop_windows' }, query: str('Optional filter matching element name, automationId, type, or value'), interactiveOnly: { type: 'boolean', description: 'Return interactive/labeled controls only (default true)' }, maxDepth: { type: 'integer', minimum: 1, maximum: 24 }, maxElements: { type: 'integer', minimum: 10, maximum: 300 } }),
+  def('desktop_screenshot', 'Capture a specific window (recommended for privacy so unrelated apps are excluded), a specific monitor, a region, or the primary screen. Returns origin and scaleFactor for accurate click coordinates.', { windowTitle: str('Capture ONLY the window matching this title or process name (privacy-safe)'), hwnd: { type: 'integer', description: 'Capture ONLY this native window handle from desktop_windows' }, monitor: { type: ['integer', 'string'], description: 'Monitor index (0, 1, ...) or "all" for full virtual desktop' }, region: { type: 'object', properties: { x: { type: 'integer' }, y: { type: 'integer' }, width: { type: 'integer', minimum: 16 }, height: { type: 'integer', minimum: 16 } }, required: ['x', 'y', 'width', 'height'], additionalProperties: false } }),
+  def('desktop_action', 'Control Windows mouse, keyboard, and window focus. Prefer desktop_ui_tree or window-scoped desktop_screenshot first to get accurate coordinates.', { action: { type:'string', enum:['focus_window','click','double_click','right_click','move','drag','type','key','scroll'] }, windowTitle: str('Target window title/process for focus_window'), hwnd: { type: 'integer', description: 'Target window handle for focus_window' }, x:{type:'integer'}, y:{type:'integer'}, toX:{type:'integer', description:'Destination X for drag'}, toY:{type:'integer', description:'Destination Y for drag'}, text:str('Literal text or key chord: ENTER, TAB, ESC, CTRL+A, CTRL+C, CTRL+V, ALT+TAB'), amount:{type:'integer'} }, ['action']),
 ];
 
 const checkpointName = /^checkpoint-(\d+)\.json$/;
@@ -302,39 +318,55 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     return { updated: true, todos: task.todos };
   }
   if(name==='memory_store'){
-    store.state.memories ||= [];
-    const scope = args.scope || (task.workspace ? 'project' : 'global');
-    const workspaceKey = scope === 'project' ? (task.workspace || '') : '';
+    store.state.memories = normalizeMemories(store.state.memories || []);
+    const defaultScope = ['priority', 'preference', 'constraint', 'profile'].includes(args.category) ? 'global' : (task.workspace ? 'project' : 'global');
     if(args.action === 'list'){
-      return { memories: store.state.memories.filter(m => m.scope === 'global' || m.workspace === task.workspace) };
+      const items = searchMemories(store.state.memories, {
+        category: args.category || 'all',
+        priority: args.priority || 'all',
+        scope: args.scope || 'all',
+        workspace: task.workspace || '',
+      });
+      return { count: items.length, memories: items };
     }
-    if(args.action === 'remember'){
-      if(typeof args.key !== 'string' || !args.key.trim() || typeof args.value !== 'string' || !args.value.trim()){
-        throw new Error('Provide both key and value to remember.');
-      }
-      const existing = store.state.memories.find(m => m.key.toLowerCase() === args.key.trim().toLowerCase() && m.scope === scope && m.workspace === workspaceKey);
-      if(existing){
-        existing.value = args.value.trim().slice(0, 4000);
-        existing.updatedAt = new Date().toISOString();
-      } else {
-        store.state.memories.push({
-          id: crypto.randomUUID(),
-          key: args.key.trim().slice(0, 120),
-          value: args.value.trim().slice(0, 4000),
-          scope,
-          workspace: workspaceKey,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        });
-      }
+    if(args.action === 'search'){
+      const items = searchMemories(store.state.memories, {
+        query: args.query || args.key || '',
+        category: args.category || 'all',
+        priority: args.priority || 'all',
+        scope: args.scope || 'all',
+        workspace: task.workspace || '',
+      });
+      return { count: items.length, memories: items };
+    }
+    if(args.action === 'profile'){
+      const selected = selectMemoriesForContext(store.state.memories, { workspace: task.workspace || '' });
+      return {
+        count: selected.length,
+        formattedProfile: formatMemoriesForPrompt(selected) || '(No user memories stored yet.)',
+        memories: selected,
+      };
+    }
+    if(args.action === 'remember' || args.action === 'update'){
+      const res = upsertMemory(store.state.memories, {
+        id: args.id,
+        key: args.key,
+        value: args.value,
+        category: args.category,
+        priority: args.priority,
+        scope: args.scope,
+        tags: args.tags,
+        pinned: args.pinned,
+        source: 'agent',
+      }, { defaultScope, defaultWorkspace: task.workspace || '', defaultSource: 'agent' });
       runtime.changed(null);
-      return { saved: true, key: args.key.trim(), scope };
+      return { saved: true, updated: res.updated, memory: res.memory, key: res.memory.key, scope: res.memory.scope, category: res.memory.category, priority: res.memory.priority };
     }
     if(args.action === 'forget'){
-      const before = store.state.memories.length;
-      store.state.memories = store.state.memories.filter(m => !(m.key.toLowerCase() === String(args.key || '').trim().toLowerCase() && (m.scope === 'global' || m.workspace === task.workspace)));
+      const res = removeMemory(store.state.memories, { id: args.id, key: args.key, workspace: task.workspace || '' });
+      store.state.memories = res.memories;
       runtime.changed(null);
-      return { removed: before - store.state.memories.length };
+      return { removed: res.removed };
     }
     throw new Error('Unsupported memory_store action.');
   }
@@ -343,10 +375,24 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     if (proxyUrl && runtime.request === fetch) return proxiedFetch(url, opts, proxyUrl);
     return runtime.request(url, opts);
   };
-  if(name==='web_search')return searchWebDuckDuckGo(args.query, { maxResults: args.maxResults, request: toolFetch, signal });
-  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, request: toolFetch, signal });
+  const webUa = store.state.settings.webUserAgent || '';
+  if(name==='web_search')return searchWebDuckDuckGo(args.query, { maxResults: args.maxResults, userAgent: webUa, request: toolFetch, signal });
+  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, userAgent: webUa, request: toolFetch, signal });
   if(name==='http_request')return executeHttpRequest(args, { request: toolFetch, signal });
-  if(name==='browser_inspect')return inspectWebPage(args.url, { extractLinks: args.extractLinks !== false, extractForms: args.extractForms !== false, renderJs: Boolean(args.renderJs), browserInspect: runtime.browserInspect, request: toolFetch, signal });
+  if(name==='browser_inspect')return inspectWebPage(args.url, {
+    extractLinks: args.extractLinks !== false,
+    extractForms: args.extractForms !== false,
+    renderJs: Boolean(args.renderJs),
+    waitMs: args.waitMs,
+    waitForSelector: args.waitForSelector || '',
+    actions: args.actions || null,
+    useAccountSession: Boolean(args.useAccountSession),
+    captureScreenshot: Boolean(args.captureScreenshot),
+    userAgent: webUa,
+    browserInspect: runtime.browserInspect,
+    request: toolFetch,
+    signal,
+  });
   if(name==='manage_automation'){
     if(!runtime.automations)throw new Error('Automations scheduler is not attached to this runtime.');
     if(args.action==='list')return { automations: runtime.automations.list() };

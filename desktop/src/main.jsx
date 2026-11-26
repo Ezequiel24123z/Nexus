@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   Plus, Search, Settings2, Folder, FolderOpen, MessageSquare, BookOpen, ListTodo,
   Network, Plug, Swords, PanelLeft, Sun, Moon, Pin, Trash2, GitFork, RefreshCw, X,
-  ChevronRight, Globe, Clock, Sparkles
+  ChevronRight, Globe, Clock, Sparkles, Brain
 } from 'lucide-react';
 import { installNexusBridge } from './bridge.mjs';
 import './styles/tokens.css';
@@ -14,6 +14,7 @@ import ChatView from './components/ChatView.jsx';
 import ArenaView from './components/ArenaView.jsx';
 import StudioView from './components/StudioView.jsx';
 import LibraryView from './components/LibraryView.jsx';
+import MemoryView from './components/MemoryView.jsx';
 import GalleryView from './components/GalleryView.jsx';
 import ConnectorsView from './components/ConnectorsView.jsx';
 import McpView from './components/McpView.jsx';
@@ -204,6 +205,7 @@ function App() {
   const isDark = appearance.resolvedTheme !== 'light';
 
   const navItems = [
+    ['memory', Brain, 'Memory & Profile'],
     ['browser', Globe, 'Private Browser'],
     ['gallery', Sparkles, 'Skills & Plugins'],
     ['arena', Swords, 'Model Arena'],
@@ -217,6 +219,7 @@ function App() {
 
   const viewTitle = {
     chat: task?.title || currentProject?.name || 'New Chat',
+    memory: 'User Memory & Profile',
     browser: 'Private Browser',
     gallery: 'Skills & Plugins Gallery',
     arena: 'Model Arena',
@@ -258,6 +261,7 @@ function App() {
             <button key={id} type="button" className={`nav-btn ${view === id ? 'active' : ''}`} onClick={() => setView(id)}>
               <Icon size={15} />
               <span>{label}</span>
+              {id === 'memory' && (state.memoryCount || 0) > 0 && <span className="nav-badge tabular">{state.memoryCount}</span>}
               {id === 'queue' && activeCount > 0 && <span className="nav-badge tabular">{activeCount}</span>}
               {id === 'automations' && enabledAutomations > 0 && <span className="nav-badge tabular">{enabledAutomations}</span>}
             </button>
@@ -427,6 +431,7 @@ function App() {
             }}
           />
         )}
+        {view === 'memory' && <MemoryView state={state} workspace={activeWorkspace} act={act} notify={notify} />}
         {view === 'gallery' && <GalleryView act={act} notify={notify} navigate={setView} />}
         {view === 'arena' && <ArenaView state={state} models={models} workspace={activeWorkspace} setWorkspace={setWorkspace} projectId={projectId} openTask={openTask} act={act} notify={notify} />}
         {view === 'files' && <StudioView workspace={activeWorkspace} setWorkspace={setWorkspace} act={act} notify={notify} onOpenInChat={path => { setWorkspace(path); newChat(); }} />}

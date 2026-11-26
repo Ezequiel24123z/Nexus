@@ -1,6 +1,6 @@
 # NEXUS — Standalone Native Agentic Coding, Private Browser & Personal Operator Workstation
 
-**NEXUS (`v1.1.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
+**NEXUS (`v1.2.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
 
 Designed for maximum personal autonomy and hackability, NEXUS imposes **zero client-side content filters or artificial generation caps**—delegating content policy solely to the model provider you choose while granting full, auditable power over your local Windows environment, codebase, Win32 ConPTY terminal, Git repositories, integrated browser, REST APIs, dynamic JS plugins, and Model Context Protocol (MCP) servers.
 
@@ -8,11 +8,12 @@ Designed for maximum personal autonomy and hackability, NEXUS imposes **zero cli
 
 ---
 
-## Key Capabilities (`v1.1.0`)
+## Key Capabilities (`v1.2.0`)
 
 ### 1. Native Windows Architecture (Zero Electron)
 - **Standalone Native Host (`desktop/native-host/`)**: C# / .NET 10 WinForms + official Windows `Microsoft.Web.WebView2` runtime (no Electron, no bundled Chromium). Includes native Win11 dark titlebar (`DWMWA`), System Tray, global summon hotkey (`Ctrl+Shift+Space`), single-instance lock, crash watchdogs (`host.log` / `core.log`), WebView2 auto-recovery, and Core daemon auto-restart.
-- **Native Win32 ConPTY Terminal & Desktop Automation**: Pure Win32 `CreatePseudoConsole` (`ConPtyHost.cs`, zero `node-pty`) for real interactive PowerShell/CMD/TUI sessions with Tab completion, arrow keys, Ctrl+C, and resize, plus fast native C# Win32 screenshot & input automation (`NativeDesktop.cs`).
+- **Native Win32 ConPTY Terminal, UI Automation & Window-Scoped Desktop Control**: Pure Win32 `CreatePseudoConsole` (`ConPtyHost.cs`, zero `node-pty`), **Windows UI Automation accessibility tree inspection (`desktop_ui_tree`)** returning real buttons/inputs/tabs and exact click centers with zero screenshots, **window-only privacy-safe screenshots (`PrintWindow`)**, **multi-monitor support (`desktop_windows`)**, and native Win32 input (`NativeDesktop.cs` with `focus_window`, `click`, `drag`, `type`, `key`, `scroll`).
+- **Headless Native WebView2 JS Rendering & DOM Automation (`NativeBrowser.cs`)**: `browser_inspect` executes real JavaScript inside Edge WebView2 (`renderJs: true`), waits for selectors (`waitForSelector`), runs scripted DOM actions (`click`, `type`, `select`, `scroll`, `wait`, `eval`), optionally reuses Account Mode cookies, captures rendered page screenshots, and uses standard Edge/Chrome browser headers across web tools (configurable via `webUserAgent`).
 - **Decoupled Core Engine (`desktop/core/server.mjs`)**: Zero-dependency Node 24 HTTP + SSE daemon with loopback-only CORS, constant-time token auth, live-reloading `nexus.config.json`, Windows DPAPI secret vault (stdin-piped, rotating backups), and standalone Web (`npm run start:web`) or Headless API (`npm run start:headless`) modes.
 
 ### 2. Multi-Provider Model Engine (10 Built-In + Unlimited Custom Profiles)
@@ -32,23 +33,27 @@ Switch globally or per chat across **10 built-in providers** plus **unlimited us
 - **Unrestricted** — Zero local path confinement and zero approval prompts across the host machine.
 - **10 Built-in Slash Commands** (`/compact`, `/init`, `/review`, `/architect`, `/diagnostics`, `/explain`, `/fix`, `/test`, `/mcp-create`, `/self-improve`) plus custom user-defined slash commands in `nexus.config.json`.
 
-### 4. 61 Built-In Agentic Tools & Smart Lazy Toolsets
-- **Smart Lazy Toolsets (`load_toolset`)**: Optionally start with **18 core tools** and activate **10 on-demand groups** (`git`, `shell_processes`, `web_browser`, `sessions`, `capabilities_mcp`, `connectors`, `memory_history`, `desktop`, `automations_evolve`, `plugins`), reducing Step-1 input tokens by ~65%.
+### 4. 63 Built-In Agentic Tools & Smart Lazy Toolsets
+- **Smart Lazy Toolsets (`load_toolset`)**: Optionally start with **19 core tools** (including `memory_store`) and activate **10 on-demand groups** (`git`, `shell_processes`, `web_browser`, `sessions`, `capabilities_mcp`, `connectors`, `memory_history`, `desktop`, `automations_evolve`, `plugins`), reducing Step-1 input tokens by ~65%.
 - **Surgical Code Editing & Navigation**: `read_file` (line-range slicing up to 10 MB), `batch_read_files`, `dir_tree`, `write_file`, `replace_text`, `multi_edit`, `apply_patch` (`SEARCH/REPLACE` and unified `@@` diffs), `delete_file` / `move_file` (with automatic backups & 1-click rollback), `run_diagnostics`, `glob_files`, `grep_search`, and `code_outline`.
 - **Git, Worktrees, Stateful Shell & Processes**: `git_operation` (`status`, `diff`, `log`, `branch`, `checkout`, `checkout_new`, `discard`, `stash`, `pull`, `push`, `stage`, `unstage`, `commit`, `worktree_list`, `worktree_add`, `worktree_remove`), `shell_session`, `run_command`, `manage_process`, and `system_info`.
-- **Web, HTTP, OpenAPI & Desktop Control**: `web_search` (built-in DuckDuckGo/Bing fallback, zero API keys), `web_fetch`, `http_request`, `browser_inspect`, OpenAPI 3.0/3.1 importer, idempotent REST connectors, and `desktop_screenshot` / `desktop_action`.
+- **Web, JS Browser, OpenAPI & Privacy-Safe Desktop Control**: `web_search` (built-in DuckDuckGo/Bing fallback), `web_fetch` (standard browser headers), `http_request`, `browser_inspect` (real Edge WebView2 JS rendering + DOM actions + screenshot), OpenAPI 3.0/3.1 importer, idempotent REST connectors, `desktop_windows`, `desktop_ui_tree` (Windows UI Automation), window/monitor-scoped `desktop_screenshot`, and `desktop_action`.
 
-### 5. Integrated Account / InPrivate Browser & App-Scoped Tor/Proxy
+### 5. Structured User Memory, Priorities & Working Style (`MemoryView` + `memory_store`)
+- **Dedicated Memory & Profile Studio**: Organize durable memories across 6 categories (**Priorities**, **Preferences**, **Constraints**, **Workflows**, **User Profile**, **Facts**) with **Critical / High / Normal / Low** priorities, pinning, tags, Global vs. Project scopes, live **Prompt Preview**, and Markdown/JSON export & import.
+- **Priority-Ranked Context Injection**: Constraints, pinned items, active priorities, and working-style preferences are automatically grouped and injected into every matching session, while agents proactively learn and respect your style via `memory_store` (`list`, `search`, `remember`, `update`, `forget`, `profile`).
+
+### 6. Integrated Account / InPrivate Browser & App-Scoped Tor/Proxy
 - **Side-Panel & Full-View Browser (`BrowserSidePanel` / `PrivateBrowserView`)**: Embedded WebView2 browser alongside chat or in full view.
 - **Account Mode vs. InPrivate Mode**: Keep logins/cookies isolated inside NEXUS in Account mode, or switch to ephemeral zero-trace InPrivate sessions with 1-click **Wipe**.
 - **App-Scoped Privacy Networking**: NEXUS-managed portable Tor (`127.0.0.1:9055`, never touches Windows system proxy), SOCKS5/HTTP proxy support, system VPN detection, tracker domain blocking, anti-fingerprinting, **Send to AI**, and **Screenshot to Chat**.
 
-### 6. Rooted Projects, Nested Sessions, Skills Gallery & Local Automations
+### 7. Rooted Projects, Nested Sessions, Skills Gallery & Local Automations
 - **Rooted Projects & Concurrent Nested Sessions**: Bind projects to root folders to auto-discover `NEXUS.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.nexus/.github/.claude/skills/*/SKILL.md`. Agents can orchestrate concurrent nested child sessions (`spawn_session`, `list_sessions`, `send_session_message`, `read_session`) with automatic parent handoff.
 - **Skills & Plugins Gallery (`GalleryView`)**: 12 curated skills, 4 zero-dependency hot-loaded native JS plugins (`SQLite Explorer`, `Network Diagnostics`, `Dev Crypto & JWT`, `Archive Pack`), 9 1-click Cloud MCP plugins (with live connect & tool test), live GitHub `SKILL.md` search/import, and live self-evolution (`create_dynamic_tool`, `scaffold_mcp_server`, `self_improve`).
 - **Local Automations & Multi-Model Arena**: Schedule recurring autonomous missions (interval, daily, weekly, 5-field cron, one-shot) via `AutomationsView` or `manage_automation`, and benchmark 2–4 models side-by-side in **Model Arena**.
 
-### 7. Zero-Flicker Studio UI & 2-Stage Lossless Compaction
+### 8. Zero-Flicker Studio UI & 2-Stage Lossless Compaction
 - **Studio Themes & Live Hackability**: Obsidian Dark, Studio Paper Light, and Midnight Slate themes, accent color picker, Live Custom CSS editor, block-memoized streaming Markdown with **Mermaid** (`securityLevel: 'strict'`) and **KaTeX**, inline unified diffs with 1-click **Revert**, `@`-file and `/`-slash autocomplete, 40-turn progressive DOM windowing, and raw `nexus.config.json` editor.
 - **2-Stage Lossless Compaction**: Stage 1 `$0` Micro-Compaction prunes old oversized tool outputs into lossless artifact references before Stage 2 structured checkpoint compaction. Originals and pinned messages are always preserved; hidden reasoning is never resent across turns.
 
@@ -91,9 +96,9 @@ npm run dist:portable
 
 | Document | Contents |
 | --- | --- |
-| [Changelog](CHANGELOG.md) | Release history across `v1.1.0`, `v0.4.0`, and `v0.3.0` |
+| [Changelog](CHANGELOG.md) | Release history across `v1.2.0`, `v1.1.0`, `v0.4.0`, and `v0.3.0` |
 | [Architecture](docs/ARQUITECTURA.md) | Module map, runtime data flow, security boundaries, and durability invariants |
-| [Status & Roadmap](docs/ESTADO-Y-ROADMAP.md) | Implemented `v1.1.0` capabilities and audit hardening status |
+| [Status & Roadmap](docs/ESTADO-Y-ROADMAP.md) | Implemented `v1.2.0` capabilities and roadmap |
 | [Validation](docs/VALIDACION.md) | Automated Node test suite, Vite build, native host build, and visual/E2E checks |
 | [Desktop Manual](desktop/README.md) | Launch modes, providers, tools, browser, and live configuration guide |
 | [VM & Copilot Setup](docs/VM-Y-COPILOT.md) | Clean development setup on Windows with Node 24, .NET 10, and Copilot |

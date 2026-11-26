@@ -23,12 +23,12 @@ To open the app with an isolated profile during development, set `NEXUS_TEST_DAT
 
 ## Code Map (relative to `desktop/`)
 
-- Standalone Native Windows Host (Zero Electron): `native-host/NEXUS.csproj`, `native-host/Program.cs`, `native-host/ConPtyHost.cs`, `native-host/NativeDesktop.cs`.
+- Standalone Native Windows Host (Zero Electron): `native-host/NEXUS.csproj`, `native-host/Program.cs`, `native-host/ConPtyHost.cs`, `native-host/NativeDesktop.cs`, `native-host/NativeBrowser.cs`.
 - Decoupled Local HTTP/SSE Core Server, DPAPI Vault, Live Config & Fallback Shell: `core/server.mjs`, `core/vault.mjs`, `core/config-file.mjs`, `core/pty-shell.mjs`.
-- Agent loop, 4-tier autonomy, subagents, concurrent nested sessions, parallel read-only tools, queue, 2-stage compaction: `core/runtime.mjs`.
-- Agentic coding engine, Git & worktrees, stateful shell, processes, MCP scaffolding, outline, web search/fetch, self-improvement: `core/coding-engine.mjs`.
+- Agent loop, structured User Memory profile, 4-tier autonomy, subagents, concurrent nested sessions, parallel read-only tools, queue, 2-stage compaction: `core/runtime.mjs`, `core/memory.mjs`.
+- Agentic coding engine, Git & worktrees, stateful shell, processes, MCP scaffolding, outline, realistic-header web search/fetch/browser inspect, self-improvement: `core/coding-engine.mjs`.
 - Providers (native Anthropic `/v1/messages`, Copilot OAuth exchange, OpenRouter, Arli.ai, OpenAI, DeepSeek, Gemini, xAI, Groq, unlimited Custom Profiles), lazy toolsets, payloads, errors, SSE stream parser: `core/providers.mjs`, `model-request.mjs`, `provider-errors.mjs`, `stream.mjs`.
-- Tools (61 built-in), Plugins, Gallery, Automations, Privacy/Tor, MCP, OpenAPI, Capabilities: `core/tools.mjs`, `plugins.mjs`, `gallery.mjs`, `automations.mjs`, `privacy-proxy.mjs`, `tor-manager.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs`.
+- Tools (63 built-in), Plugins, Gallery, Automations, Privacy/Tor, MCP, OpenAPI, Capabilities, Windows UI Automation: `core/tools.mjs`, `plugins.mjs`, `gallery.mjs`, `automations.mjs`, `privacy-proxy.mjs`, `tor-manager.mjs`, `mcp.mjs`, `openapi.mjs`, `capabilities.mjs`, `native/ui-tree.ps1`.
 - Persistence & recovery: `core/store.mjs`, `sqlite-workspace.mjs`, `storage-*`, `response-journal.mjs`.
 - Packaging & CLI utilities: `tools/build-portable.mjs` (`release/NEXUS-Portable-Windows.zip`), `tools/launch.mjs`, `tools/vault-inspect.cjs`, `Launch NEXUS.cmd`.
 - Modular React 19 UI (100% English, Obsidian Dark / Studio Paper Light / Midnight Slate + Live Custom CSS): `src/main.jsx`, `src/bridge.mjs`, `src/styles/*.css`, `src/components/*.jsx`, `src/lib/*.mjs`; Node tests: `tests/*.test.mjs`.

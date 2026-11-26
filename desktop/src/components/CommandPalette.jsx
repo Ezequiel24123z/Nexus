@@ -27,6 +27,7 @@ export default function CommandPalette({ state, navigate, openTask, newChat, app
     const items = [
       { id: 'new', title: 'New Chat', detail: 'Start a new autonomous agent session', run: newChat },
       { id: 'nav-chat', title: 'Chat Workspace', detail: 'View · Agent chat', run: () => navigate('chat') },
+      { id: 'nav-memory', title: 'User Memory & Profile', detail: 'Priorities, preferences, working style, constraints & facts', run: () => navigate('memory') },
       { id: 'nav-browser', title: 'Private Browser (VPN / Tor / Proxy)', detail: 'View · Isolated InPrivate WebView2 + tracker shield', run: () => navigate('browser') },
       { id: 'nav-arena', title: 'Model Arena', detail: 'Compare 2–4 models side-by-side', run: () => navigate('arena') },
       { id: 'nav-studio', title: 'Files & Git Studio', detail: 'Editor, Git diff, Interactive Terminal, Processes, Worktrees', run: () => navigate('files') },

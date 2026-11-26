@@ -1058,4 +1058,170 @@ test('Audit hardening: server version sync, loopback-only CORS, malformed URL ha
   assert.equal(reloadedAgain.get('TEST_ROTATE_KEY'), null);
 });
 
+test('v1.2.0 User Memory & Preference Profile: categories, priorities, pinning, search, context injection, and export/import', async t => {
+  const { store, runtime, workspace } = await setup(t);
+  const signal = new AbortController().signal;
+  const taskId = runtime.create({ prompt: 'Build a module', workspace });
+  const task = store.task(taskId);
+
+  // memory_store is always available in CORE_TOOL_NAMES even when lazyToolLoading is enabled
+  const lazyTools = requestTools({ ...store.state.settings, lazyToolLoading: true });
+  assert.ok(lazyTools.some(tool => tool.function?.name === 'memory_store'));
+
+  // Store structured user priorities, preferences, constraints, and project facts
+  await executeTool(runtime, task, 'memory_store', {
+    action: 'remember',
+    key: 'Primary Goal',
+    value: 'Focus on security and native Windows reliability first.',
+    category: 'priority',
+    priority: 'critical',
+    pinned: true,
+    tags: ['roadmap', 'security'],
+  }, signal);
+  await executeTool(runtime, task, 'memory_store', {
+    action: 'remember',
+    key: 'Coding Style',
+    value: 'Prefer concise ESM modules without unnecessary abstractions.',
+    category: 'preference',
+    priority: 'high',
+    tags: ['style'],
+  }, signal);
+  await executeTool(runtime, task, 'memory_store', {
+    action: 'remember',
+    key: 'Never Push Main Directly',
+    value: 'Always open a pull request instead of pushing straight to main.',
+    category: 'constraint',
+    priority: 'critical',
+  }, signal);
+  await executeTool(runtime, task, 'memory_store', {
+    action: 'remember',
+    key: 'Project Port',
+    value: 'Dev server runs on port 5173.',
+    category: 'fact',
+    priority: 'normal',
+    scope: 'project',
+  }, signal);
+
+  // Search filters by query & category
+  const prefMatches = await executeTool(runtime, task, 'memory_store', { action: 'search', query: 'ESM', category: 'preference' }, signal);
+  assert.equal(prefMatches.count, 1);
+  assert.equal(prefMatches.memories[0].key, 'Coding Style');
+  assert.equal(prefMatches.memories[0].scope, 'global'); // user preferences default to global
+
+  // Profile summary groups constraints -> priorities -> preferences -> facts
+  const profile = await executeTool(runtime, task, 'memory_store', { action: 'profile' }, signal);
+  assert.equal(profile.count, 4);
+  assert.match(profile.formattedProfile, /### Hard Constraints & Boundaries/);
+  assert.match(profile.formattedProfile, /### Active User Priorities & Goals/);
+  assert.match(profile.formattedProfile, /### User Preferences & Working Style/);
+  assert.ok(profile.formattedProfile.indexOf('Never Push Main Directly') < profile.formattedProfile.indexOf('Coding Style'));
+
+  // Injected into runtime.buildContext()
+  const sysContext = JSON.stringify(runtime.buildContext(task, { hydrate: false }));
+  assert.match(sysContext, /Focus on security and native Windows reliability/);
+  assert.match(sysContext, /Never Push Main Directly/);
+
+  // Server RPCs: memoriesPreview, memoriesExport, memoriesImport
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nexus-mem-srv-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const srv = await createNexusServer({ dataDir: dir, port: 0 });
+  t.after(() => srv.close());
+  await srv.invoke('memorySave', { key: 'Tone', value: 'Direct and concise Spanish replies.', category: 'preference', priority: 'high', pinned: true, tags: ['language'] });
+  const preview = await srv.invoke('memoriesPreview', { workspace: '' });
+  assert.equal(preview.count, 1);
+  assert.match(preview.markdown, /\[PINNED · HIGH\] \*\*Tone\*\*/);
+  const exported = await srv.invoke('memoriesExport');
+  assert.match(exported.markdown, /NEXUS User Memory & Preference Profile/);
+  const imported = await srv.invoke('memoriesImport', {
+    json: JSON.stringify([{ key: 'Editor', value: 'Uses VS Code and PowerShell', category: 'profile', priority: 'normal' }]),
+  });
+  assert.equal(imported.imported, 1);
+  assert.equal(imported.total, 2);
+});
+
+test('v1.2.0 Native WebView2 browser_inspect, realistic browser HTTP headers, and desktop UI Automation/window capture tools', async t => {
+  const { store, runtime, workspace } = await setup(t);
+  const signal = new AbortController().signal;
+  const taskId = runtime.create({ prompt: 'Inspect web and desktop', workspace, agentMode: 'semi-autopilot' });
+  const task = store.task(taskId);
+
+  // 1. Realistic browser headers on web_fetch & static browser_inspect (no NEXUS-Agent leak) + custom UA override
+  const seenHeaders = [];
+  runtime.request = async (url, opts) => {
+    seenHeaders.push(opts.headers);
+    return new Response('<html><head><title>Dynamic Test</title></head><body><h1>Quotes</h1></body></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    });
+  };
+  await executeTool(runtime, task, 'web_fetch', { url: 'https://example.test/page' }, signal);
+  assert.match(seenHeaders[0]['User-Agent'], /Mozilla\/5\.0.*Chrome\/134/);
+  assert.ok(!seenHeaders[0]['User-Agent'].includes('NEXUS-Agent'));
+  assert.ok(seenHeaders[0]['Sec-CH-UA']);
+
+  runtime.settings({ webUserAgent: 'CustomBrowserUA/9.0' });
+  const staticInspect = await executeTool(runtime, task, 'browser_inspect', { url: 'https://example.test/static', renderJs: true }, signal);
+  assert.equal(seenHeaders[1]['User-Agent'], 'CustomBrowserUA/9.0');
+  assert.equal(staticInspect.renderedJs, false);
+  assert.equal(staticInspect.engine, 'http-fetch');
+  assert.match(staticInspect.renderJsNote, /JavaScript did not execute/);
+
+  // 2. When native browserInspect callback is wired, renderJs & actions execute and preserve both text AND screenshot attachment
+  let capturedOpts = null;
+  runtime.browserInspect = async (url, opts) => {
+    capturedOpts = { url, ...opts };
+    return {
+      url,
+      title: 'JS Quotes Rendered',
+      renderedJs: true,
+      engine: 'webview2',
+      text: 'The world as we have created it is a process of our thinking.',
+      interactiveElements: [{ tag: 'a', text: 'Next', selector: 'li.next > a' }],
+      actionsLog: [{ type: 'click', selector: 'li.next > a', result: { ok: true } }],
+      image: 'data:image/png;base64,' + Buffer.from('fake-png-bytes').toString('base64'),
+      dimensions: { physicalWidth: 1280, physicalHeight: 900, image: { width: 1280, height: 900 }, scaleFactor: 1 },
+    };
+  };
+
+  // Semi-Autopilot gates interactive actions/account session, while passive browser_inspect stays auto-allowed
+  assert.equal(runtime.approvalCheck('browser_inspect', task, { url: 'https://quotes.toscrape.com/js', renderJs: true }).required, false);
+  assert.equal(runtime.approvalCheck('browser_inspect', task, { url: 'https://quotes.toscrape.com/js', actions: [{ type: 'click', selector: 'li.next > a' }] }).required, true);
+  assert.equal(runtime.approvalCheck('browser_inspect', task, { url: 'https://mail.example', useAccountSession: true }).required, true);
+
+  const singleRes = await runtime.executeSingleToolCall(
+    task,
+    { id: 'bi-1', function: { name: 'browser_inspect', arguments: JSON.stringify({ url: 'https://quotes.toscrape.com/js', renderJs: true, waitForSelector: '.quote', captureScreenshot: true }) } },
+    signal,
+    { id: 'run-1', status: 'running' }
+  );
+  assert.equal(capturedOpts.waitForSelector, '.quote');
+  assert.equal(capturedOpts.captureScreenshot, true);
+  const parsedToolPayload = JSON.parse(singleRes.serialized);
+  assert.equal(parsedToolPayload.renderedJs, true);
+  assert.equal(parsedToolPayload.capturedScreenshot, true);
+  assert.match(parsedToolPayload.text, /process of our thinking/);
+  assert.equal(task.pendingImages.length, 1);
+
+  // 3. Desktop windows enumeration, UI Automation tree, window-scoped screenshot, and focus_window/drag actions
+  const desktopCalls = [];
+  runtime.desktop = async (name, args) => {
+    desktopCalls.push({ name, args });
+    if (name === 'desktop_windows') return { monitors: [{ index: 0, primary: true }], windows: [{ hwnd: 42, title: 'Notepad', processName: 'notepad' }] };
+    if (name === 'desktop_ui_tree') return { window: { hwnd: 42, title: 'Notepad' }, count: 1, elements: [{ name: 'Save', controlType: 'Button', center: { x: 100, y: 50 } }] };
+    if (name === 'desktop_screenshot') return { image: 'data:image/jpeg;base64,' + Buffer.from('jpg').toString('base64'), dimensions: { scope: 'window', windowTitle: args.windowTitle } };
+    return { ok: true };
+  };
+  assert.equal(runtime.approvalCheck('desktop_windows', task, {}).required, false);
+  assert.equal(runtime.approvalCheck('desktop_ui_tree', task, { windowTitle: 'Notepad' }).required, false);
+  const winList = await executeTool(runtime, task, 'desktop_windows', {}, signal);
+  assert.equal(winList.windows[0].title, 'Notepad');
+  const uiTree = await executeTool(runtime, task, 'desktop_ui_tree', { windowTitle: 'Notepad' }, signal);
+  assert.equal(uiTree.elements[0].center.x, 100);
+  const winShot = await executeTool(runtime, task, 'desktop_screenshot', { windowTitle: 'Notepad' }, signal);
+  assert.equal(winShot.dimensions.scope, 'window');
+  await executeTool(runtime, task, 'desktop_action', { action: 'focus_window', windowTitle: 'Notepad' }, signal);
+  await executeTool(runtime, task, 'desktop_action', { action: 'drag', x: 10, y: 10, toX: 80, toY: 80 }, signal);
+  assert.equal(desktopCalls.length, 5);
+});
+
 

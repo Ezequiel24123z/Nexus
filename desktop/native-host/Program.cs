@@ -43,13 +43,21 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Length >= 1 && args[0] == "--list-windows")
+        {
+            return NativeDesktop.RunListWindows();
+        }
         if (args.Length >= 2 && args[0] == "--screenshot")
         {
-            return NativeDesktop.RunScreenshot(args[1]);
+            return NativeDesktop.RunScreenshot(args[1], args.Length >= 3 ? args[2] : null);
         }
         if (args.Length >= 2 && args[0] == "--desktop-action")
         {
             return NativeDesktop.RunDesktopAction(args[1]);
+        }
+        if (args.Length >= 2 && args[0] == "--browser-inspect")
+        {
+            return NativeBrowser.RunBrowserInspect(args[1]);
         }
 
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -81,7 +89,7 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
-            HostLog.Write("host", "Launching NEXUS native host v1.1.0");
+            HostLog.Write("host", "Launching NEXUS native host v1.2.0");
             using var server = CoreProcess.Start(args);
             using var form = new NexusWindow(server, args);
             Application.Run(form);
