@@ -235,7 +235,8 @@ export class PluginManager {
     if (!/^[a-z][a-z0-9_]{1,48}$/.test(name || '')) {
       throw new Error('Tool name must be lowercase snake_case (2–49 chars, e.g. parse_csv_stats).');
     }
-    const dir = path.join(this.directory, pluginId);
+    const safePluginId = String(pluginId || 'nexus-self-tools').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'nexus-self-tools';
+    const dir = path.join(this.directory, safePluginId);
     await fsp.mkdir(dir, { recursive: true });
     const registryFile = path.join(dir, 'registry.json');
     let registry = [];
@@ -255,7 +256,7 @@ export class PluginManager {
     const toolsCode = `// Auto-generated NEXUS Self-Evolved Tools\nexport const tools = [\n${registry.map(t => `  {\n    name: ${JSON.stringify(t.name)},\n    description: ${JSON.stringify(t.description)},\n    readOnly: ${Boolean(t.readOnly)},\n    parameters: ${JSON.stringify(t.parameters)},\n    async handler(args, helpers, context) {\n      const { fs, fsSync, path, os, net, dns, crypto, execFileAsync, require, fetch, workspace } = helpers;\n      ${t.handlerCode}\n    }\n  }`).join(',\n')}\n];\n`;
 
     return this.installPlugin({
-      id: pluginId,
+      id: safePluginId,
       name: 'Self-Evolved Dynamic Tools',
       description: 'Live JavaScript tools authored autonomously by NEXUS or the user.',
       category: 'self-evolved',

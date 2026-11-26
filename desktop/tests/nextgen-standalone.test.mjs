@@ -11,7 +11,8 @@ import { executeTool } from '../core/tools.mjs';
 import { ConfigFileManager } from '../core/config-file.mjs';
 import { createNexusServer } from '../core/server.mjs';
 import { materializeToolResult, readArtifact } from '../core/artifacts.mjs';
-import { AutomationsManager, matchesCron, isAutomationDue } from '../core/automations.mjs';
+import { AutomationsManager, matchesCron, isAutomationDue, validateAutomation } from '../core/automations.mjs';
+import { SecretVault } from '../core/vault.mjs';
 import { InteractiveTerminalManager } from '../core/pty-shell.mjs';
 import { resolveEffectiveProxyUrl, proxiedFetch } from '../core/privacy-proxy.mjs';
 import { TorManager } from '../core/tor-manager.mjs';
@@ -958,4 +959,103 @@ test('Wave 7: TorManager + app-scoped SOCKS5 proxy tunnel, silentToolSteps, git_
   assert.equal(sRes.matches.length, 1);
   assert.equal(sRes.matches[0].path, 'needle.txt');
 });
+
+test('Audit hardening: automations preserve midnight/Sunday zero values, Semi-Autopilot path risk, empty tool arguments, and pluginId sanitization', async t => {
+  // 1. Midnight (hour: 0) and Sunday (weekday: 0) are preserved rather than coerced to defaults
+  const dailyMidnight = validateAutomation({ name: 'Midnight Job', prompt: 'Check logs', scheduleType: 'daily', hour: 0, minute: 0 });
+  assert.equal(dailyMidnight.hour, 0);
+  assert.equal(dailyMidnight.minute, 0);
+  const weeklySunday = validateAutomation({ name: 'Sunday Job', prompt: 'Weekly digest', scheduleType: 'weekly', weekday: 0, hour: 0, minute: 15 });
+  assert.equal(weeklySunday.weekday, 0);
+  assert.equal(weeklySunday.hour, 0);
+  assert.equal(weeklySunday.minute, 15);
+
+  // 2. Semi-Autopilot path containment catches nested traversal & forward-slash drive escapes while allowing in-workspace absolute paths
+  const ws = path.resolve(os.tmpdir(), 'nexus-ws-check');
+  assert.equal(assessActionRisk('write_file', { path: 'sub/../../outside.txt' }, { workspace: ws }).risky, true);
+  assert.equal(assessActionRisk('write_file', { path: path.join(ws, 'nested', 'ok.js') }, { workspace: ws }).risky, false);
+  assert.equal(assessActionRisk('write_file', { path: path.resolve(ws, '..', 'other', 'bad.js') }, { workspace: ws }).risky, true);
+
+  // 3. Parameterless tool calls emitting empty arguments string ("") succeed without JSON.parse error
+  let step = 0;
+  const { store, runtime, workspace, dir } = await setup(t, async () => {
+    if (step++ === 0) {
+      return Response.json({
+        choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'empty_args_1', type: 'function', function: { name: 'todo_read', arguments: '' } }] } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      });
+    }
+    return Response.json({
+      choices: [{ message: { role: 'assistant', content: 'Handled empty arguments cleanly.' } }],
+      usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 18 },
+    });
+  });
+  const taskId = runtime.create({ prompt: 'Read todos', workspace });
+  const task = store.task(taskId);
+  await runtime.run(task, new AbortController().signal);
+  assert.equal(task.status, 'complete');
+  assert.equal(task.events.some(e => e.kind === 'tool_error'), false);
+
+  // 4. PluginManager sanitizes traversal pluginId so files never escape plugins/
+  const created = await runtime.plugins.createSingleTool({
+    name: 'safe_audit_tool',
+    description: 'Audit sanitization test',
+    readOnly: true,
+    pluginId: '../../escape-attempt',
+    handlerCode: 'return { ok: true };',
+  });
+  assert.ok(created && !created.id.includes('..') && !created.id.includes('/') && !created.id.includes('\\'));
+  assert.equal((await fs.readdir(dir)).includes('escape-attempt'), false);
+});
+
+test('Audit hardening: server version sync, loopback-only CORS, malformed URL handling, workspace delete guard, and DPAPI vault rotation', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nexus-audit-srv-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const dataDir = path.join(dir, 'data');
+  const wsDir = path.join(dir, 'ws');
+  const uiDir = path.join(dir, 'ui');
+  await fs.mkdir(wsDir, { recursive: true });
+  await fs.mkdir(uiDir, { recursive: true });
+  await fs.writeFile(path.join(uiDir, 'index.html'), '<html>ok</html>', 'utf8');
+  await fs.writeFile(path.join(wsDir, 'keep.txt'), 'safe', 'utf8');
+
+  // 1. Server health version matches package.json & hostInfo, CORS rejects untrusted origins, malformed URL returns 400
+  const srv = await createNexusServer({ dataDir, uiDir, port: 0 });
+  t.after(() => srv.close());
+  const pkg = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
+
+  const healthRes = await fetch(`${srv.url}/api/health`, { headers: { Origin: 'https://evil.example' } });
+  const health = await healthRes.json();
+  assert.equal(health.version, pkg.version);
+  assert.equal(healthRes.headers.get('access-control-allow-origin'), null);
+
+  const localRes = await fetch(`${srv.url}/api/health`, { headers: { Origin: srv.url } });
+  assert.equal(localRes.headers.get('access-control-allow-origin'), srv.url);
+
+  const hostInfo = await srv.invoke('hostInfo');
+  assert.equal(hostInfo.version, pkg.version);
+
+  const badUrlRes = await fetch(`${srv.url}/%E0%A4%A`);
+  assert.equal(badUrlRes.status, 400);
+
+  // 2. deleteFileOrDir blocks workspace root deletion and traversal escapes
+  await assert.rejects(() => srv.invoke('deleteFileOrDir', { workspace: wsDir, path: '.' }), /workspace root/i);
+  await assert.rejects(() => srv.invoke('deleteFileOrDir', { workspace: wsDir, path: '../data' }), /outside/i);
+  assert.equal(await fs.readFile(path.join(wsDir, 'keep.txt'), 'utf8'), 'safe');
+
+  // 3. SecretVault round-trips via stdin DPAPI, rotates backups to max 5, and clears deleted keys from vault.plain.json
+  const vaultDir = path.join(dir, 'vault-test');
+  const vault = new SecretVault(vaultDir);
+  for (let i = 0; i < 8; i++) vault.set('TEST_ROTATE_KEY', 'secret-val-' + i);
+  const backups = (await fs.readdir(vaultDir)).filter(n => /^vault-backup-.*\.dpapi$/i.test(n));
+  assert.ok(backups.length <= 5, `Expected at most 5 backups, found ${backups.length}`);
+  const reloaded = new SecretVault(vaultDir);
+  assert.equal(reloaded.get('TEST_ROTATE_KEY'), 'secret-val-7');
+  // Even if vault.plain.json existed, clearing a key prevents resurrection on reload
+  await fs.writeFile(path.join(vaultDir, 'vault.plain.json'), JSON.stringify({ TEST_ROTATE_KEY: 'stale-plain' }), 'utf8');
+  reloaded.set('TEST_ROTATE_KEY', '');
+  const reloadedAgain = new SecretVault(vaultDir);
+  assert.equal(reloadedAgain.get('TEST_ROTATE_KEY'), null);
+});
+
 

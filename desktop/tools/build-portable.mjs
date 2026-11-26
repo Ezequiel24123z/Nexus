@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
-const outDir = path.join(desktopDir, 'release', 'NEXUS-Portable');
-const nativeDir = path.join(desktopDir, 'release', 'NEXUS');
+const releaseDir = path.join(desktopDir, 'release');
+const outDir = path.join(releaseDir, 'NEXUS-Portable');
+const zipOut = path.join(releaseDir, 'NEXUS-Portable-Windows.zip');
+const nativeDir = path.join(releaseDir, 'NEXUS');
 const uiDir = path.join(desktopDir, 'ui');
 
 if (!fs.existsSync(path.join(nativeDir, 'NEXUS.exe'))) {
@@ -70,5 +73,26 @@ if (torSrc) {
   copyRecursive(torSrc, path.join(outDir, 'tor'));
 }
 
-console.log(`NEXUS Portable bundle created at: ${outDir}`);
+// 6. Package portable archive (NEXUS-Portable-Windows.zip) for CI artifacts & GitHub Releases
+fs.rmSync(zipOut, { force: true });
+if (process.platform === 'win32') {
+  try {
+    execFileSync('tar.exe', ['-a', '-cf', zipOut, '-C', releaseDir, 'NEXUS-Portable'], { stdio: 'inherit', windowsHide: true });
+  } catch {
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      'Compress-Archive -Path $env:NEXUS_ZIP_SRC -DestinationPath $env:NEXUS_ZIP_DST -Force',
+    ], {
+      env: { ...process.env, NEXUS_ZIP_SRC: outDir, NEXUS_ZIP_DST: zipOut },
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+  }
+}
+
+console.log(`NEXUS v${pkg.version} Portable bundle created at: ${outDir}`);
+if (fs.existsSync(zipOut)) {
+  const mb = (fs.statSync(zipOut).size / (1024 * 1024)).toFixed(2);
+  console.log(`Portable archive created at: ${zipOut} (${mb} MB)`);
+}
 console.log(`Includes NEXUS.exe, WebView2 loader, bundled Node ${process.version}, core/, ui/, ${torSrc ? 'bundled portable Tor, ' : ''}and ${visited.size} backend dependency packages.`);

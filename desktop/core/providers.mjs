@@ -47,7 +47,7 @@ export async function resolveCopilotAuth(rawToken, { request = fetch, base = 'ht
     headers: {
       Authorization: 'token ' + token,
       Accept: 'application/json',
-      'User-Agent': 'NEXUS-Desktop/1.0',
+      'User-Agent': 'NEXUS-Desktop/1.1',
       'Editor-Version': 'vscode/1.99.0',
       'Editor-Plugin-Version': 'copilot-chat/0.26.0',
     },
@@ -178,6 +178,7 @@ export function buildAnthropicPayload({ connection, messages = [], settings = {}
       continue;
     }
     const blocks = toAnthropicContentBlocks(msg.content);
+    if (!blocks.length) continue;
     const content = blocks.length === 1 && blocks[0].type === 'text' ? blocks[0].text : blocks;
     const prev = converted.at(-1);
     if (prev && prev.role === 'user') {

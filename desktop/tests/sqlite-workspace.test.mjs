@@ -45,7 +45,7 @@ test('failure before activating marker keeps JSON authoritative and candidate re
  assert.throws(()=>store.migrateToSqlite(),/activation failure/);assert.equal(sync.existsSync(path.join(directory,'storage-engine.json')),false);assert.equal(open().storageInfo().engine,'json');assert.ok((await fs.readdir(directory)).some(name=>name.endsWith('.sqlite')));
 });
 test('legacy writes after activation are detected instead of silently discarding either history',async t=>{
- const {store,open}=await setup(t);store.migrateToSqlite();store.close();await fs.appendFile(store.filename,'\n');assert.throws(()=>open(),/cambió después de migrar/);
+ const {store,open}=await setup(t);store.migrateToSqlite();store.close();await fs.appendFile(store.filename,'\n');assert.throws(()=>open(),/changed after migration/);
 });
 test('missing or corrupt active database never falls back silently to stale JSON',async t=>{
  const {store,open}=await setup(t);const info=store.migrateToSqlite();store.close();await fs.rename(info.file,info.file+'.preserved');assert.throws(()=>open(),/SQLite store is missing/);await fs.writeFile(info.file,'broken');assert.throws(()=>open());

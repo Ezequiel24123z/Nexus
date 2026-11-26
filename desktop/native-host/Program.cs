@@ -345,6 +345,7 @@ internal sealed class NexusWindow : Form
     private bool _forceExit;
     private bool _darkMode = true;
     private bool _restartingCore;
+    private readonly Queue<DateTime> _coreRestartTimestamps = new();
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
@@ -354,6 +355,9 @@ internal sealed class NexusWindow : Form
 
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
     public NexusWindow(CoreProcess server, string[] cliArgs)
     {
@@ -424,6 +428,18 @@ internal sealed class NexusWindow : Form
         proc.UnexpectedExit += code =>
         {
             if (IsDisposed || _forceExit || _restartingCore) return;
+            lock (_coreRestartTimestamps)
+            {
+                var cutoff = DateTime.UtcNow.AddSeconds(-60);
+                while (_coreRestartTimestamps.Count > 0 && _coreRestartTimestamps.Peek() < cutoff)
+                    _coreRestartTimestamps.Dequeue();
+                if (_coreRestartTimestamps.Count >= 5)
+                {
+                    HostLog.Write("host", "Core daemon restarted 5 times in 60s; halting auto-restart loop.");
+                    return;
+                }
+                _coreRestartTimestamps.Enqueue(DateTime.UtcNow);
+            }
             _restartingCore = true;
             Task.Run(async () =>
             {
@@ -431,8 +447,10 @@ internal sealed class NexusWindow : Form
                 {
                     await Task.Delay(600);
                     HostLog.Write("host", "Attempting automatic restart of NEXUS core daemon...");
+                    var oldServer = _server;
                     var restarted = CoreProcess.Start(_cliArgs);
                     _server = restarted;
+                    try { oldServer.Dispose(); } catch { }
                     AttachCoreWatchdog(restarted);
                     if (!IsDisposed && IsHandleCreated)
                     {
@@ -531,7 +549,7 @@ internal sealed class NexusWindow : Form
             _webView.CoreWebView2.NewWindowRequested += (_, args) =>
             {
                 args.Handled = true;
-                if (!string.IsNullOrWhiteSpace(args.Uri)) OpenShellTarget(args.Uri);
+                if (!string.IsNullOrWhiteSpace(args.Uri)) OpenSafeHttpUrl(args.Uri);
             };
             _webView.CoreWebView2.ProcessFailed += (_, args) =>
             {
@@ -562,6 +580,15 @@ internal sealed class NexusWindow : Form
 
     private async void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
+        if (!Uri.TryCreate(e.Source, UriKind.Absolute, out var sourceUri)
+            || !Uri.TryCreate(_server.Url, UriKind.Absolute, out var serverUri)
+            || !string.Equals(sourceUri.Scheme, serverUri.Scheme, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(sourceUri.Host, serverUri.Host, StringComparison.OrdinalIgnoreCase)
+            || sourceUri.Port != serverUri.Port)
+        {
+            HostLog.Write("host", "Rejected native WebMessage from untrusted origin: " + e.Source);
+            return;
+        }
         string id = "";
         try
         {
@@ -697,10 +724,15 @@ internal sealed class NexusWindow : Form
                 return dlg.ShowDialog(this) == DialogResult.OK ? dlg.FileName : null;
             }
             case "openExternal":
+            {
+                string target = GetStr("target", "");
+                if (!string.IsNullOrWhiteSpace(target)) OpenSafeHttpUrl(target);
+                return true;
+            }
             case "openPath":
             {
                 string target = GetStr("target", "");
-                if (!string.IsNullOrWhiteSpace(target)) OpenShellTarget(target);
+                if (!string.IsNullOrWhiteSpace(target)) OpenExistingLocalPath(target);
                 return true;
             }
             case "openDevTools":
@@ -720,11 +752,28 @@ internal sealed class NexusWindow : Form
         _webView.CoreWebView2?.PostWebMessageAsJson(payload);
     }
 
-    private static void OpenShellTarget(string target)
+    private static void OpenSafeHttpUrl(string url)
     {
         try
         {
-            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            if (Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+            {
+                Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
+            }
+        }
+        catch { }
+    }
+
+    private static void OpenExistingLocalPath(string target)
+    {
+        try
+        {
+            string full = Path.GetFullPath(target.Trim());
+            if (File.Exists(full) || Directory.Exists(full))
+            {
+                Process.Start(new ProcessStartInfo(full) { UseShellExecute = true });
+            }
         }
         catch { }
     }
@@ -762,7 +811,16 @@ internal sealed class NexusWindow : Form
             var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
             g.DrawString("N", font, fg, new RectangleF(4, 5, 56, 56), sf);
         }
-        return Icon.FromHandle(bmp.GetHicon());
+        IntPtr hIcon = bmp.GetHicon();
+        try
+        {
+            using var tempIcon = Icon.FromHandle(hIcon);
+            return (Icon)tempIcon.Clone();
+        }
+        finally
+        {
+            DestroyIcon(hIcon);
+        }
     }
 }
 
@@ -829,16 +887,32 @@ internal sealed class PrivateBrowserPanel : IDisposable
         _emitState = emitState;
     }
 
+    private static string ValidateProxyUrl(string proxyUrl)
+    {
+        string trimmed = (proxyUrl ?? "").Trim();
+        if (string.IsNullOrEmpty(trimmed)) return "";
+        if (trimmed.IndexOfAny(['"', '\'', ' ', '\t', '\r', '\n', ';']) >= 0)
+            throw new InvalidOperationException("Proxy URL contains disallowed characters.");
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+            throw new InvalidOperationException("Invalid proxy URL.");
+        string scheme = uri.Scheme.ToLowerInvariant();
+        if (scheme is not ("http" or "https" or "socks4" or "socks5" or "socks5h"))
+            throw new InvalidOperationException("Unsupported proxy scheme: " + scheme);
+        return uri.AbsoluteUri.TrimEnd('/');
+    }
+
     public async Task<object> ShowAsync(double x, double y, double width, double height, string url, string proxyUrl, bool blockTrackers, bool antiFingerprint, bool persistent = false)
     {
+        string safeProxy = ValidateProxyUrl(proxyUrl);
+        bool antiFpChanged = _antiFingerprint != antiFingerprint;
         _blockTrackers = blockTrackers;
         _antiFingerprint = antiFingerprint;
         UpdateBounds(x, y, width, height);
 
-        bool needsInit = _view == null || _activeProxy != proxyUrl || _persistent != persistent;
+        bool needsInit = _view == null || _activeProxy != safeProxy || _persistent != persistent || antiFpChanged;
         if (needsInit)
         {
-            await RecreateAsync(url, proxyUrl, persistent);
+            await RecreateAsync(url, safeProxy, persistent);
         }
         else if (!string.IsNullOrWhiteSpace(url) && url != _currentUrl && _view?.CoreWebView2 != null)
         {
@@ -884,6 +958,7 @@ internal sealed class PrivateBrowserPanel : IDisposable
 
     public async Task<object> WipeAndReinitAsync(string url, string proxyUrl, bool blockTrackers, bool antiFingerprint, bool persistent = false)
     {
+        string safeProxy = ValidateProxyUrl(proxyUrl);
         bool wasVisible = _view?.Visible == true;
         _blockTrackers = blockTrackers;
         _antiFingerprint = antiFingerprint;
@@ -893,7 +968,7 @@ internal sealed class PrivateBrowserPanel : IDisposable
             DestroyCurrent();
             try { if (Directory.Exists(persistDir)) Directory.Delete(persistDir, true); } catch { }
         }
-        await RecreateAsync(url, proxyUrl, persistent);
+        await RecreateAsync(url, safeProxy, persistent);
         if (_view != null && wasVisible)
         {
             _view.Bounds = _lastRect;

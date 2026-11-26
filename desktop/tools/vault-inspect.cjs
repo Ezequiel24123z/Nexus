@@ -1,19 +1,20 @@
-// Diagnóstico: muestra SOLO nombres de clave de un vault.bin (nunca los valores).
-// Uso: electron tools/vault-inspect.cjs <ruta-vault.bin> [carpeta-userData]
-const { app, safeStorage } = require('electron');
-const fs = require('node:fs');
-const os = require('node:os');
+// Diagnostic tool: prints ONLY key names and lengths from the local NEXUS DPAPI vault (never secret values).
+// Usage: node tools/vault-inspect.cjs [dataDir]
 const path = require('node:path');
-const args = process.argv.slice(2);
-const file = args[0];
-const userDataDir = args[1];
-app.setPath('userData', userDataDir || path.join(os.tmpdir(), 'nexus-vault-inspect'));
-app.whenReady().then(() => {
+const { resolveDataDirectory } = require('../core/datadir.cjs');
+
+(async () => {
   try {
-    const data = JSON.parse(safeStorage.decryptString(fs.readFileSync(file)));
-    const names = Object.keys(data);
-    console.log('OK keys=' + names.length + ' [' + names.join(', ') + ']');
-    for (const name of names) console.log('- ' + name + ' length=' + String(data[name] ?? '').length);
-  } catch (error) { console.log('FAIL: ' + (error && error.message)); }
-  app.exit(0);
-});
+    const dataDir = process.argv[2] ? path.resolve(process.argv[2]) : resolveDataDirectory();
+    const { SecretVault } = await import('../core/vault.mjs');
+    const vault = new SecretVault(dataDir);
+    const names = vault.listNames();
+    console.log('OK dir=' + dataDir + ' keys=' + names.length + ' [' + names.join(', ') + ']');
+    for (const name of names) {
+      console.log('- ' + name + ' length=' + String(vault.secrets[name] ?? '').length);
+    }
+  } catch (error) {
+    console.error('FAIL: ' + (error && error.message));
+    process.exitCode = 1;
+  }
+})();

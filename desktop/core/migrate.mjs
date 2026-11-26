@@ -1,8 +1,6 @@
-// Importación de datos de instalaciones/contextos anteriores de NEXUS.
-// No borra nada: copia un respaldo antes de actuar y conserva el origen intacto.
-// Las claves cifradas (vault.bin) NO se descifran aquí: en Windows dependen del
-// par Local State + vault.bin de cada carpeta, así que main.cjs usa un proceso
-// puente que arranca con la carpeta heredada (ver readLegacyVault).
+// Import data from previous NEXUS installations/contexts.
+// Non-destructive: creates a backup before acting and leaves the original source untouched.
+// Legacy encrypted vault.bin files are not decrypted here (current NEXUS uses DPAPI vault.dpapi).
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeTask } from './store.mjs';
@@ -42,7 +40,7 @@ export function mergeLegacyData({ store, dataDir, localAppData, now = () => new 
   const sources = candidateLegacyDirs(localAppData).filter(dir => {
     if(seen.has(dir) || path.resolve(dir) === path.resolve(dataDir))return false;
     // Its JSON is frozen at migration, not current. Skip before making backups.
-    if(fs.existsSync(path.join(dir,'storage-engine.json'))){console.warn('NEXUS: origen SQLite omitido de la importación JSON; requiere exportación compatible.');return false;}
+    if(fs.existsSync(path.join(dir,'storage-engine.json'))){console.warn('NEXUS: skipped SQLite source during JSON import; compatible export required.');return false;}
     return true;
   });
   const result = { dirs: [], backup: null };

@@ -10,13 +10,13 @@ function durableFile(filename,content){const fd=fs.openSync(filename,'wx');try{f
 export function readStorageMarker(directory){
  const file=path.join(directory,markerName);if(!fs.existsSync(file))return null;
  const marker=JSON.parse(fs.readFileSync(file,'utf8'));
- if(marker.version!==1||marker.engine!=='sqlite'||!/^workspace-v1-[a-f0-9-]{36}\.sqlite$/.test(marker.file)||typeof marker.legacySha256!=='string')throw new Error('Marcador de almacenamiento no válido; no se han sustituido datos.');
+ if(marker.version!==1||marker.engine!=='sqlite'||!/^workspace-v1-[a-f0-9-]{36}\.sqlite$/.test(marker.file)||typeof marker.legacySha256!=='string')throw new Error('Invalid storage marker; no data was replaced.');
  const legacy=path.join(directory,'workspace.json');
- if(!fs.existsSync(legacy)||digest(legacy)!==marker.legacySha256)throw new Error('El historial JSON anterior cambió después de migrar. Conserva ambos almacenes y revisa qué versión de NEXUS lo modificó antes de continuar.');
+ if(!fs.existsSync(legacy)||digest(legacy)!==marker.legacySha256)throw new Error('The legacy JSON history changed after migration. Preserve both stores and check which version of NEXUS modified it before continuing.');
  return marker;
 }
 export function migrateStorage(directory,state){
- if(fs.existsSync(path.join(directory,markerName)))throw new Error('Ya existe una selección de almacenamiento.');
+ if(fs.existsSync(path.join(directory,markerName)))throw new Error('A storage engine selection already exists.');
  const stamp=crypto.randomUUID(),file='workspace-v1-'+stamp+'.sqlite',backup='workspace.before-sqlite-'+stamp+'.json';
  const legacy=path.join(directory,'workspace.json');
  fs.copyFileSync(legacy,path.join(directory,backup),fs.constants.COPYFILE_EXCL);
@@ -25,7 +25,7 @@ export function migrateStorage(directory,state){
  let candidate;
  try{
    candidate=new SqliteWorkspace(path.join(directory,file),{create:true});candidate.save(state);
-   if(!isDeepStrictEqual(candidate.read(),persistedState(state)))throw new Error('La verificación de la migración no coincide con el original.');
+   if(!isDeepStrictEqual(candidate.read(),persistedState(state)))throw new Error('Migration verification did not match the original state.');
    candidate.close();candidate=null;
    const marker={version:1,engine:'sqlite',file,backup,legacySha256:digest(legacy),at:new Date().toISOString()};
    const temp=path.join(directory,markerName+'.'+stamp+'.tmp');durableFile(temp,JSON.stringify(marker,null,2));

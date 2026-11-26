@@ -37,6 +37,10 @@ const require = createRequire(import.meta.url);
 const { resolveDataDirectory } = require('./datadir.cjs');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(__dirname, '..');
+const APP_VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(desktopRoot, 'package.json'), 'utf8')).version || '1.1.0'; }
+  catch { return '1.1.0'; }
+})();
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -57,13 +61,39 @@ const MIME_TYPES = {
 const connectorRevision = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 function openWithShell(target) {
+  const safeTarget = String(target || '').trim();
+  if (!safeTarget) throw new Error('Target cannot be empty.');
   if (process.platform === 'win32') {
-    spawn('cmd.exe', ['/c', 'start', '', target], { windowsHide: true, detached: true, stdio: 'ignore' }).unref();
+    spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $env:NEXUS_OPEN_TARGET'], {
+      env: { ...process.env, NEXUS_OPEN_TARGET: safeTarget },
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
     return true;
   }
   const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
-  spawn(opener, [target], { detached: true, stdio: 'ignore' }).unref();
+  spawn(opener, [safeTarget], { detached: true, stdio: 'ignore' }).unref();
   return true;
+}
+
+function allowedCorsOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return null;
+  try {
+    const parsed = new URL(origin);
+    if (['http:', 'https:'].includes(parsed.protocol) && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
+      return origin;
+    }
+  } catch {}
+  return null;
+}
+
+function safeTokenEqual(provided, expected) {
+  if (typeof provided !== 'string' || typeof expected !== 'string' || !expected) return false;
+  const a = Buffer.from(provided, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 async function readJsonBody(req, maxBytes = 25 * 1024 * 1024) {
@@ -243,7 +273,7 @@ export async function createNexusServer({
           dataDir,
           configPath: configFile.filename,
           logsDir: path.join(dataDir, 'logs'),
-          version: '1.1.0',
+          version: APP_VERSION,
         };
       case 'getLogs': {
         const logsDir = path.join(dataDir, 'logs');
@@ -741,7 +771,7 @@ export async function createNexusServer({
       }
       case 'files': {
         if (!args.workspace) throw new Error('Select a workspace folder first.');
-        const target = path.resolve(args.workspace, args.path || '.');
+        const target = await workspacePath(args.workspace, args.path || '.', false);
         return fs.readdirSync(target, { withFileTypes: true })
           .filter(f => f.name !== '.git' && f.name !== 'node_modules')
           .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
@@ -754,21 +784,21 @@ export async function createNexusServer({
       }
       case 'readFile': {
         if (!args.workspace) throw new Error('Select a workspace folder first.');
-        const target = path.resolve(args.workspace, args.path);
+        const target = await workspacePath(args.workspace, args.path, false);
         const stat = fs.statSync(target);
         if (stat.size > 2 * 1024 * 1024) throw new Error('Preview supports files up to 2 MB.');
         return fs.readFileSync(target, 'utf8');
       }
       case 'writeFileDirect': {
         if (!args.workspace || !args.path) throw new Error('Workspace and file path are required.');
-        const target = path.resolve(args.workspace, args.path);
+        const target = await workspacePath(args.workspace, args.path, true);
         await fsp.mkdir(path.dirname(target), { recursive: true });
         await fsp.writeFile(target, String(args.content ?? ''), 'utf8');
         return { saved: true, path: args.path, bytes: Buffer.byteLength(String(args.content ?? ''), 'utf8') };
       }
       case 'createFileOrDir': {
         if (!args.workspace || !args.path) throw new Error('Workspace and target path are required.');
-        const target = path.resolve(args.workspace, args.path);
+        const target = await workspacePath(args.workspace, args.path, true);
         if (args.directory) {
           await fsp.mkdir(target, { recursive: true });
         } else {
@@ -779,7 +809,11 @@ export async function createNexusServer({
       }
       case 'deleteFileOrDir': {
         if (!args.workspace || !args.path) throw new Error('Workspace and target path are required.');
-        const target = path.resolve(args.workspace, args.path);
+        const target = await workspacePath(args.workspace, args.path, false);
+        const realWorkspace = await fsp.realpath(args.workspace);
+        if (path.resolve(target) === path.resolve(realWorkspace)) {
+          throw new Error('Cannot delete the workspace root directory.');
+        }
         await fsp.rm(target, { recursive: true, force: true });
         return { deleted: true, path: args.path };
       }
@@ -859,78 +893,95 @@ export async function createNexusServer({
     if (!requireToken) return true;
     const header = req.headers['x-nexus-token'];
     const queryToken = url.searchParams.get('token');
-    return header === token || queryToken === token;
+    return safeTokenEqual(header, token) || safeTokenEqual(queryToken, token);
   };
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+    try {
+      const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+      const corsOrigin = allowedCorsOrigin(req);
+      const corsHeaders = corsOrigin ? { 'Access-Control-Allow-Origin': corsOrigin, Vary: 'Origin' } : {};
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, X-Nexus-Token',
-      });
-      res.end();
-      return;
-    }
-
-    if (url.pathname === '/api/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, version: '1.0.0', pid: process.pid, nativeHost }));
-      return;
-    }
-
-    if (url.pathname === '/api/events') {
-      if (!checkAuth(req, url)) { res.writeHead(401); res.end('Unauthorized'); return; }
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-      });
-      res.write('event: ready\ndata: {}\n\n');
-      sseClients.add(res);
-      const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
-      req.on('close', () => { clearInterval(keepAlive); sseClients.delete(res); });
-      return;
-    }
-
-    if (url.pathname === '/api/invoke' && req.method === 'POST') {
-      if (!checkAuth(req, url)) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-      try {
-        const body = await readJsonBody(req);
-        const result = await invoke(body.method, body.args || {});
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(JSON.stringify({ ok: true, result }));
-      } catch (error) {
-        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(JSON.stringify({ ok: false, error: error?.message || String(error) }));
-      }
-      return;
-    }
-
-    // Serve built UI files cleanly
-    if (req.method === 'GET') {
-      const requested = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname);
-      let filePath = path.resolve(uiDir, '.' + requested);
-      const resolvedUi = path.resolve(uiDir);
-      if (!filePath.startsWith(resolvedUi) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-        filePath = path.join(resolvedUi, 'index.html');
-      }
-      if (!fs.existsSync(filePath)) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end('NEXUS UI not built yet. Run "npm run build" in desktop/.');
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          ...corsHeaders,
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, X-Nexus-Token',
+        });
+        res.end();
         return;
       }
-      const ext = path.extname(filePath).toLowerCase();
-      res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
-      fs.createReadStream(filePath).pipe(res);
-      return;
-    }
 
-    res.writeHead(404);
-    res.end('Not found');
+      if (url.pathname === '/api/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json', ...corsHeaders });
+        res.end(JSON.stringify({ ok: true, version: APP_VERSION, pid: process.pid, nativeHost }));
+        return;
+      }
+
+      if (url.pathname === '/api/events') {
+        if (!checkAuth(req, url)) { res.writeHead(401); res.end('Unauthorized'); return; }
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          ...corsHeaders,
+        });
+        res.write('event: ready\ndata: {}\n\n');
+        sseClients.add(res);
+        const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
+        req.on('close', () => { clearInterval(keepAlive); sseClients.delete(res); });
+        return;
+      }
+
+      if (url.pathname === '/api/invoke' && req.method === 'POST') {
+        if (!checkAuth(req, url)) { res.writeHead(401, { 'Content-Type': 'application/json', ...corsHeaders }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+        try {
+          const body = await readJsonBody(req);
+          const result = await invoke(body.method, body.args || {});
+          res.writeHead(200, { 'Content-Type': 'application/json', ...corsHeaders });
+          res.end(JSON.stringify({ ok: true, result }));
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json', ...corsHeaders });
+          res.end(JSON.stringify({ ok: false, error: error?.message || String(error) }));
+        }
+        return;
+      }
+
+      // Serve built UI files cleanly
+      if (req.method === 'GET') {
+        let requested;
+        try {
+          requested = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Malformed URL path.');
+          return;
+        }
+        const resolvedUi = path.resolve(uiDir);
+        let filePath = path.resolve(resolvedUi, '.' + requested);
+        const insideUi = filePath === resolvedUi || filePath.startsWith(resolvedUi + path.sep);
+        if (!insideUi || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+          filePath = path.join(resolvedUi, 'index.html');
+        }
+        if (!fs.existsSync(filePath)) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end('NEXUS UI not built yet. Run "npm run build" in desktop/.');
+          return;
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
+      res.writeHead(404);
+      res.end('Not found');
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad request: ' + (err?.message || 'invalid request'));
+      }
+    }
   });
 
   await new Promise((resolve, reject) => {

@@ -40,6 +40,12 @@ export function matchesCron(expr, date = new Date()) {
   );
 }
 
+const parseOptionalInt = (value, fallback) => {
+  if (value === undefined || value === null || value === '') return fallback;
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.round(num) : fallback;
+};
+
 export function validateAutomation(input = {}) {
   const keys = Object.keys(input || {}).join(', ') || '(none)';
   if (typeof input.name !== 'string' || !input.name.trim()) {
@@ -72,10 +78,10 @@ export function validateAutomation(input = {}) {
     model: String(input.model || '').trim(),
     agentMode: validModes.includes(input.agentMode) ? input.agentMode : 'autopilot',
     scheduleType,
-    everyMinutes: scheduleType === 'interval' ? Math.max(1, Math.round(Number(input.everyMinutes) || 60)) : null,
-    hour: ['daily', 'weekly'].includes(scheduleType) ? Math.max(0, Math.min(23, Math.round(Number(input.hour) || 9))) : null,
-    minute: ['daily', 'weekly'].includes(scheduleType) ? Math.max(0, Math.min(59, Math.round(Number(input.minute) || 0))) : null,
-    weekday: scheduleType === 'weekly' ? Math.max(0, Math.min(6, Math.round(Number(input.weekday) || 1))) : null,
+    everyMinutes: scheduleType === 'interval' ? Math.max(1, parseOptionalInt(input.everyMinutes, 60)) : null,
+    hour: ['daily', 'weekly'].includes(scheduleType) ? Math.max(0, Math.min(23, parseOptionalInt(input.hour, 9))) : null,
+    minute: ['daily', 'weekly'].includes(scheduleType) ? Math.max(0, Math.min(59, parseOptionalInt(input.minute, 0))) : null,
+    weekday: scheduleType === 'weekly' ? Math.max(0, Math.min(6, parseOptionalInt(input.weekday, 1))) : null,
     cronExpression: scheduleType === 'cron' ? String(input.cronExpression).trim() : '',
     runAt: scheduleType === 'once' ? new Date(input.runAt).toISOString() : '',
     enabled: input.enabled !== false,

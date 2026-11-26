@@ -17,7 +17,7 @@ function loadMermaid(isDark) {
   return mermaidPromise.then(m => {
     m.initialize({
       startOnLoad: false,
-      securityLevel: 'loose',
+      securityLevel: 'strict',
       theme: isDark ? 'dark' : 'default',
       fontFamily: 'var(--font-sans)',
     });
@@ -132,20 +132,9 @@ export function CopyButton({ text, label = 'Copy', compact = false }) {
   );
 }
 
-function CodeBlock({ children }) {
+function SyntaxCodeBlock({ rawCode, rawLang }) {
   const [wrap, setWrap] = useState(false);
-  const codeEl = children?.props ? children : null;
-  const rawLang = (codeEl?.props?.className || '').replace(/^language-/, '') || 'text';
-  const rawCode = String(codeEl?.props?.children ?? '').replace(/\n$/, '');
   const lineCount = rawCode ? rawCode.split('\n').length : 0;
-
-  if (rawLang.toLowerCase() === 'mermaid') {
-    return <MermaidBlock code={rawCode} />;
-  }
-  if (rawLang.toLowerCase() === 'math' || rawLang.toLowerCase() === 'latex') {
-    return <MathSpan expr={rawCode} display />;
-  }
-
   const highlighted = useMemo(() => tokenizeCode(rawCode, rawLang), [rawCode, rawLang]);
 
   return (
@@ -168,6 +157,20 @@ function CodeBlock({ children }) {
       </pre>
     </div>
   );
+}
+
+function CodeBlock({ children }) {
+  const codeEl = children?.props ? children : null;
+  const rawLang = (codeEl?.props?.className || '').replace(/^language-/, '') || 'text';
+  const rawCode = String(codeEl?.props?.children ?? '').replace(/\n$/, '');
+
+  if (rawLang.toLowerCase() === 'mermaid') {
+    return <MermaidBlock code={rawCode} />;
+  }
+  if (rawLang.toLowerCase() === 'math' || rawLang.toLowerCase() === 'latex') {
+    return <MathSpan expr={rawCode} display />;
+  }
+  return <SyntaxCodeBlock rawCode={rawCode} rawLang={rawLang} />;
 }
 
 const plugins = [remarkGfm];

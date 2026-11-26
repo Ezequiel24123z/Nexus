@@ -15,12 +15,18 @@ function resolveConnection() {
 
 const conn = resolveConnection();
 const pendingNative = new Map();
+const changeListeners = new Set();
+const deltaListeners = new Set();
+const terminalListeners = new Set();
+const notifyListeners = new Set();
+const torListeners = new Set();
 const browserListeners = new Set();
 let nativeSeq = 0;
 
 if (conn.nativeHost && window.chrome?.webview) {
   window.chrome.webview.addEventListener('message', event => {
-    const msg = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+    let msg;
+    try { msg = typeof event.data === 'string' ? JSON.parse(event.data) : event.data; } catch { return; }
     if (!msg) return;
     if (msg.event === 'browserState') {
       for (const cb of browserListeners) { try { cb(msg.data); } catch {} }
@@ -204,11 +210,6 @@ async function invoke(method, args = {}) {
   return callServer(method, args);
 }
 
-const changeListeners = new Set();
-const deltaListeners = new Set();
-const terminalListeners = new Set();
-const notifyListeners = new Set();
-const torListeners = new Set();
 let eventSource = null;
 
 function ensureStream() {
@@ -292,4 +293,4 @@ export function installNexusBridge() {
   return window.nexus;
 }
 
-export { invoke, subscribe, subscribeDelta, subscribeTerminal, subscribeNotify, subscribeBrowser, beforeClose, conn as bridgeConnection };
+export { invoke, subscribe, subscribeDelta, subscribeTerminal, subscribeNotify, subscribeTor, subscribeBrowser, beforeClose, conn as bridgeConnection };

@@ -122,6 +122,7 @@ export function connectSocks5({ proxyHost, proxyPort, username = '', password = 
     const sendConnect = () => {
       stage = 'connect';
       const hostBuf = Buffer.from(targetHost, 'utf8');
+      if (hostBuf.length > 255) return fail(new Error('SOCKS5 target hostname exceeds 255 bytes.'));
       const portBuf = Buffer.alloc(2);
       portBuf.writeUInt16BE(targetPort, 0);
       socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]), hostBuf, portBuf]));
@@ -152,10 +153,13 @@ export function connectSocks5({ proxyHost, proxyPort, username = '', password = 
         if (atyp === 0x01) needed = 4 + 4 + 2;
         else if (atyp === 0x03) needed = buffer.length >= 5 ? 5 + buffer[4] + 2 : 9999;
         else if (atyp === 0x04) needed = 4 + 16 + 2;
+        else return fail(new Error(`SOCKS5 unsupported address type (${atyp}).`));
         if (buffer.length >= needed) {
+          const leftover = buffer.subarray(needed);
           clearTimeout(timer);
           socket.removeAllListeners('data');
           socket.removeAllListeners('error');
+          if (leftover.length) socket.unshift(leftover);
           resolve(socket);
         }
       }
@@ -178,6 +182,7 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
   if (bodyBuf && !headers['Content-Length'] && !headers['content-length']) {
     headers['Content-Length'] = String(bodyBuf.length);
   }
+  if (options.signal?.aborted) throw new Error('Aborted');
 
   let tunnelSocket;
   if (proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:') {
@@ -196,13 +201,18 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
         port: Number(proxy.port) || (proxy.protocol === 'https:' ? 443 : 8080),
         method: 'CONNECT',
         path: `${target.hostname}:${targetPort}`,
+        timeout: 20000,
         headers: proxy.username ? { 'Proxy-Authorization': 'Basic ' + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString('base64') } : {},
       });
+      const onAbort = () => { connectReq.destroy(new Error('Aborted')); };
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      connectReq.on('timeout', () => { connectReq.destroy(new Error('HTTP proxy CONNECT timed out.')); });
       connectReq.on('connect', (res, sock) => {
+        options.signal?.removeEventListener('abort', onAbort);
         if (res.statusCode !== 200) { sock.destroy(); reject(new Error(`HTTP proxy CONNECT failed (${res.statusCode})`)); }
         else resolve(sock);
       });
-      connectReq.on('error', reject);
+      connectReq.on('error', err => { options.signal?.removeEventListener('abort', onAbort); reject(err); });
       connectReq.end();
     });
   } else {
@@ -214,6 +224,10 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
     : tunnelSocket;
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const doneReject = err => { if (!settled) { settled = true; reject(err); } };
+    const doneResolve = val => { if (!settled) { settled = true; resolve(val); } };
+    transportSocket.on('error', doneReject);
     const req = (isHttps ? https : http).request({
       createConnection: () => transportSocket,
       hostname: target.hostname,
@@ -223,6 +237,7 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
       headers,
     }, res => {
       const chunks = [];
+      res.on('error', doneReject);
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         const respHeaders = new Headers();
@@ -230,12 +245,14 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
           if (Array.isArray(v)) for (const item of v) respHeaders.append(k, item);
           else if (v !== undefined) respHeaders.set(k, String(v));
         }
-        resolve(new Response(Buffer.concat(chunks), { status: res.statusCode || 200, headers: respHeaders }));
+        const status = res.statusCode || 200;
+        const nullBody = status === 204 || status === 205 || status === 304;
+        doneResolve(new Response(nullBody ? null : Buffer.concat(chunks), { status, headers: respHeaders }));
       });
     });
-    req.on('error', reject);
+    req.on('error', doneReject);
     if (options.signal) {
-      if (options.signal.aborted) { req.destroy(); return reject(new Error('Aborted')); }
+      if (options.signal.aborted) { req.destroy(); return doneReject(new Error('Aborted')); }
       options.signal.addEventListener('abort', () => req.destroy(new Error('Aborted')), { once: true });
     }
     if (bodyBuf) req.write(bodyBuf);
