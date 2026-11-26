@@ -8,6 +8,45 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+export function wrapUtf8Ps(cmd = '') {
+  return `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\n${cmd}`;
+}
+
+export function createUnifiedDiff(oldText = '', newText = '', filePath = 'file', maxLines = 120) {
+  const oldLines = oldText ? String(oldText).split(/\r?\n/) : [];
+  const newLines = newText ? String(newText).split(/\r?\n/) : [];
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const removed = oldLines.slice(prefix, oldLines.length - suffix);
+  const added = newLines.slice(prefix, newLines.length - suffix);
+  if (!removed.length && !added.length) return { diff: '', addedLines: 0, removedLines: 0 };
+
+  const ctxStart = Math.max(0, prefix - 2);
+  const ctxEndOld = Math.min(oldLines.length, oldLines.length - suffix + 2);
+  const beforeCtx = oldLines.slice(ctxStart, prefix).map(l => ' ' + l);
+  const afterCtx = oldLines.slice(oldLines.length - suffix, ctxEndOld).map(l => ' ' + l);
+  const header = `@@ -${ctxStart + 1},${removed.length + beforeCtx.length + afterCtx.length} +${ctxStart + 1},${added.length + beforeCtx.length + afterCtx.length} @@ ${filePath}`;
+  const body = [
+    header,
+    ...beforeCtx,
+    ...removed.map(l => '-' + l),
+    ...added.map(l => '+' + l),
+    ...afterCtx,
+  ];
+  const truncated = body.length > maxLines;
+  const rendered = (truncated ? [...body.slice(0, maxLines), `... (${body.length - maxLines} more diff lines)`] : body).join('\n');
+  return { diff: rendered, addedLines: added.length, removedLines: removed.length };
+}
+
 export function globToRegExp(globPattern = '*') {
   const normalized = String(globPattern || '*').replace(/\\/g, '/').trim();
   let regex = '^';
@@ -101,10 +140,65 @@ export async function multiEditFile(store, task, target, requestedPath, edits = 
   }
   const backup = path.join(store.directoryFor(task.id), 'backup-' + crypto.randomUUID() + '.txt');
   await fs.writeFile(backup, previous, 'utf8');
+  const diffInfo = createUnifiedDiff(previous, content, requestedPath);
   store.journal(task, 'write_intent', { path: target, reason, backup, existed: true, edits: applied.length });
   await fs.writeFile(target, content, 'utf8');
-  store.journal(task, 'file_change', { path: target, reason, backup, bytes: Buffer.byteLength(content, 'utf8'), edits: applied.length });
-  return { written: requestedPath, backup, bytes: Buffer.byteLength(content, 'utf8'), editsApplied: applied.length, details: applied };
+  store.journal(task, 'file_change', { path: target, reason, backup, bytes: Buffer.byteLength(content, 'utf8'), edits: applied.length, addedLines: diffInfo.addedLines, removedLines: diffInfo.removedLines });
+  return { written: requestedPath, backup, bytes: Buffer.byteLength(content, 'utf8'), editsApplied: applied.length, details: applied, ...diffInfo };
+}
+
+export function nodeExecutable() {
+  return process.versions.electron ? 'node' : process.execPath;
+}
+
+export async function revertFileBackup(store, task, eventId) {
+  const event = (task.events || []).find(e => e.id === eventId && e.kind === 'file_change');
+  if (!event || !event.detail?.path) throw new Error('File change event not found.');
+  const target = event.detail.path;
+  const backup = event.detail.backup;
+  if (!backup) {
+    // File did not exist before this write; remove it if still present.
+    await fs.rm(target, { force: true });
+    store.journal(task, 'file_reverted', { path: target, eventId, removedNewFile: true });
+    return { reverted: true, path: target, removedNewFile: true };
+  }
+  const previous = await fs.readFile(backup, 'utf8');
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, previous, 'utf8');
+  store.journal(task, 'file_reverted', { path: target, eventId, backup });
+  return { reverted: true, path: target, bytes: Buffer.byteLength(previous, 'utf8') };
+}
+
+export function discoverWorkspaceMcpServers(workspace) {
+  if (!workspace || typeof workspace !== 'string') return [];
+  const candidates = [path.join(workspace, '.mcp.json'), path.join(workspace, 'mcp.json'), path.join(workspace, '.github', 'mcp.json')];
+  const discovered = [];
+  for (const file of candidates) {
+    try {
+      if (!fsSync.existsSync(file) || !fsSync.statSync(file).isFile()) continue;
+      const parsed = JSON.parse(fsSync.readFileSync(file, 'utf8'));
+      const map = parsed?.mcpServers || parsed?.servers || {};
+      if (!map || typeof map !== 'object') continue;
+      for (const [name, cfg] of Object.entries(map)) {
+        if (!cfg || typeof cfg !== 'object') continue;
+        if (cfg.url) {
+          discovered.push({ name, transport: 'http', url: String(cfg.url), secretRef: '', source: path.relative(workspace, file) });
+        } else if (cfg.command) {
+          discovered.push({
+            name,
+            transport: 'stdio',
+            command: String(cfg.command),
+            args: Array.isArray(cfg.args) ? cfg.args.map(String) : [],
+            cwd: cfg.cwd ? String(cfg.cwd) : workspace,
+            env: cfg.env && typeof cfg.env === 'object' ? cfg.env : undefined,
+            envSecrets: {},
+            source: path.relative(workspace, file),
+          });
+        }
+      }
+    } catch {}
+  }
+  return discovered;
 }
 
 export async function applyPatchToFile(store, task, target, requestedPath, patchText, reason = 'Apply patch') {
@@ -118,11 +212,11 @@ export async function applyPatchToFile(store, task, target, requestedPath, patch
     const edits = blocks.map(match => ({ oldText: match[1], newText: match[2] }));
     return multiEditFile(store, task, target, requestedPath, edits, reason);
   }
+  let existed = true;
   const previous = await fs.readFile(target, 'utf8').catch(error => {
-    if (error.code === 'ENOENT') return '';
+    if (error.code === 'ENOENT') { existed = false; return ''; }
     throw error;
   });
-  const lines = previous ? previous.split(/\r?\n/) : [];
   const patchLines = patchText.split(/\r?\n/);
   const hunks = [];
   let current = null;
@@ -130,7 +224,7 @@ export async function applyPatchToFile(store, task, target, requestedPath, patch
     const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (header) {
       if (current) hunks.push(current);
-      current = { oldStart: Number(header[1]), lines: [] };
+      current = { oldStart: Number(header[1]), oldCount: header[2] !== undefined ? Number(header[2]) : 1, lines: [] };
       continue;
     }
     if (current && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-'))) {
@@ -141,6 +235,34 @@ export async function applyPatchToFile(store, task, target, requestedPath, patch
   if (!hunks.length) {
     throw new Error('Patch must contain either <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE blocks or unified @@ -l,s +l,s @@ hunks.');
   }
+
+  // Handle pure new-file creation or pure insertion hunks directly by line position
+  const hasEmptyOld = !existed || hunks.some(h => h.lines.every(l => l.startsWith('+')));
+  if (hasEmptyOld) {
+    const eol = previous.includes('\r\n') ? '\r\n' : '\n';
+    const fileLines = previous ? previous.split(/\r?\n/) : [];
+    let delta = 0;
+    for (const hunk of hunks) {
+      const insertAt = Math.max(0, Math.min(fileLines.length, (hunk.oldStart > 0 ? hunk.oldStart - 1 : 0) + delta));
+      const oldLen = hunk.lines.filter(l => !l.startsWith('+')).length;
+      const newLines = hunk.lines.filter(l => !l.startsWith('-')).map(l => l.slice(1));
+      fileLines.splice(insertAt, oldLen, ...newLines);
+      delta += newLines.length - oldLen;
+    }
+    const content = fileLines.join(eol);
+    let backup = null;
+    if (existed) {
+      backup = path.join(store.directoryFor(task.id), 'backup-' + crypto.randomUUID() + '.txt');
+      await fs.writeFile(backup, previous, 'utf8');
+    }
+    const diffInfo = createUnifiedDiff(previous, content, requestedPath);
+    store.journal(task, 'write_intent', { path: target, reason, backup, existed, edits: hunks.length });
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content, 'utf8');
+    store.journal(task, 'file_change', { path: target, reason, backup, bytes: Buffer.byteLength(content, 'utf8'), edits: hunks.length, addedLines: diffInfo.addedLines, removedLines: diffInfo.removedLines });
+    return { written: requestedPath, backup, bytes: Buffer.byteLength(content, 'utf8'), editsApplied: hunks.length, ...diffInfo };
+  }
+
   const edits = hunks.map(hunk => {
     const oldText = hunk.lines.filter(l => !l.startsWith('+')).map(l => l.slice(1)).join('\n');
     const newText = hunk.lines.filter(l => !l.startsWith('-')).map(l => l.slice(1)).join('\n');
@@ -334,7 +456,37 @@ export async function executeGitOperation(cwd, args = {}, signal) {
   }
   if (op === 'branch') {
     const res = await runGit(cwd, ['branch', '-a'], { signal });
-    return { operation: 'branch', output: res.stdout, exitCode: res.exitCode };
+    const branches = (res.stdout || '').split(/\r?\n/).filter(Boolean).map(l => ({
+      current: l.startsWith('* '),
+      name: l.replace(/^\*?\s+/, '').trim(),
+    }));
+    return { operation: 'branch', output: res.stdout, branches, exitCode: res.exitCode };
+  }
+  if (op === 'checkout' || op === 'checkout_new') {
+    if (!args.branch) throw new Error('Provide a branch name to checkout.');
+    const shouldCreate = op === 'checkout_new' || Boolean(args.create || args.createBranch || args.newBranch);
+    const flags = shouldCreate ? ['checkout', '-b', args.branch] : ['checkout', args.branch];
+    const res = await runGit(cwd, flags, { signal });
+    if (res.exitCode !== 0) throw new Error(res.stderr || res.stdout || 'git checkout failed');
+    return { operation: op, branch: args.branch, created: shouldCreate, output: res.stdout || res.stderr, status: await inspectGitWorkspace(cwd, { signal }) };
+  }
+  if (op === 'discard') {
+    const target = args.target;
+    if (!target) throw new Error('Provide a file path to discard changes.');
+    const res = await runGit(cwd, ['checkout', '--', target], { signal });
+    if (res.exitCode !== 0) throw new Error(res.stderr || 'git checkout -- failed');
+    return inspectGitWorkspace(cwd, { signal });
+  }
+  if (op === 'stash') {
+    const flags = args.pop ? ['stash', 'pop'] : ['stash', 'push', ...(args.message ? ['-m', args.message] : [])];
+    const res = await runGit(cwd, flags, { signal });
+    if (res.exitCode !== 0) throw new Error(res.stderr || res.stdout || 'git stash failed');
+    return { operation: 'stash', output: res.stdout, status: await inspectGitWorkspace(cwd, { signal }) };
+  }
+  if (op === 'pull' || op === 'push') {
+    const res = await runGit(cwd, [op], { signal, timeout: 60000 });
+    if (res.exitCode !== 0) throw new Error(res.stderr || res.stdout || ('git ' + op + ' failed'));
+    return { operation: op, output: res.stdout || res.stderr, status: await inspectGitWorkspace(cwd, { signal }) };
   }
   if (op === 'stage') {
     const paths = Array.isArray(args.paths) && args.paths.length ? args.paths : [args.target || '.'];
@@ -395,7 +547,7 @@ export class ProcessManager {
     if (typeof command !== 'string' || !command.trim()) throw new Error('Provide a command to start.');
     const id = 'proc-' + crypto.randomUUID().slice(0, 8);
     const shellExe = process.platform === 'win32' ? 'powershell.exe' : 'sh';
-    const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-NonInteractive', '-Command', command] : ['-c', command];
+    const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(command)] : ['-c', command];
     const child = spawn(shellExe, shellArgs, {
       cwd: cwd || process.cwd(),
       windowsHide: true,
@@ -546,15 +698,27 @@ export async function fetchWebResource(urlInput, { extractText = true, offset = 
 
 export async function inspectSystemEnvironment(cwd) {
   const tools = {};
-  for (const [name, bin, arg] of [
-    ['node', process.execPath, '--version'],
-    ['git', 'git', '--version'],
-    ['python', 'python', '--version'],
-    ['gh', 'gh', '--version'],
+  const isWin = process.platform === 'win32';
+  const nodeDir = path.dirname(nodeExecutable());
+  const localDotnet = isWin ? path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'dotnet') : '';
+  const extraPaths = [nodeDir, localDotnet].filter(Boolean);
+  const envWithTools = {
+    ...process.env,
+    PATH: [...extraPaths, ...(process.env.PATH || '').split(path.delimiter)].filter(Boolean).join(path.delimiter),
+  };
+  for (const [name, bin, args, validator] of [
+    ['node', nodeExecutable(), ['--version'], v => /^v\d+/i.test(v)],
+    ['npm', isWin ? 'cmd.exe' : 'npm', isWin ? ['/c', 'npm.cmd', '--version'] : ['--version'], v => /^\d+\.\d+/.test(v)],
+    ['git', 'git', ['--version'], v => /git version/i.test(v)],
+    ['python', 'python', ['--version'], v => /^Python \d/i.test(v)],
+    ['gh', 'gh', ['--version'], v => /^gh version/i.test(v)],
+    ['dotnet', 'dotnet', ['--version'], v => /^\d+\.\d+/.test(v)],
+    ['rg', 'rg', ['--version'], v => /ripgrep/i.test(v)],
   ]) {
     try {
-      const { stdout } = await execFileAsync(bin, [arg], { timeout: 4000, windowsHide: true });
-      tools[name] = stdout.split(/\r?\n/)[0].trim();
+      const { stdout } = await execFileAsync(bin, args, { timeout: 4000, windowsHide: true, env: envWithTools });
+      const first = stdout.split(/\r?\n/)[0].trim();
+      tools[name] = first && (!validator || validator(first)) ? first : null;
     } catch {
       tools[name] = null;
     }
@@ -599,9 +763,11 @@ export async function extractCodeOutline(root, requestedPath = '.', { resolvePat
   const symbolPatterns = [
     { kind: 'export', regex: /^\s*export\s+(?:default\s+)?(?:async\s+)?(function|class|const|let|interface|type|enum)\s+([A-Za-z0-9_$]+)/ },
     { kind: 'function', regex: /^\s*(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/ },
-    { kind: 'class', regex: /^\s*class\s+([A-Za-z0-9_$]+)/ },
+    { kind: 'arrow', regex: /^(?:const|let)\s+([A-Za-z0-9_$]+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z0-9_$]+)\s*=>/ },
+    { kind: 'class', regex: /^\s*(?:public|internal|private|sealed|abstract)?\s*(?:static\s+)?class\s+([A-Za-z0-9_$]+)/ },
     { kind: 'def', regex: /^\s*(?:async\s+)?def\s+([A-Za-z0-9_]+)\s*\(/ },
-    { kind: 'struct/fn', regex: /^\s*(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait|func|type)\s+([A-Za-z0-9_]+)/ },
+    { kind: 'tool', regex: /^\s*def\(\s*['"]([A-Za-z0-9_-]+)['"]/ },
+    { kind: 'struct/fn', regex: /^\s*(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait|func|type|interface)\s+([A-Za-z0-9_]+)/ },
   ];
   const parseFile = async (filePath, relName) => {
     const fstat = await fs.stat(filePath);
@@ -673,13 +839,28 @@ export async function scaffoldMcpServer(store, mcp, { name, description = '', to
 
   const serverSource = `// Auto-generated NEXUS MCP Server: ${name.trim()}
 import readline from 'node:readline';
-import fs from 'node:fs/promises';
+import fsPromises from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
+// Hybrid fs helper: supports both async fs.promises AND common fsSync methods (existsSync, readFileSync, writeFileSync, etc.)
+const fs = Object.assign({}, fsPromises, {
+  existsSync: fsSync.existsSync,
+  readFileSync: fsSync.readFileSync,
+  writeFileSync: fsSync.writeFileSync,
+  appendFileSync: fsSync.appendFileSync,
+  mkdirSync: fsSync.mkdirSync,
+  readdirSync: fsSync.readdirSync,
+  statSync: fsSync.statSync,
+  rmSync: fsSync.rmSync,
+  unlinkSync: fsSync.unlinkSync,
+  copyFileSync: fsSync.copyFileSync,
+  promises: fsPromises,
+});
 
 const TOOLS = ${JSON.stringify(normalizedTools.map(({ name: tName, description: tDesc, inputSchema }) => ({ name: tName, description: tDesc, inputSchema })), null, 2)};
 
@@ -714,7 +895,7 @@ rl.on('line', async line => {
       const toolName = req.params?.name;
       const handler = HANDLERS[toolName];
       if (!handler) throw new Error('Unknown tool: ' + toolName);
-      const output = await handler(req.params?.arguments || {}, { fs, path, os, crypto, execFileAsync });
+      const output = await handler(req.params?.arguments || {}, { fs, fsSync, path, os, crypto, execFileAsync });
       const text = typeof output === 'string' ? output : JSON.stringify(output, null, 2);
       return send({ jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text }] } });
     }
@@ -726,10 +907,16 @@ rl.on('line', async line => {
 `;
 
   await fs.writeFile(scriptPath, serverSource, 'utf8');
+  try {
+    await execFileAsync(nodeExecutable(), ['--check', scriptPath], { timeout: 8000, windowsHide: true });
+  } catch (syntaxErr) {
+    const detail = String(syntaxErr.stderr || syntaxErr.message || 'Syntax error in handlerCode').trim().slice(0, 600);
+    throw new Error(`Generated MCP server failed syntax check (node --check). Fix handlerCode and retry:\n${detail}`);
+  }
   const serverConfig = {
     name: name.trim(),
     transport: 'stdio',
-    command: process.execPath,
+    command: nodeExecutable(),
     args: [scriptPath],
     envSecrets: {},
     description: String(description || 'Autonomous local MCP server').slice(0, 300),
@@ -741,14 +928,21 @@ rl.on('line', async line => {
   else store.state.mcpServers.push(serverConfig);
   store.save(null);
   let discoveredTools = normalizedTools.map(t => t.name);
+  let connected = false;
+  let connectionError = null;
   if (mcp) {
     try {
       const live = await mcp.list(serverConfig.name);
       discoveredTools = live.map(t => t.name);
-    } catch {}
+      connected = true;
+    } catch (err) {
+      connectionError = err?.message || String(err);
+    }
   }
   return {
     created: true,
+    connected,
+    ...(connectionError ? { connectionError } : {}),
     server: serverConfig.name,
     scriptPath,
     tools: discoveredTools,
@@ -798,12 +992,22 @@ export function runSelfImprovement(runtime, task, args = {}) {
   throw new Error('Unsupported self_improve action: ' + action);
 }
 
-export function expandSlashCommand(prompt = '') {
+export function expandSlashCommand(prompt = '', customCommands = []) {
   const trimmed = String(prompt || '').trim();
   if (!trimmed.startsWith('/')) return { prompt, mode: undefined };
   const [cmd, ...rest] = trimmed.split(/\s+/);
   const argText = rest.join(' ').trim();
-  switch (cmd.toLowerCase()) {
+  const cmdLower = cmd.toLowerCase();
+  if (Array.isArray(customCommands)) {
+    const custom = customCommands.find(item => item && typeof item.command === 'string' && ('/' + item.command.replace(/^\/+/, '').toLowerCase()) === cmdLower);
+    if (custom && typeof custom.template === 'string' && custom.template.trim()) {
+      const rendered = custom.template.includes('{{args}}')
+        ? custom.template.replaceAll('{{args}}', argText)
+        : (custom.template + (argText ? '\n\n' + argText : ''));
+      return { prompt: rendered, mode: custom.mode || undefined };
+    }
+  }
+  switch (cmdLower) {
     case '/init':
       return {
         mode: 'agent',
@@ -812,7 +1016,7 @@ export function expandSlashCommand(prompt = '') {
     case '/review':
       return {
         mode: 'explore',
-        prompt: `Run git_operation(diff) and git_operation(status) to inspect current workspace changes, then perform a thorough code and security review with severity ratings, file/line citations, and concrete fix recommendations.${argText ? ' Focus on: ' + argText : ''}`,
+        prompt: `Run git_operation(diff) and git_operation(status) to inspect current workspace changes, then perform a thorough code review with severity ratings, file/line citations, and concrete fix recommendations.${argText ? ' Focus on: ' + argText : ''}`,
       };
     case '/architect':
       return {
@@ -833,6 +1037,21 @@ export function expandSlashCommand(prompt = '') {
       return {
         mode: 'agent',
         prompt: `Run run_diagnostics on the workspace to check for syntax or type errors, then fix any reported issues.${argText ? ' Target: ' + argText : ''}`,
+      };
+    case '/explain':
+      return {
+        mode: 'explore',
+        prompt: `Inspect the relevant code using code_outline, grep_search, and read_file, then provide a clear architectural explanation with file and line references.${argText ? ' Subject: ' + argText : ''}`,
+      };
+    case '/fix':
+      return {
+        mode: 'agent',
+        prompt: `Investigate the root cause of the issue using grep_search, read_file, and run_diagnostics, implement a clean fix, and verify with tests.${argText ? ' Issue: ' + argText : ''}`,
+      };
+    case '/test':
+      return {
+        mode: 'agent',
+        prompt: `Inspect the codebase test setup, run the relevant test suite, diagnose any failures, and add focused tests for uncovered edge cases.${argText ? ' Target: ' + argText : ''}`,
       };
     default:
       return { prompt, mode: undefined };
@@ -908,13 +1127,18 @@ export async function runCodeDiagnostics(workspace, targetPath = '.', { resolveP
     const rel = path.relative(workspace, file).replace(/\\/g, '/');
     if (file.endsWith('.json')) {
       try {
-        JSON.parse(await fs.readFile(file, 'utf8'));
+        const rawJson = await fs.readFile(file, 'utf8');
+        const hasBom = rawJson.charCodeAt(0) === 0xFEFF;
+        JSON.parse(hasBom ? rawJson.slice(1) : rawJson);
+        if (hasBom) {
+          diagnostics.push({ file: rel, severity: 'warning', tool: 'json', message: 'UTF-8 BOM detected (valid JSON, though some tools reject BOMs; save as UTF-8 without BOM).' });
+        }
       } catch (err) {
         diagnostics.push({ file: rel, severity: 'error', tool: 'json', message: err.message });
       }
     } else if (/\.(mjs|cjs|js)$/i.test(file)) {
       try {
-        await execFileAsync(process.execPath, ['--check', file], { timeout: 8000, windowsHide: true });
+        await execFileAsync(nodeExecutable(), ['--check', file], { timeout: 8000, windowsHide: true });
       } catch (err) {
         const stderr = String(err.stderr || err.message || '').trim();
         const lineMatch = /:(\d+)\r?\n/.exec(stderr);
@@ -932,7 +1156,7 @@ export async function runCodeDiagnostics(workspace, targetPath = '.', { resolveP
     workspace,
     target: targetPath,
     checkedFiles: filesToCheck.length,
-    passed: diagnostics.length === 0,
+    passed: diagnostics.every(d => d.severity !== 'error'),
     diagnostics,
   };
 }
@@ -959,10 +1183,12 @@ export class StatefulShellManager {
       }
     }
     const marker = '__NEXUS_CWD_' + crypto.randomUUID().slice(0, 8) + '__';
+    const envMarker = '__NEXUS_ENV_' + crypto.randomUUID().slice(0, 8) + '__';
     const isWin = process.platform === 'win32';
+    const baseEnv = { ...process.env, ...session.env };
     const wrapped = isWin
-      ? `${commandText}\n$__code = $LASTEXITCODE\nWrite-Output "${marker}:$((Get-Location).Path)"\nif ($__code -ne $null) { exit $__code }`
-      : `${commandText}\n__code=$?\nprintf "\\n${marker}:%s\\n" "$(pwd)"\nexit $__code`;
+      ? wrapUtf8Ps(`${commandText}\n$__code = $LASTEXITCODE\nWrite-Output "${marker}:$((Get-Location).Path)"\n$__e = @{}; Get-ChildItem Env: | ForEach-Object { $__e[$_.Name] = $_.Value }\nWrite-Output ("${envMarker}:" + ($__e | ConvertTo-Json -Compress))\nif ($__code -ne $null) { exit $__code }`)
+      : `${commandText}\n__code=$?\nprintf "\\n${marker}:%s\\n" "$(pwd)"\nprintf "${envMarker}:"; env -0 | tr '\\0' '\\x1f'; printf "\\n"\nexit $__code`;
     const exe = isWin ? 'powershell.exe' : 'sh';
     const args = isWin ? ['-NoProfile', '-NonInteractive', '-Command', wrapped] : ['-c', wrapped];
 
@@ -970,7 +1196,7 @@ export class StatefulShellManager {
       if (signal?.aborted) return reject(new Error('Cancelled'));
       const child = spawn(exe, args, {
         cwd: session.cwd,
-        env: { ...process.env, ...session.env },
+        env: baseEnv,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -983,20 +1209,44 @@ export class StatefulShellManager {
       const timer = timeout > 0 ? setTimeout(stop, timeout) : null;
       signal?.addEventListener('abort', stop, { once: true });
       const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', stop); };
-      child.stdout.on('data', d => { stdout = (stdout + d).slice(-48000); });
+      child.stdout.on('data', d => { stdout = (stdout + d).slice(-128000); });
       child.stderr.on('data', d => { stderr = (stderr + d).slice(-24000); });
       child.on('error', err => { cleanup(); reject(err); });
       child.on('close', code => {
         cleanup();
         if (stopped) return reject(new Error('Stateful shell command stopped or timed out.'));
-        const markerRegex = new RegExp(`${marker}:([^\\r\\n]+)`);
+        const envRegex = new RegExp(`(?:\\r?\\n)?${envMarker}:([^\\r\\n]+)`);
+        const envMatch = envRegex.exec(stdout);
+        if (envMatch && envMatch[1]) {
+          stdout = stdout.replace(envRegex, '');
+          try {
+            if (isWin) {
+              const afterEnv = JSON.parse(envMatch[1]);
+              const baseLower = new Map(Object.entries(baseEnv).map(([k, v]) => [k.toLowerCase(), String(v ?? '')]));
+              for (const [k, v] of Object.entries(afterEnv)) {
+                const sv = String(v ?? '');
+                if (!baseLower.has(k.toLowerCase()) || baseLower.get(k.toLowerCase()) !== sv) {
+                  session.env[k] = sv;
+                }
+              }
+            } else {
+              for (const entry of envMatch[1].split('\x1f')) {
+                const eq = entry.indexOf('=');
+                if (eq <= 0) continue;
+                const k = entry.slice(0, eq), sv = entry.slice(eq + 1);
+                if (baseEnv[k] !== sv) session.env[k] = sv;
+              }
+            }
+          } catch {}
+        }
+        const markerRegex = new RegExp(`(?:\\r?\\n)?${marker}:([^\\r\\n]+)`);
         const match = markerRegex.exec(stdout);
         if (match && match[1]) {
           const nextCwd = match[1].trim();
           if (fsSync.existsSync(nextCwd)) session.cwd = nextCwd;
           stdout = stdout.replace(markerRegex, '').trimEnd();
         }
-        const combined = (stdout + (stderr ? '\n' + stderr : '')).trim();
+        const combined = (stdout.slice(-48000) + (stderr ? '\n' + stderr : '')).trim();
         session.history.push({ command: commandText, cwd: session.cwd, exitCode: code, at: new Date().toISOString() });
         if (session.history.length > 50) session.history.shift();
         resolve({ exitCode: code, cwd: session.cwd, envKeys: Object.keys(session.env), output: combined });
@@ -1053,4 +1303,136 @@ export async function inspectWebPage(urlInput, { extractLinks = true, extractFor
     links,
     forms,
   };
+}
+
+export async function buildDirectoryTree(root, requestedPath = '.', { maxDepth = 4, maxEntries = 250, resolvePath, signal } = {}) {
+  const target = resolvePath ? await resolvePath(root, requestedPath, false) : path.resolve(root, requestedPath);
+  const depthCap = Math.max(1, Math.min(Number(maxDepth) || 4, 8));
+  const entryCap = Math.max(10, Math.min(Number(maxEntries) || 250, 800));
+  const lines = [];
+  let count = 0;
+  let truncated = false;
+
+  const walk = async (dir, depth, prefix) => {
+    signal?.throwIfAborted();
+    if (depth > depthCap || count >= entryCap) return;
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    const filtered = entries
+      .filter(e => !e.isSymbolicLink() && !IGNORED_DIRS.has(e.name))
+      .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+    for (let i = 0; i < filtered.length; i++) {
+      if (count >= entryCap) { truncated = true; return; }
+      const entry = filtered[i];
+      const isLast = i === filtered.length - 1;
+      const connector = isLast ? '└── ' : '├── ';
+      lines.push(`${prefix}${connector}${entry.name}${entry.isDirectory() ? '/' : ''}`);
+      count++;
+      if (entry.isDirectory() && depth < depthCap) {
+        await walk(path.join(dir, entry.name), depth + 1, prefix + (isLast ? '    ' : '│   '));
+      }
+    }
+  };
+
+  lines.push(`${requestedPath || '.'}/`);
+  await walk(target, 1, '');
+  return { root: requestedPath || '.', count, truncated, tree: lines.join('\n') };
+}
+
+export async function deleteFileWithBackup(store, task, target, requestedPath, reason = 'Delete file') {
+  const stat = await fs.stat(target);
+  if (!stat.isFile()) throw new Error('delete_file only supports files (use run_command for directories).');
+  const previous = stat.size <= 5 * 1024 * 1024 ? await fs.readFile(target, 'utf8') : null;
+  let backup = null;
+  if (previous !== null) {
+    backup = path.join(store.directoryFor(task.id), 'backup-' + crypto.randomUUID() + '.txt');
+    await fs.writeFile(backup, previous, 'utf8');
+  }
+  const diffInfo = previous !== null ? createUnifiedDiff(previous, '', requestedPath) : { diff: '', addedLines: 0, removedLines: 0 };
+  store.journal(task, 'write_intent', { path: target, reason, backup, existed: true, deleted: true });
+  await fs.rm(target, { force: true });
+  store.journal(task, 'file_change', { path: target, reason, backup, bytes: 0, deleted: true, removedLines: diffInfo.removedLines });
+  return { deleted: requestedPath, written: requestedPath, backup, ...diffInfo };
+}
+
+export async function moveFileWithBackup(store, task, source, dest, reqSource, reqDest, reason = 'Move/rename file') {
+  const stat = await fs.stat(source);
+  if (!stat.isFile()) throw new Error('move_file requires a source file.');
+  const previous = stat.size <= 5 * 1024 * 1024 ? await fs.readFile(source, 'utf8') : null;
+  let backup = null;
+  if (previous !== null) {
+    backup = path.join(store.directoryFor(task.id), 'backup-' + crypto.randomUUID() + '.txt');
+    await fs.writeFile(backup, previous, 'utf8');
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  store.journal(task, 'write_intent', { path: dest, from: source, reason, backup });
+  await fs.rename(source, dest);
+  store.journal(task, 'file_change', { path: dest, from: source, reason, backup, bytes: stat.size });
+  return { moved: true, from: reqSource, to: reqDest, written: reqDest, backup };
+}
+
+export async function searchWebDuckDuckGo(query, { maxResults = 8, request = fetch, signal } = {}) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('Provide a non-empty search query.');
+  const limit = Math.max(1, Math.min(Number(maxResults) || 8, 15));
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  const clean = s => String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+
+  // 1. Primary: DuckDuckGo HTML (skip HTTP 202 anti-bot challenge)
+  let engine = 'duckduckgo';
+  const results = [];
+  try {
+    const url = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q);
+    const res = await request(url, {
+      headers: browserHeaders,
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+    });
+    if (res.status === 200) {
+      const html = await res.text();
+      const blockRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>)?/gi;
+      for (const m of html.matchAll(blockRe)) {
+        if (results.length >= limit) break;
+        let href = m[1];
+        try {
+          const parsed = new URL(href, 'https://duckduckgo.com');
+          const uddg = parsed.searchParams.get('uddg');
+          if (uddg) href = decodeURIComponent(uddg);
+          else href = parsed.href;
+        } catch {}
+        if (!/^https?:\/\//i.test(href)) continue;
+        results.push({ title: clean(m[2]), url: href, snippet: clean(m[3] || m[4] || '') });
+      }
+    }
+  } catch {}
+
+  // 2. Fallback: Bing RSS XML (zero-CAPTCHA structured results when DuckDuckGo returns 202 or 0)
+  if (!results.length) {
+    engine = 'bing-rss';
+    try {
+      const bingUrl = 'https://www.bing.com/search?format=rss&q=' + encodeURIComponent(q);
+      const res = await request(bingUrl, {
+        headers: browserHeaders,
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      });
+      if (res.status === 200) {
+        const xml = await res.text();
+        for (const m of xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)) {
+          if (results.length >= limit) break;
+          const block = m[1];
+          const title = clean(/<title>([\s\S]*?)<\/title>/i.exec(block)?.[1] || '');
+          const link = clean(/<link>([\s\S]*?)<\/link>/i.exec(block)?.[1] || '');
+          const snippet = clean(/<description>([\s\S]*?)<\/description>/i.exec(block)?.[1] || '');
+          if (title && /^https?:\/\//i.test(link)) {
+            results.push({ title, url: link, snippet });
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return { query: q, engine, count: results.length, results };
 }

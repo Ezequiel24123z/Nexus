@@ -1,24 +1,108 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { baseTools, executeTool, READ_ONLY_TOOL_NAMES } from './tools.mjs';
-import { ProcessManager, StatefulShellManager, discoverWorkspaceInstructions, expandSlashCommand } from './coding-engine.mjs';
+import { ProcessManager, StatefulShellManager, discoverWorkspaceInstructions, expandSlashCommand, revertFileBackup } from './coding-engine.mjs';
 import { aggregateUsage, normalizeUsage } from './telemetry.mjs';
-import {citationsFromAnnotations, readCompletionStream} from './stream.mjs';
-import {hydrateAttachmentReferences, materializeImageAttachment, materializeToolResult} from './artifacts.mjs';
+import {citationsFromAnnotations, readCompletionStream, readAnthropicStream, normalizeAnthropicResponse} from './stream.mjs';
+import {hydrateAttachmentReferences, materializeImageAttachment, materializeToolResult, saveRawArtifact} from './artifacts.mjs';
 import {AttachmentStore,attachmentMessage} from './attachments.mjs';
 import {ResponseJournal} from './response-journal.mjs';
 import {validateChatOptions, agentModes} from './chat-options.mjs';
 import {requestTools,affinitySession} from './model-request.mjs';
 import {CapabilityLibrary} from './capabilities.mjs';
+import {PluginManager, discoverWorkspaceSkills} from './plugins.mjs';
 import {openApiRequest,validateOpenApiConnector} from './openapi.mjs';
-import {modelConnection,completionRequest} from './providers.mjs';
-import {isNetworkFailure,retryableNetworkFailure,networkFailure,providerHttpFailure} from './provider-errors.mjs';
+import {modelConnection,completionRequest,allProviders,resolveCopilotAuth} from './providers.mjs';
+import {isNetworkFailure,retryableNetworkFailure,networkFailure,providerHttpFailure,extractSafeProviderDetail} from './provider-errors.mjs';
 import {setTimeout as retryDelay} from 'node:timers/promises';
 
-const externalEffects=new Set(['write_file','replace_text','multi_edit','apply_patch','run_command','git_operation','manage_process','invoke_mcp','invoke_connector','desktop_action','create_connector','save_capability']);
+const externalEffects=new Set(['write_file','replace_text','multi_edit','apply_patch','delete_file','move_file','run_command','shell_session','git_operation','manage_process','invoke_mcp','invoke_connector','http_request','desktop_action','create_connector','save_capability','scaffold_mcp_server','manage_automation','create_dynamic_tool']);
 
-// Only retain explicit provider summaries; never resend literal hidden reasoning.
-export const reasoningToText = details => Array.isArray(details) ? details.map(item => item?.summary || '').filter(Boolean).join('\n\n') : '';
+const RISKY_COMMAND_RE = /\b(rm|rmdir|del|erase|remove-item|format|diskpart|stop-process|taskkill|shutdown|restart-computer|netsh|icacls|takeown|bcdedit|invoke-expression|iex|chmod|chown|runas|sudo|reg\s+(add|delete)|git\s+(push|reset\s+--hard|clean\s+-f)|npm\s+publish)\b|\|\s*(sh|bash|powershell|iex)\b/i;
+
+export function matchesSemiAutoRule(rule, name, args = {}) {
+  const raw = String(rule || '').trim();
+  if (!raw) return false;
+  const targetDetail = String(args?.command || args?.operation || args?.path || args?.to || args?.url || (args?.server ? `${args.server}:${args.tool || ''}` : '') || '');
+  const composite = `${name}:${targetDetail}`;
+  if (raw.startsWith('/') && raw.lastIndexOf('/') > 0) {
+    const last = raw.lastIndexOf('/');
+    try {
+      const re = new RegExp(raw.slice(1, last), raw.slice(last + 1) || 'i');
+      return re.test(composite) || re.test(targetDetail) || re.test(name);
+    } catch { return false; }
+  }
+  if (!raw.includes(':')) {
+    return raw.toLowerCase() === name.toLowerCase();
+  }
+  const [ruleTool, ...rest] = raw.split(':');
+  const needle = rest.join(':').trim().toLowerCase();
+  if (ruleTool.trim() !== '*' && ruleTool.trim().toLowerCase() !== name.toLowerCase()) return false;
+  return !needle || targetDetail.toLowerCase().includes(needle);
+}
+
+export function suggestAllowPattern(name, args = {}) {
+  if (['run_command', 'shell_session', 'manage_process'].includes(name)) {
+    const head = String(args?.command || '').trim().split(/\s+/).slice(0, 2).join(' ');
+    return head ? `${name}:${head}` : name;
+  }
+  if (name === 'git_operation' && args?.operation) return `git_operation:${args.operation}`;
+  if (name === 'invoke_mcp' && args?.server) return `invoke_mcp:${args.server}:${args.tool || ''}`;
+  if ((name === 'http_request' || name === 'invoke_connector') && args?.url) {
+    try { return `${name}:${new URL(args.url).hostname}`; } catch { return name; }
+  }
+  return name;
+}
+
+export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
+  const denyRules = Array.isArray(settings?.semiAutoDenyRules) ? settings.semiAutoDenyRules : [];
+  for (const rule of denyRules) {
+    if (matchesSemiAutoRule(rule, name, args)) {
+      return { risky: true, reason: `Matched deny rule (${rule})` };
+    }
+  }
+  const allowRules = Array.isArray(settings?.semiAutoAllowRules) ? settings.semiAutoAllowRules : [];
+  for (const rule of allowRules) {
+    if (matchesSemiAutoRule(rule, name, args)) {
+      return { risky: false, reason: '' };
+    }
+  }
+  if (READ_ONLY_TOOL_NAMES.has(name) || ['document_progress', 'todo_write', 'memory_store', 'search_capabilities', 'get_capability', 'get_connector'].includes(name)) {
+    return { risky: false, reason: '' };
+  }
+  if (['delete_file', 'desktop_action', 'scaffold_mcp_server', 'create_connector', 'manage_automation'].includes(name)) {
+    return { risky: true, reason: `High-impact tool (${name})` };
+  }
+  if (name === 'invoke_mcp') {
+    return { risky: true, reason: `External MCP tool (${args?.server || 'server'}:${args?.tool || 'tool'})` };
+  }
+  if (name === 'git_operation' && ['push', 'discard', 'worktree_remove', 'commit'].includes(args?.operation)) {
+    return { risky: true, reason: `Git mutation (${args.operation})` };
+  }
+  if ((name === 'http_request' || name === 'invoke_connector') && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(args?.method || 'POST').toUpperCase())) {
+    return { risky: true, reason: `External HTTP ${args?.method || 'mutation'}` };
+  }
+  if (['run_command', 'shell_session', 'manage_process'].includes(name)) {
+    const cmd = String(args?.command || '');
+    if (RISKY_COMMAND_RE.test(cmd)) {
+      return { risky: true, reason: 'Potentially destructive or elevated shell command' };
+    }
+    return { risky: false, reason: '' };
+  }
+  if (['write_file', 'replace_text', 'multi_edit', 'apply_patch', 'move_file'].includes(name)) {
+    const targetPath = String(args?.path || args?.to || '');
+    if (task?.workspace && targetPath && /^(?:[A-Za-z]:\\|\/|\.\.)/.test(targetPath)) {
+      return { risky: true, reason: `File write outside workspace (${targetPath})` };
+    }
+    return { risky: false, reason: '' };
+  }
+  return { risky: false, reason: '' };
+}
+
+// Extract readable reasoning text/summaries for local UI display; scrubMessages() always strips reasoning_details before outbound model calls.
+export const reasoningToText = details => Array.isArray(details)
+  ? details.filter(item => item && item.type !== 'reasoning.encrypted').map(item => item?.summary || item?.text || item?.plain || '').filter(Boolean).join('\n\n')
+  : '';
 
 export const estimateTokens = (value, bytesPerToken = 3) => {
   let images = 0;
@@ -39,11 +123,30 @@ export class Runtime extends EventEmitter {
     this.attachments=new AttachmentStore(store);
     this.processes=new ProcessManager();
     this.shells=new StatefulShellManager();
+    this.plugins=new PluginManager(store.directory);
   }
-  changed(task=undefined) { this.store.save(task); this.emit('change'); }
+  changed(task=undefined, { immediate = false } = {}) {
+    try {
+      if (!immediate && task && this.active.has(task.id)) this.store.scheduleSave(task);
+      else this.store.save(task);
+    } catch (err) { console.error('NEXUS store.save error:', err?.message || err); }
+    this.emit('change');
+  }
+  emitDelta(task) {
+    if (!task) return;
+    this.emit('delta', {
+      taskId: task.id,
+      status: task.status,
+      compacting: this.compacting.has(task.id),
+      liveText: task.liveText || '',
+      liveReasoning: task.liveReasoning || '',
+      liveActivity: task.liveActivity || '',
+      liveTools: task.liveTools || [],
+      liveSubagents: task.liveSubagents || [],
+    });
+  }
   get capabilities(){return this._capabilities ||= new CapabilityLibrary(this.store.directory);}
   snapshot(activeTaskId=undefined) {
-    const compressionThreshold=this.store.state.settings.contextWindow*this.store.state.settings.compressionPercent/100;
     const conn=modelConnection(this.store.state.settings.model,this.store.state.settings);
     return {
       ...this.store.state,
@@ -51,28 +154,24 @@ export class Runtime extends EventEmitter {
       connectorCount:this.store.state.connectors.length,
       memories:activeTaskId===undefined?(this.store.state.memories||[]):[],
       memoryCount:(this.store.state.memories||[]).length,
+      automations:this.store.state.automations||[],
       capabilities:this._capabilities?.summary()||{total:0,skills:0,functions:0,revision:0,damaged:0},
       mcpStatus:this.mcp?.status({compact:activeTaskId!==undefined}) || {},
       tasks: this.store.state.tasks.map(task => {
         if(activeTaskId!==undefined&&task.id!==activeTaskId)return {
-          id:task.id,title:task.title,prompt:task.prompt,projectId:task.projectId,workspace:task.workspace,
-          status:task.status,model:task.model,agentMode:task.agentMode,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,
+          id:task.id,title:task.title,prompt:task.prompt,projectId:task.projectId,parentTaskId:task.parentTaskId||null,workspace:task.workspace,
+          status:task.status,model:task.model,agentMode:task.agentMode,arenaGroupId:task.arenaGroupId||null,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,
           compacting:this.compacting.has(task.id),summaryOnly:true
         };
         const conversationStart=Math.max(0,task.conversation.length-120),eventsStart=Math.max(0,task.events.length-80);
         const contextTokens=task.contextTokens || 0;
-        return {...task,messages:undefined,pendingImages:undefined,compacting:this.compacting.has(task.id),todos:task.todos||[],calls:(task.calls||[]).slice(-80),callsTotal:(task.calls||[]).length,callsStart:Math.max(0,(task.calls||[]).length-80),effects:(task.effects||[]).slice(-60),effectsTotal:(task.effects||[]).length,events:task.events.slice(eventsStart),eventsStart,eventsTotal:task.events.length,conversation:task.conversation.slice(conversationStart),conversationStart,conversationTotal:task.conversation.length,contextTokens,needsCompression:contextTokens>=compressionThreshold};
+        const effectiveWindow=task.contextWindow || this.store.state.settings.contextWindow;
+        const compressionThreshold=effectiveWindow*this.store.state.settings.compressionPercent/100;
+        return {...task,messages:undefined,pendingImages:undefined,compacting:this.compacting.has(task.id),todos:task.todos||[],liveTools:task.liveTools||[],liveSubagents:task.liveSubagents||[],calls:(task.calls||[]).slice(-80),callsTotal:(task.calls||[]).length,callsStart:Math.max(0,(task.calls||[]).length-80),effects:(task.effects||[]).slice(-60),effectsTotal:(task.effects||[]).length,events:task.events.slice(eventsStart),eventsStart,eventsTotal:task.events.length,conversation:task.conversation.slice(conversationStart),conversationStart,conversationTotal:task.conversation.length,contextTokens,needsCompression:contextTokens>=compressionThreshold};
       }),
-      approvals: [...this.approvals].filter(([,item])=>activeTaskId===undefined||item.taskId===activeTaskId).map(([id, item]) => ({ id, taskId: item.taskId, name: item.name, args: item.args })),
+      approvals: [...this.approvals].filter(([,item])=>activeTaskId===undefined||item.taskId===activeTaskId).map(([id, item]) => ({ id, taskId: item.taskId, name: item.name, args: item.args, reason: item.reason || '', suggestedPattern: item.suggestedPattern || item.name })),
       hasKey: Boolean(conn.optionalKey || this.getSecret(conn.key)),
-      providerKeys:{
-        arliai:Boolean(this.getSecret('ARLIAI_API_KEY')),
-        openrouter:Boolean(this.getSecret('OPENROUTER_API_KEY')),
-        openai:Boolean(this.getSecret('OPENAI_API_KEY')),
-        copilot:Boolean(this.getSecret('GITHUB_COPILOT_TOKEN')),
-        anthropic:Boolean(this.getSecret('ANTHROPIC_API_KEY')),
-        custom:true,
-      }
+      providerKeys: Object.fromEntries(allProviders(this.store.state.settings).map(p => [p.id, Boolean(p.optionalKey || this.getSecret(p.key))])),
     };
   }
   page(id, collection, before, limit) {
@@ -85,22 +184,25 @@ export class Runtime extends EventEmitter {
     const start=Math.max(0,before-limit);
     return {items:values.slice(start,before),start,total:values.length,hasMore:start>0};
   }
-  create({ prompt, workspace = '', model, agentMode, dependsOn = [], title, projectId, attachmentIds=[] }) {
+  create({ prompt, workspace = '', model, agentMode, dependsOn = [], title, projectId, parentTaskId = null, notifyParentOnIdle = false, attachmentIds=[], arenaGroupId = null, temperature = undefined, systemPromptOverride = '' }) {
     const attachments=this.attachments.resolve(attachmentIds);
     if(!prompt?.trim()&&attachments.length)prompt='Analyze the attached files.';
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 100000) throw new Error('Describe a task of up to 100,000 characters.');
     if (!Array.isArray(dependsOn) || dependsOn.some(id => !this.store.state.tasks.some(t => t.id === id))) throw new Error('Invalid task dependency.');
     const project = projectId && this.store.state.projects.find(p=>p.id===projectId);
     if(projectId && !project)throw new Error('Project not found');
-    workspace = project?.workspace || workspace;
-    const expanded = expandSlashCommand(prompt);
+    workspace = workspace || project?.workspace || '';
+    const expanded = expandSlashCommand(prompt, this.store.state.settings.customCommands);
     const effectivePrompt = expanded.prompt;
     const effectiveMode = agentMode || expanded.mode;
     if(effectiveMode!==undefined && !agentModes.includes(effectiveMode))throw new Error('Invalid agent mode.');
     const chosenModel = model || this.store.state.settings.model;
-    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), prompt: effectivePrompt, workspace, projectId:projectId || null, engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
+    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), prompt: effectivePrompt, workspace, projectId:projectId || null, parentTaskId: parentTaskId || null, notifyParentOnIdle: Boolean(notifyParentOnIdle), engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
       ...(effectiveMode ? { agentMode: effectiveMode } : {}),
-      dependsOn, attachments, status: 'queued', createdAt: new Date().toISOString(), messages: [], conversation: [], events: [], effects: [], todos: [], summary: '', compressions: 0, steps: 0, contextTokens: 0 };
+      ...(arenaGroupId ? { arenaGroupId } : {}),
+      ...(typeof temperature === 'number' ? { temperature } : {}),
+      ...(systemPromptOverride ? { systemPromptOverride } : {}),
+      dependsOn, attachments, status: 'queued', createdAt: new Date().toISOString(), messages: [], conversation: [], events: [], effects: [], todos: [], liveTools: [], liveSubagents: [], summary: '', compressions: 0, steps: 0, contextTokens: 0 };
     if (!task.model) throw new Error('Select a model in Settings.');
     if(!task.workspace&&attachments.length)task.workspace=this.attachments.workspace(task.id);
     this.store.state.tasks.unshift(task);
@@ -117,7 +219,36 @@ export class Runtime extends EventEmitter {
         s[key] = Math.round(input[key]);
       }
     }
-    for (const key of ['autonomous','autoWorkspaceWrites','desktopEnabled','streaming','cacheAffinity']) if (typeof input[key] === 'boolean') s[key] = input[key];
+    for (const [key,min,max] of [['temperature',0,2],['topP',0,1],['presencePenalty',-2,2],['frequencyPenalty',-2,2]]) {
+      if (input[key] !== undefined) {
+        if (input[key] === null || input[key] === '') s[key] = null;
+        else if (typeof input[key] === 'number' && Number.isFinite(input[key]) && input[key] >= min && input[key] <= max) s[key] = input[key];
+        else throw new Error('Invalid setting: ' + key);
+      }
+    }
+    if (input.seed !== undefined) {
+      if (input.seed === null || input.seed === '') s.seed = null;
+      else if (Number.isInteger(input.seed)) s.seed = input.seed;
+      else throw new Error('Invalid seed.');
+    }
+    for (const key of ['extraBody','extraHeaders']) {
+      if (input[key] !== undefined) {
+        if (input[key] === null) s[key] = null;
+        else if (typeof input[key] === 'object' && !Array.isArray(input[key])) s[key] = input[key];
+        else throw new Error('Invalid JSON object for ' + key);
+      }
+    }
+    for (const key of ['autonomous','autoWorkspaceWrites','desktopEnabled','streaming','cacheAffinity','promptCaching','lazyToolLoading','microCompaction','silentToolSteps','minimizeToTray','browserPersistentProfile','browserBlockTrackers','browserAntiFingerprint','browserRouteAgentTraffic']) if (typeof input[key] === 'boolean') s[key] = input[key];
+    for (const ruleKey of ['semiAutoAllowRules', 'semiAutoDenyRules']) {
+      if (input[ruleKey] !== undefined) {
+        if (!Array.isArray(input[ruleKey]) || input[ruleKey].length > 200) throw new Error('Invalid ' + ruleKey);
+        s[ruleKey] = [...new Set(input[ruleKey].map(x => String(x || '').trim()).filter(Boolean).slice(0, 200))];
+      }
+    }
+    if(input.browserProxyMode!==undefined&&['direct','managed-tor','tor','custom','socks5','http'].includes(input.browserProxyMode))s.browserProxyMode=input.browserProxyMode;
+    if(typeof input.browserProxyUrl==='string'&&input.browserProxyUrl.length<=300)s.browserProxyUrl=input.browserProxyUrl.trim();
+    if(input.browserSearchEngine!==undefined&&['duckduckgo','startpage','brave','qwant','searxng'].includes(input.browserSearchEngine))s.browserSearchEngine=input.browserSearchEngine;
+    if(typeof input.browserSearxUrl==='string'&&input.browserSearxUrl.length<=300)s.browserSearxUrl=input.browserSearxUrl.trim();
     if(input.reasoningEffort!==undefined){
       if(!['auto','none','minimal','low','medium','high','xhigh','max'].includes(input.reasoningEffort))throw new Error('Invalid reasoning effort level');
       s.reasoningEffort=input.reasoningEffort;
@@ -125,6 +256,12 @@ export class Runtime extends EventEmitter {
     if(input.providerRouting!==undefined){
       if(!['auto','price','throughput','latency'].includes(input.providerRouting))throw new Error('Invalid provider routing preference');
       s.providerRouting=input.providerRouting;
+    }
+    if(input.providerOrder!==undefined){
+      if(input.providerOrder===null||input.providerOrder==='')s.providerOrder=[];
+      else if(Array.isArray(input.providerOrder))s.providerOrder=input.providerOrder.map(x=>String(x).trim()).filter(Boolean).slice(0,12);
+      else if(typeof input.providerOrder==='string')s.providerOrder=input.providerOrder.split(',').map(x=>x.trim()).filter(Boolean).slice(0,12);
+      else throw new Error('Invalid provider order');
     }
     if(input.agentMode!==undefined){
       if(!agentModes.includes(input.agentMode))throw new Error('Invalid agent mode');
@@ -134,6 +271,11 @@ export class Runtime extends EventEmitter {
       const u=new URL(input.customBaseUrl.trim());
       if(!['http:','https:'].includes(u.protocol))throw new Error('Invalid custom endpoint URL');
       s.customBaseUrl=input.customBaseUrl.trim().replace(/\/+$/,'');
+    }
+    if(typeof input.copilotBaseUrl==='string'&&input.copilotBaseUrl.trim()){
+      const u=new URL(input.copilotBaseUrl.trim());
+      if(!['http:','https:'].includes(u.protocol))throw new Error('Invalid Copilot endpoint URL');
+      s.copilotBaseUrl=input.copilotBaseUrl.trim().replace(/\/+$/,'');
     }
     if(typeof input.webSearchEnabled==='boolean')s.webSearchEnabled=input.webSearchEnabled;
     if(input.webSearchEngine!==undefined){
@@ -147,26 +289,92 @@ export class Runtime extends EventEmitter {
     if(typeof input.globalInstructions === 'string')s.globalInstructions=input.globalInstructions;
     if (typeof input.model === 'string' && input.model.length < 180) s.model = input.model;
     if(input.favoriteModels!==undefined){if(!Array.isArray(input.favoriteModels)||input.favoriteModels.length>100||input.favoriteModels.some(id=>typeof id!=='string'||!id.trim()||id.length>180))throw new Error('Invalid favorite models list.');s.favoriteModels=[...new Set(input.favoriteModels.map(id=>id.trim()))];}
+    if(input.customProviders!==undefined){
+      if(!Array.isArray(input.customProviders)||input.customProviders.length>50)throw new Error('Invalid customProviders list.');
+      s.customProviders=input.customProviders.filter(p=>p&&typeof p.id==='string'&&/^[a-z0-9][a-z0-9_-]{0,31}$/i.test(p.id)&&typeof p.baseUrl==='string'&&p.baseUrl.trim()).map(p=>({
+        id:p.id.toLowerCase(),name:String(p.name||p.id).slice(0,80),baseUrl:String(p.baseUrl).trim().replace(/\/+$/,''),
+        apiFormat:p.apiFormat==='anthropic'?'anthropic':'openai',keyName:p.keyName||('PROVIDER_'+p.id.toUpperCase().replace(/[^A-Z0-9_]/g,'_')+'_KEY'),
+        optionalKey:p.optionalKey!==false,defaultModel:String(p.defaultModel||'').slice(0,120),
+        headers:p.headers&&typeof p.headers==='object'&&!Array.isArray(p.headers)?p.headers:{},
+      }));
+    }
+    if(input.customCommands!==undefined){
+      if(!Array.isArray(input.customCommands)||input.customCommands.length>100)throw new Error('Invalid customCommands list.');
+      s.customCommands=input.customCommands.filter(c=>c&&typeof c.command==='string'&&c.command.trim()&&typeof c.template==='string'&&c.template.trim()).map(c=>({
+        command:'/'+c.command.trim().replace(/^\/+/,''),
+        description:String(c.description||'Custom slash command').slice(0,200),
+        template:c.template,
+        mode:agentModes.includes(c.mode)?c.mode:undefined,
+      }));
+    }
+    if(input.disabledTools!==undefined){
+      if(!Array.isArray(input.disabledTools))throw new Error('Invalid disabledTools list.');
+      s.disabledTools=[...new Set(input.disabledTools.filter(x=>typeof x==='string'))];
+    }
+    if(typeof input.customCss==='string'&&input.customCss.length<=100000)s.customCss=input.customCss;
+    if(typeof input.accentColor==='string'&&input.accentColor.length<=40)s.accentColor=input.accentColor.trim();
+    if(typeof input.globalHotkey==='string'&&input.globalHotkey.length<=40)s.globalHotkey=input.globalHotkey.trim();
     this.store.state.settings=s;
+    this.configFile?.writeSettings(s);
     this.changed(null); this.schedule();
   }
   schedule() {
     if (this.closed) return;
     for (const task of [...this.store.state.tasks].reverse()) {
-      if (this.active.size >= this.store.state.settings.concurrency) break;
+      const isActiveNestedChild = Boolean(task.parentTaskId && this.active.has(task.parentTaskId));
+      const effectiveLimit = isActiveNestedChild
+        ? Math.max(this.store.state.settings.concurrency, 4)
+        : this.store.state.settings.concurrency;
+      if (this.active.size >= effectiveLimit) continue;
       if (task.status !== 'queued') continue;
       if (this.compacting.has(task.id)) continue;
       const dependencies = task.dependsOn.map(id => this.store.task(id));
       if (dependencies.some(t => t.status !== 'complete')) continue;
-      if (task.workspace && [...this.active.keys()].some(id => this.store.task(id).workspace.toLowerCase() === task.workspace.toLowerCase())) continue;
+      if (task.workspace && [...this.active.keys()].some(id => {
+        const other = this.store.task(id);
+        if (!other.workspace || other.workspace.toLowerCase() !== task.workspace.toLowerCase()) return false;
+        // Allow nested session trees (parent/child/siblings) and Arena peers to run concurrently in the same project root
+        if (task.parentTaskId && (other.id === task.parentTaskId || other.parentTaskId === task.parentTaskId)) return false;
+        if (other.parentTaskId === task.id) return false;
+        if (task.arenaGroupId && other.arenaGroupId === task.arenaGroupId) return false;
+        return true;
+      })) continue;
       const controller = new AbortController();
       this.active.set(task.id, controller); task.status = 'running'; task.error = null;
       this.changed(task);
       void this.run(task, controller.signal).catch(error => {
         task.status = controller.signal.aborted ? 'paused' : 'failed';
         task.error = error.message;
-        this.store.journal(task, 'stopped', { reason: error.message });
-      }).finally(() => { this.active.delete(task.id); task.liveText='';task.liveReasoning='';task.liveActivity='';if(this.desktopOwner===task.id)this.desktopOwner=null; if(task.status==='complete'&&task.pendingFollowups>0){task.status='queued';task.error=null;} this.changed(task); this.schedule(); });
+        try { this.store.journal(task, 'stopped', { reason: error.message }); } catch {}
+      }).finally(() => {
+        try {
+          this.active.delete(task.id);
+          task.liveText='';task.liveReasoning='';task.liveActivity='';task.liveTools=[];task.liveSubagents=[];
+          if(this.desktopOwner===task.id)this.desktopOwner=null;
+          if(task.status==='complete'&&task.pendingFollowups>0){task.status='queued';task.error=null;}
+          if(task.status==='complete') this.emit('notify', { title: 'NEXUS · Task Complete', body: task.title });
+          // Auto-handoff nested child session completion back to its parent orchestrator
+          if (task.parentTaskId && task.notifyParentOnIdle && ['complete', 'failed'].includes(task.status)) {
+            const parent = this.store.state.tasks.find(t => t.id === task.parentTaskId);
+            if (parent) {
+              const summary = task.status === 'complete'
+                ? String(task.result || task.conversation.findLast(m => m.role === 'assistant')?.content || '(Completed without text)').slice(0, 4000)
+                : `Failed with error: ${task.error || 'Unknown error'}`;
+              const handoff = `[Nested child session "${task.title}" (${task.id}) finished (${task.status})]:\n${summary}`;
+              this.store.journal(parent, 'child_session_handoff', { childId: task.id, title: task.title, status: task.status });
+              if (this.active.has(parent.id) || this.compacting.has(parent.id)) {
+                this.followup(parent, handoff);
+              } else {
+                this.resume(parent.id, handoff);
+              }
+            }
+          }
+          this.changed(task);
+          this.schedule();
+        } catch (err) {
+          console.error('NEXUS schedule finalize error:', err?.message || err);
+        }
+      });
     }
   }
   updateChat(input){
@@ -174,10 +382,197 @@ export class Runtime extends EventEmitter {
     if(Object.keys(options).some(key=>options[key]!==task[key])&&(this.active.has(task.id)||this.compacting.has(task.id)))throw new Error('Pause the task and wait for the active call to finish before changing model, mode, or thinking.');
     if(input.projectId&& !this.store.state.projects.some(project=>project.id===input.projectId))throw new Error('Project not found');
     Object.assign(task,options);
+    if(options.model)task.engine=modelConnection(options.model,this.store.state.settings).id;
     if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim();
     if(typeof input.pinned==='boolean')task.pinned=input.pinned;
     if(input.projectId!==undefined)task.projectId=input.projectId||null;
+    if(typeof input.workspace==='string')task.workspace=input.workspace;
     this.changed(task);return true;
+  }
+  deleteTask(id) {
+    const task = this.store.task(id);
+    this.active.get(id)?.abort();
+    this.compressionControllers.get(id)?.abort();
+    for (const [approvalId, pending] of [...this.approvals.entries()]) {
+      if (pending.taskId === id) { this.approvals.delete(approvalId); try { pending.resolve(false); } catch {} }
+    }
+    this.store.state.tasks = this.store.state.tasks.filter(t => t.id !== id);
+    for (const other of this.store.state.tasks) {
+      if (Array.isArray(other.dependsOn) && other.dependsOn.includes(id)) {
+        other.dependsOn = other.dependsOn.filter(dep => dep !== id);
+      }
+    }
+    this.changed(null);
+    return { deleted: true, id: task.id };
+  }
+  forkTask(id, messageId) {
+    const source = this.store.task(id);
+    const convIdx = messageId ? source.conversation.findIndex(m => m.id === messageId) : source.conversation.length - 1;
+    const slicedConv = convIdx >= 0 ? source.conversation.slice(0, convIdx + 1) : [...source.conversation];
+    const clonedConv = slicedConv.map(m => ({ ...m, id: crypto.randomUUID() }));
+    const clonedMessages = slicedConv
+      .filter(m => m.role === 'user' || (m.role === 'assistant' && m.content))
+      .map(m => ({ role: m.role, content: m.content || '' }));
+    const forked = {
+      id: crypto.randomUUID(),
+      title: ('Fork · ' + source.title).slice(0, 80),
+      prompt: source.prompt,
+      workspace: source.workspace,
+      projectId: source.projectId,
+      engine: source.engine,
+      model: source.model,
+      ...(source.agentMode ? { agentMode: source.agentMode } : {}),
+      ...(source.reasoningEffort ? { reasoningEffort: source.reasoningEffort } : {}),
+      ...(source.providerRouting ? { providerRouting: source.providerRouting } : {}),
+      ...(source.temperature !== undefined ? { temperature: source.temperature } : {}),
+      ...(source.systemPromptOverride ? { systemPromptOverride: source.systemPromptOverride } : {}),
+      dependsOn: [],
+      attachments: [...(source.attachments || [])],
+      status: 'paused',
+      createdAt: new Date().toISOString(),
+      messages: [],
+      conversation: clonedConv,
+      events: [],
+      effects: [],
+      todos: (source.todos || []).map(t => ({ ...t })),
+      liveTools: [],
+      liveSubagents: [],
+      summary: source.summary || '',
+      compressions: 0,
+      steps: 0,
+      contextTokens: 0,
+    };
+    this.store.state.tasks.unshift(forked);
+    for (const msg of clonedMessages) this.store.transcript(forked, msg);
+    this.store.journal(forked, 'forked', { fromTaskId: source.id, fromMessageId: messageId || null, messageCount: clonedConv.length });
+    this.changed(forked);
+    return forked.id;
+  }
+  editMessageAndResend(id, messageId, newContent) {
+    const task = this.store.task(id);
+    if (this.active.has(id) || this.compacting.has(id)) throw new Error('Pause the task before editing a previous message.');
+    const text = String(newContent || '').trim();
+    if (!text) throw new Error('Message content cannot be empty.');
+    const idx = task.conversation.findIndex(m => m.id === messageId && m.role === 'user');
+    if (idx < 0) throw new Error('User message not found.');
+    const prior = task.conversation[idx];
+    const kept = task.conversation.slice(0, idx);
+    const expanded = expandSlashCommand(text, this.store.state.settings.customCommands);
+    if (expanded.mode) task.agentMode = expanded.mode;
+    task.conversation = [...kept, { id: crypto.randomUUID(), role: 'user', content: text, attachments: prior.attachments || [] }];
+    task.messages = kept
+      .filter(m => m.role === 'user' || (m.role === 'assistant' && m.content))
+      .map(m => ({ role: m.role, content: m.content || '' }));
+    this.store.transcript(task, attachmentMessage(expanded.prompt, prior.attachments || []));
+    this.store.journal(task, 'message_edited', { replacedMessageId: messageId, prompt: expanded.prompt });
+    task.status = 'queued';
+    task.error = null;
+    this.changed(task);
+    this.schedule();
+    return true;
+  }
+  regenerate(id) {
+    const task = this.store.task(id);
+    if (this.active.has(id) || this.compacting.has(id)) throw new Error('Pause the task before regenerating.');
+    while (task.conversation.length && task.conversation.at(-1).role === 'assistant') {
+      task.conversation.pop();
+    }
+    while (task.messages.length && task.messages.at(-1).role !== 'user') {
+      task.messages.pop();
+    }
+    if (!task.messages.length) throw new Error('No user prompt available to regenerate.');
+    this.store.journal(task, 'regenerated', { at: new Date().toISOString() });
+    task.status = 'queued';
+    task.error = null;
+    this.changed(task);
+    this.schedule();
+    return true;
+  }
+  spawnChildSession(parentTask, args = {}) {
+    const prompt = String(args.prompt || '').trim();
+    if (!prompt) throw new Error('spawn_session requires a non-empty prompt.');
+    const childId = this.create({
+      title: args.title ? String(args.title).slice(0, 80) : prompt.slice(0, 64),
+      prompt,
+      workspace: args.workspace !== undefined ? String(args.workspace) : (parentTask.workspace || ''),
+      projectId: parentTask.projectId || null,
+      parentTaskId: parentTask.id,
+      notifyParentOnIdle: args.notifyParentOnIdle !== false,
+      model: args.model || parentTask.model,
+      agentMode: args.agentMode || parentTask.agentMode,
+    });
+    const child = this.store.task(childId);
+    this.store.journal(parentTask, 'child_session_spawned', { childId, title: child.title, workspace: child.workspace, model: child.model });
+    return { sessionId: childId, title: child.title, status: child.status, workspace: child.workspace, model: child.model };
+  }
+  listSessionsFor(currentTask, { scope = 'tree' } = {}) {
+    const tasks = this.store.state.tasks || [];
+    const filtered = scope === 'all'
+      ? tasks
+      : tasks.filter(t =>
+          t.id === currentTask.id ||
+          t.parentTaskId === currentTask.id ||
+          (currentTask.parentTaskId && (t.id === currentTask.parentTaskId || t.parentTaskId === currentTask.parentTaskId))
+        );
+    return {
+      currentSessionId: currentTask.id,
+      parentSessionId: currentTask.parentTaskId || null,
+      sessions: filtered.slice(0, 50).map(t => {
+        const lastAssistant = [...(t.conversation || [])].reverse().find(m => m.role === 'assistant' && m.content);
+        return {
+          id: t.id,
+          title: t.title,
+          parentTaskId: t.parentTaskId || null,
+          relation: t.id === currentTask.id ? 'self' : t.id === currentTask.parentTaskId ? 'parent' : t.parentTaskId === currentTask.id ? 'child' : 'peer',
+          status: t.status,
+          model: t.model,
+          workspace: t.workspace,
+          lastOutputPreview: lastAssistant?.content ? String(lastAssistant.content).slice(0, 400) : '',
+        };
+      }),
+    };
+  }
+  sendSessionMessage(senderTask, { sessionId, message } = {}) {
+    if (!sessionId || typeof message !== 'string' || !message.trim()) {
+      throw new Error('send_session_message requires sessionId and a non-empty message.');
+    }
+    if (senderTask && sessionId === senderTask.id) throw new Error('A session cannot send an inter-session message to itself.');
+    const target = this.store.task(sessionId);
+    const senderLabel = senderTask ? `"${senderTask.title}" (${senderTask.id.slice(0, 8)})` : 'User Coordinator';
+    const envelope = `[Inter-session message from ${senderLabel}]:\n${message.trim()}`;
+    if (senderTask) this.store.journal(senderTask, 'session_message_sent', { toSessionId: target.id, toTitle: target.title, preview: message.trim().slice(0, 200) });
+    this.store.journal(target, 'session_message_received', { fromSessionId: senderTask?.id || null, fromTitle: senderTask?.title || 'Coordinator', preview: message.trim().slice(0, 200) });
+    this.resume(target.id, envelope);
+    return { delivered: true, targetSessionId: target.id, targetTitle: target.title, targetStatus: target.status };
+  }
+  async readSession({ sessionId, wait = false, timeoutSeconds = 60 } = {}, signal) {
+    const target = this.store.task(sessionId);
+    if (wait && ['queued', 'running', 'approval'].includes(target.status)) {
+      const deadline = Date.now() + Math.max(1, Math.min(Number(timeoutSeconds) || 60, 300)) * 1000;
+      while (Date.now() < deadline && ['queued', 'running', 'approval'].includes(target.status)) {
+        signal?.throwIfAborted();
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }
+    return {
+      sessionId: target.id,
+      title: target.title,
+      parentTaskId: target.parentTaskId || null,
+      status: target.status,
+      error: target.error || null,
+      result: target.result || null,
+      todos: target.todos || [],
+      recentMessages: (target.conversation || []).slice(-6).map(m => ({
+        role: m.role,
+        content: m.content ? String(m.content).slice(0, 2000) : '',
+      })),
+    };
+  }
+  async revertFileChange(id, eventId) {
+    const task = this.store.task(id);
+    const res = await revertFileBackup(this.store, task, eventId);
+    this.changed(task);
+    return res;
   }
   pause(id) {
     const task = this.store.task(id);
@@ -187,10 +582,11 @@ export class Runtime extends EventEmitter {
     this.changed(task);
   }
   followup(task, text, attachments=[]) {
+    const expanded = expandSlashCommand(text, this.store.state.settings.customCommands);
     task.conversation.push({id:crypto.randomUUID(),role:'user', content:text,attachments});
-    (task.followupQueue ||= []).push(attachments.length?{text,attachments}:text);
+    (task.followupQueue ||= []).push(attachments.length?{text:expanded.prompt,attachments}:expanded.prompt);
     task.pendingFollowups=task.followupQueue.length;
-    this.store.journal(task,'user_followup',{instruction:text,whileRunning:true});
+    this.store.journal(task,'user_followup',{instruction:expanded.prompt,whileRunning:true});
     this.changed(task);
   }
   flushFollowups(task) {
@@ -225,38 +621,78 @@ export class Runtime extends EventEmitter {
     this.flushPendingImages(task);
     this.flushFollowups(task);
     if (instruction?.trim()) {
-      this.store.transcript(task, attachmentMessage(instruction.trim(),attachments));
+      if (/^\/compact\b/i.test(instruction.trim())) {
+        void this.compact(task).catch(err => {
+          task.error = err?.message || 'Compaction failed.';
+          this.changed(task);
+        });
+        return;
+      }
+      const expanded = expandSlashCommand(instruction.trim(), this.store.state.settings.customCommands);
+      if (expanded.mode) task.agentMode = expanded.mode;
+      this.store.transcript(task, attachmentMessage(expanded.prompt,attachments));
       task.conversation.push({id:crypto.randomUUID(),role:'user', content:instruction.trim(),attachments});
-      this.store.journal(task,'user_followup',{instruction:instruction.trim()});
+      this.store.journal(task,'user_followup',{instruction:expanded.prompt});
     } else if (task.status === 'complete') throw new Error('Write a follow-up instruction to continue a completed task.');
     task.status = 'queued'; task.error = null; this.changed(task); this.schedule();
   }
-  approve(id, allowed) {
+  approve(id, allowed, { allowSession = false, alwaysAllowPattern = '' } = {}) {
     const pending = this.approvals.get(id);
     if (!pending) throw new Error('Approval request expired.');
+    if (allowed && allowSession) {
+      const task = this.store.state.tasks.find(t => t.id === pending.taskId);
+      if (task) task.sessionAutoApprove = true;
+    }
+    if (allowed && alwaysAllowPattern) {
+      const pattern = String(alwaysAllowPattern).trim();
+      if (pattern) {
+        const cur = Array.isArray(this.store.state.settings.semiAutoAllowRules) ? this.store.state.settings.semiAutoAllowRules : [];
+        if (!cur.includes(pattern)) {
+          this.settings({ semiAutoAllowRules: [...cur, pattern] });
+        }
+      }
+    }
     pending.resolve(Boolean(allowed));
   }
-  approval(task, name, args, signal) {
+  approval(task, name, args, signal, reason = '') {
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       const finish = (allowed) => {
         signal.removeEventListener('abort', cancel); this.approvals.delete(id);
         task.status = 'running';
-        this.store.journal(task, 'approval', { name, allowed });
+        this.store.journal(task, 'approval', { name, allowed, reason });
         this.changed(task); resolve(allowed);
       };
       const cancel = () => { this.approvals.delete(id); this.changed(task); reject(new Error('Cancelled')); };
       if (signal.aborted) return cancel();
       signal.addEventListener('abort', cancel, { once: true });
-      this.approvals.set(id, { taskId: task.id, name, args, resolve:finish }); task.status = 'approval'; this.changed(task);
+      this.approvals.set(id, { taskId: task.id, name, args, reason, suggestedPattern: suggestAllowPattern(name, args), resolve:finish }); task.status = 'approval'; this.changed(task);
     });
   }
-  needsApproval(name, task) {
-    if(['search_capabilities','get_capability','get_connector'].includes(name))return false;
-    if(this.store.state.settings.autonomous || task?.agentMode === 'unrestricted')return false;
-    if (READ_ONLY_TOOL_NAMES.has(name) || ['document_progress','todo_write','memory_store'].includes(name)) return false;
-    if (['write_file','replace_text','multi_edit','apply_patch'].includes(name) && this.store.state.settings.autoWorkspaceWrites) return false;
-    return true;
+  approvalCheck(name, task, args = {}) {
+    if (['search_capabilities', 'get_capability', 'get_connector', 'load_toolset'].includes(name)) return { required: false, reason: '' };
+    if (task?.sessionAutoApprove) return { required: false, reason: '' };
+    const level = task?.agentMode || this.store.state.settings.agentMode || 'autopilot';
+    if (level === 'unrestricted') return { required: false, reason: '' };
+    if (READ_ONLY_TOOL_NAMES.has(name) || this.plugins?.findTool(name)?.tool?.readOnly || ['document_progress', 'todo_write', 'memory_store'].includes(name)) {
+      return { required: false, reason: '' };
+    }
+    if (level === 'interactive') {
+      return { required: true, reason: 'Interactive autonomy: confirm each modifying or external step.' };
+    }
+    if (level === 'semi-autopilot') {
+      const risk = assessActionRisk(name, args, task, this.store.state.settings);
+      return risk.risky ? { required: true, reason: `Semi-Autopilot: ${risk.reason}` } : { required: false, reason: '' };
+    }
+    if (level === 'autopilot' && task?.agentMode === 'autopilot') {
+      return { required: false, reason: '' };
+    }
+    if (this.store.state.settings.autonomous) return { required: false, reason: '' };
+    if (['write_file', 'replace_text', 'multi_edit', 'apply_patch'].includes(name) && this.store.state.settings.autoWorkspaceWrites) return { required: false, reason: '' };
+    return { required: true, reason: 'Approval required by workspace autonomy setting.' };
+  }
+  needsApproval(name, task, args = {}) {
+    return this.approvalCheck(name, task, args).required;
   }
   effectiveSettings(task) {
     return {
@@ -264,13 +700,16 @@ export class Runtime extends EventEmitter {
       model: task.model,
       reasoningEffort: task.reasoningEffort ?? this.store.state.settings.reasoningEffort,
       providerRouting: task.providerRouting ?? this.store.state.settings.providerRouting,
+      contextWindow: task.contextWindow || this.store.state.settings.contextWindow,
+      ...(Array.isArray(task.providerOrder) && task.providerOrder.length ? { providerOrder: task.providerOrder } : {}),
       ...(task.agentMode ? { agentMode: task.agentMode } : {}),
+      ...(task.temperature !== undefined && task.temperature !== null ? { temperature: task.temperature } : {}),
     };
   }
-  async completion(messages, task, signal, { tools = true, maxOutput, effort, acceptTruncated, customTools } = {}) {
+  async completion(messages, task, signal, { tools = true, maxOutput, effort, acceptTruncated, customTools, silent = false, keepLiveOnSuccess = false } = {}) {
     const settings = this.effectiveSettings(task);
     const connection=modelConnection(task.model, settings);
-    const key = this.getSecret(connection.key) || (connection.optionalKey ? 'local-key' : '');
+    let key = this.getSecret(connection.key) || (connection.optionalKey ? 'local-key' : '');
     if (!key) throw new Error('Add your '+connection.name+' API key in Settings.');
     const started=Date.now();
     const streamingMode=Boolean(settings.streaming);
@@ -280,19 +719,28 @@ export class Runtime extends EventEmitter {
     const hardCap=setTimeout(()=>guard.abort(new DOMException('Maximum generation time exceeded.','TimeoutError')),streamingMode?1800000:900000);
     const idleTimer=streamingMode?setInterval(()=>{if(Date.now()-lastActivity>120000)guard.abort(new DOMException('Provider stopped sending data for 120 seconds.','TimeoutError'));},5000):null;
     const responseId=crypto.randomUUID();
-    const responseJournal=tools?new ResponseJournal(this.store.directoryFor(task.id),responseId):null;
+    const responseJournal=tools && !silent ? new ResponseJournal(this.store.directoryFor(task.id),responseId) : null;
     let record=normalizeUsage(undefined,{id:crypto.randomUUID(),responseId,model:task.model,kind:tools?'generation':'compression',status:'pending',sessionAffinity:connection.id==='openrouter'&&settings.cacheAffinity===true});
-    let attemptStarted=started, receivedOutput=false;
-    task.calls ||= [];task.calls.push(record);task.liveText='';task.liveActivity='Querying model…';
+    let attemptStarted=started, receivedOutput=false, succeeded=false;
+    task.calls ||= [];task.calls.push(record);
+    if (!silent) { task.liveText=''; task.liveReasoning=''; task.liveActivity='Querying model…'; }
     const account=()=>{task.telemetry=aggregateUsage(task.calls);task.lastTurnTelemetry=aggregateUsage(task.calls.slice(task.turnCallStart||0));};
-    account();this.changed(task);
+    account();
+    try { this.store.save(task); } catch {}
+    if (!silent) this.emitDelta(task);
     let lastPaint=0;
     try{
+    let effectiveBase = connection.base;
+    if (connection.id === 'copilot' && /^(gho_|ghu_|ghp_|github_pat_)/.test(key) && this.request === fetch) {
+      const resolved = await resolveCopilotAuth(key, { request: this.request, base: connection.base });
+      key = resolved.token;
+      effectiveBase = resolved.base;
+    }
     const outputLimit=maxOutput ?? settings.maxOutput;
-    const selectedTools=customTools || requestTools(settings);
-    const spec=completionRequest({model:task.model,messages,settings,tools:tools?selectedTools:undefined,outputLimit,effort,sessionId:settings.cacheAffinity?affinitySession(task,tools):undefined});
-    const send = () => this.request(connection.base+'/chat/completions', {
-      method:'POST', headers:{Authorization:'Bearer ' + key,...spec.headers},
+    const selectedTools=customTools || requestTools(settings, this.plugins, task.loadedToolsets);
+    const spec=completionRequest({model:task.model,messages,settings:{...settings,...(connection.id==='copilot'&&effectiveBase!==connection.base?{copilotBaseUrl:effectiveBase}:{})},tools:tools?selectedTools:undefined,outputLimit,effort,sessionId:settings.cacheAffinity?affinitySession(task,tools):undefined,apiKey:key});
+    const send = () => this.request(spec.url, {
+      method:'POST', headers:spec.headers,
       body:JSON.stringify(spec.body),
       signal: AbortSignal.any([signal, guard.signal])
     });
@@ -302,53 +750,85 @@ export class Runtime extends EventEmitter {
       onOutput:()=>{receivedOutput=true;},
       onText:text=>{
         bump();
-        if(!tools)return;task.liveText=text;if(!record.firstTokenMs)record.firstTokenMs=Date.now()-started;responseJournal.update(text);
-        if(Date.now()-lastPaint>100){lastPaint=Date.now();this.emit('change');}
+        if(!tools||silent)return;
+        const firstToken = !record.firstTokenMs;
+        task.liveText=text;
+        task.liveActivity='';
+        if(firstToken)record.firstTokenMs=Date.now()-started;
+        try { responseJournal?.update(text); } catch {}
+        if(firstToken){lastPaint=Date.now();this.emit('change');this.emitDelta(task);}
+        else if(Date.now()-lastPaint>45){lastPaint=Date.now();this.emitDelta(task);}
       },
       onReasoning:text=>{
         bump();
-        if(!tools)return;task.liveReasoning=text;task.liveActivity='The model updated its reasoning summary.';
-        if(Date.now()-lastPaint>100){lastPaint=Date.now();this.emit('change');}
+        if(!tools||silent)return;
+        task.liveReasoning=text;
+        task.liveActivity='Thinking…';
+        if(Date.now()-lastPaint>60){lastPaint=Date.now();this.emitDelta(task);}
       },
       onUsage:usage=>{bump();for(const [key,value] of Object.entries(normalizeUsage(usage)))if(value!==null)record[key]=value;responseJournal?.call(record);}};
-    const readBody=res=>res.headers.get('content-type')?.includes('text/event-stream')?readCompletionStream(res,streamOptions):res.json();
+    const readBody=async res=>{
+      if (spec.apiFormat === 'anthropic') {
+        return res.headers.get('content-type')?.includes('text/event-stream')
+          ? readAnthropicStream(res, streamOptions)
+          : normalizeAnthropicResponse(await res.json());
+      }
+      return res.headers.get('content-type')?.includes('text/event-stream')
+        ? readCompletionStream(res, streamOptions)
+        : res.json();
+    };
     let data;
     for(let attempt=0;attempt<2;attempt++) {
       let reading=false;
       try {
         const response=await send();bump();
-        if(!response.ok){await response.body?.cancel().catch(()=>{});throw providerHttpFailure(response.status,connection.name);}
+        if(!response.ok){
+          const errBody = await response.text().catch(()=>'');
+          const detail = extractSafeProviderDetail(errBody, key);
+          throw providerHttpFailure(response.status, connection.name, detail);
+        }
         reading=true;data=await readBody(response);break;
       } catch(error) {
         const network=isNetworkFailure(error);
         const retryable=network?retryableNetworkFailure(error):reading||error.retryable===true;
-        if(attempt>0||!retryable||signal.aborted||guard.signal.aborted||receivedOutput||task.liveText||responseJournal?.error||!error?.message)throw network&&!signal.aborted&&!guard.signal.aborted?networkFailure(error,connection.name):error;
+        if(attempt>0||!retryable||signal.aborted||guard.signal.aborted||receivedOutput||(!silent&&task.liveText)||responseJournal?.error||!error?.message)throw network&&!signal.aborted&&!guard.signal.aborted?networkFailure(error,connection.name):error;
         record.status='failed';record.latencyMs=Date.now()-attemptStarted;
         const priorId=record.id;
         record=normalizeUsage(undefined,{id:crypto.randomUUID(),responseId,model:task.model,kind:tools?'generation':'compression',status:'pending',retried:true,retryOf:priorId,sessionAffinity:connection.id==='openrouter'&&settings.cacheAffinity===true});
-        task.calls.push(record);attemptStarted=Date.now();task.liveActivity='Connection interrupted. Retrying once…';account();this.changed(task);
+        task.calls.push(record);attemptStarted=Date.now();if(!silent)task.liveActivity='Connection interrupted. Retrying once…';account();this.changed(task);
         if(network||error.retryable)await retryDelay(750,undefined,{signal:AbortSignal.any([signal,guard.signal])});
       }
     }
     for(const [key,value] of Object.entries(normalizeUsage(data.usage)))if(value!==null)record[key]=value;
-    Object.assign(record,{id:data.id||record.id,model:data.model||task.model,status:'complete',router:data.openrouter_metadata||null});
-    this.calibrate(task, messages, tools, data.usage?.prompt_tokens,selectedTools);
+    const rawRouter = data.openrouter_metadata;
+    const resolvedProvider = rawRouter?.provider_name || rawRouter?.provider || rawRouter?.endpoints?.available?.find?.(e => e.selected)?.provider || data.provider || null;
+    const compactRouter = rawRouter ? {
+      provider: resolvedProvider,
+      provider_name: resolvedProvider,
+      region: rawRouter.region || null,
+      strategy: rawRouter.strategy || null,
+      summary: rawRouter.summary || null,
+      generation_time: rawRouter.generation_time ?? null,
+    } : (data.provider ? { provider: data.provider, provider_name: data.provider } : null);
+    Object.assign(record,{id:data.id||record.id,model:data.model||task.model,status:'complete',router:compactRouter});
+    if(!silent)this.calibrate(task, messages, tools, data.usage?.prompt_tokens,selectedTools);
     const message = data.choices?.[0]?.message;
     if(data.error)throw new Error('The provider returned an error during generation.');
-    if(tools&&message?.content){task.liveText=message.content;responseJournal.update(message.content);}
+    if(tools&&!silent&&message?.content){task.liveText=message.content;responseJournal?.update(message.content);}
     signal.throwIfAborted();guard.signal.throwIfAborted();
     const citations=citationsFromAnnotations(message?.annotations);
     if(data.choices?.[0]?.finish_reason==='length'){
-      if(tools&&message?.content)task.liveText=message.content;
+      if(tools&&!silent&&message?.content)task.liveText=message.content;
       if(acceptTruncated&&typeof message?.content==='string'&&message.content.trim().length>=20)return { message:{ role:'assistant', content:message.content, ...(message.reasoning_details?{reasoning_details:message.reasoning_details}:{}), ...(citations.length?{sources:citations}:{}) }, usage:data.usage, truncated:true };
       throw new Error('The model exhausted its output token budget before finishing. Any partial text has been preserved; you can continue with a follow-up instruction or increase max output tokens.');
     }
     if (!message || (!message.content && !message.tool_calls?.length)) throw new Error('The provider returned an empty response.');
+    succeeded = true;
     return { responseId, message: { role:'assistant', content:message.content || null, ...(message.reasoning_details ? {reasoning_details:message.reasoning_details} : {}), ...(message.tool_calls?.length ? { tool_calls:message.tool_calls } : {}), ...(citations.length ? {sources:citations} : {}) }, usage:data.usage };
-    }catch(error){const guardFired=guard.signal.aborted&&!signal.aborted;const timedOut=guardFired&&(error?.name==='TimeoutError'||error?.name==='AbortError'||/aborted due to timeout/i.test(error?.message||''));record.status=signal.aborted?'interrupted':'failed';if(task.liveText){task.conversation.push({id:responseId,role:'assistant',content:task.liveText+'\n\n[Interrupted response; incomplete.]'});this.store.journal(task,'partial_response',{text:task.liveText});}if(timedOut)throw new Error('The provider stopped responding in time (slow stream or generation timeout). Any partial text has been preserved; you can resume the task.');throw error;}
-    finally{clearTimeout(hardCap);if(idleTimer)clearInterval(idleTimer);responseJournal?.close();record.latencyMs=Date.now()-attemptStarted;task.liveText='';task.liveReasoning='';task.liveActivity='';account();this.changed(task);}
+    }catch(error){const guardFired=guard.signal.aborted&&!signal.aborted;const timedOut=guardFired&&(error?.name==='TimeoutError'||error?.name==='AbortError'||/aborted due to timeout/i.test(error?.message||''));record.status=signal.aborted?'interrupted':'failed';if(!silent&&task.liveText){task.conversation.push({id:responseId,role:'assistant',content:task.liveText+'\n\n[Interrupted response; incomplete.]'});this.store.journal(task,'partial_response',{text:task.liveText});}if(timedOut)throw new Error('The provider stopped responding in time (slow stream or generation timeout). Any partial text has been preserved; you can resume the task.');throw error;}
+    finally{clearTimeout(hardCap);if(idleTimer)clearInterval(idleTimer);try{responseJournal?.close();}catch{}record.latencyMs=Date.now()-attemptStarted;account();if(!silent&&(!keepLiveOnSuccess||!succeeded)){task.liveText='';task.liveReasoning='';task.liveActivity='';this.changed(task);}else if(silent){this.changed(task);}}
   }
-  calibrate(task, messages, tools, promptTokens,toolSchema=requestTools(this.effectiveSettings(task))) {
+  calibrate(task, messages, tools, promptTokens,toolSchema=requestTools(this.effectiveSettings(task), this.plugins, task.loadedToolsets)) {
     if (!Number.isFinite(promptTokens) || promptTokens <= 0) return;
     if(messages.some(message=>Array.isArray(message.content)&&message.content.some(part=>part.type==='image_url'||part.type==='nexus_attachment')))return;
     const bytes = Buffer.byteLength(JSON.stringify({ messages, ...(tools ? { tools: toolSchema } : {}) }), 'utf8');
@@ -366,24 +846,84 @@ export class Runtime extends EventEmitter {
       return rest;
     });
   }
-  compactionTail(task, messages = []) {
-    const budget=Math.max(3000,Math.min(12000,Math.floor(this.store.state.settings.contextWindow*.16)));
-    let start=messages.length,tokens=0;
-    for(let index=messages.length-1;index>=0;index--){
-      const weight=this.estimate(task,this.scrubMessages([messages[index]]));
-      if(tokens+weight>budget){
-        if(start===messages.length)return {archived:messages,tail:[]};
+  compactionTail(task, messages = [], { forceEmptyTail = false } = {}) {
+    if (forceEmptyTail || !messages.length) return { archived: messages, tail: [] };
+    const windowSize = task?.contextWindow || this.store.state.settings.contextWindow;
+    const budget = Math.max(3000, Math.min(12000, Math.floor(windowSize * 0.16)));
+    let start = messages.length, tokens = 0;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const weight = this.estimate(task, this.scrubMessages([messages[index]]));
+      if (tokens + weight > budget) {
+        if (start === messages.length) return { archived: messages, tail: [] };
         break;
       }
-      start=index;tokens+=weight;
+      start = index; tokens += weight;
     }
-    if(start===0)return {archived:messages,tail:[]};
-    if(messages[start]?.role==='tool'){
-      let call=start-1;while(call>=0&&messages[call].role==='tool')call--;
-      if(messages[call]?.role==='assistant')start=call;
+    if (start === 0) return { archived: messages, tail: [] };
+    // Never cut inside a tool_calls -> tool response group
+    if (messages[start]?.role === 'tool') {
+      let call = start - 1;
+      while (call >= 0 && messages[call].role === 'tool') call--;
+      if (call > 0 && messages[call]?.role === 'assistant' && messages[call]?.tool_calls?.length) {
+        const groupWeight = this.estimate(task, this.scrubMessages(messages.slice(call)));
+        if (groupWeight <= Math.floor(budget * 1.5)) {
+          start = call;
+        } else {
+          // Tool group is too large for tail budget; advance past all its tool responses so the full group is archived cleanly
+          let afterTools = start;
+          while (afterTools < messages.length && messages[afterTools].role === 'tool') afterTools++;
+          start = afterTools;
+        }
+      } else {
+        // Reaching index 0 would archive nothing; advance past the tool outputs instead
+        let afterTools = start;
+        while (afterTools < messages.length && messages[afterTools].role === 'tool') afterTools++;
+        start = afterTools;
+      }
     }
-    if(messages[start]?.role==='assistant'&&!messages[start]?.tool_calls)start++;
-    return {archived:messages.slice(0,start),tail:messages.slice(start)};
+    // Skip dangling assistant messages at the start of tail so providers requiring user-first alternation stay valid
+    while (start < messages.length && messages[start]?.role === 'assistant') {
+      if (messages[start]?.tool_calls?.length) {
+        start++;
+        while (start < messages.length && messages[start]?.role === 'tool') start++;
+      } else {
+        start++;
+      }
+    }
+    if (start === 0 || start >= messages.length) return { archived: messages, tail: [] };
+    return { archived: messages.slice(0, start), tail: messages.slice(start) };
+  }
+  async microCompactTask(task, { keepRecent = 6, minChars = 1200 } = {}) {
+    if (!Array.isArray(task.messages) || task.messages.length <= keepRecent) return { prunedCount: 0, estimatedTokensFreed: 0 };
+    const cutoff = task.messages.length - keepRecent;
+    let prunedCount = 0, freedChars = 0;
+    const callNames = new Map();
+    for (const msg of task.messages) {
+      if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+        for (const c of msg.tool_calls) if (c?.id) callNames.set(c.id, c.function?.name || 'tool');
+      }
+    }
+    for (let i = 0; i < cutoff; i++) {
+      const msg = task.messages[i];
+      if (!msg || msg.role !== 'tool' || typeof msg.content !== 'string') continue;
+      if (msg.content.length < minChars) continue;
+      if (msg.content.startsWith('[Micro-compacted ') || msg.content.includes('"artifact":{')) continue;
+      const toolName = callNames.get(msg.tool_call_id) || 'tool';
+      try {
+        const saved = await saveRawArtifact(this.store, task, `micro_${toolName}`, msg.content);
+        const origLen = msg.content.length;
+        msg.content = `[Micro-compacted earlier ${toolName} output (${origLen} chars freed). Full original saved in artifact ${saved.id}; call read_artifact or search_history if exact details are needed.]`;
+        freedChars += Math.max(0, origLen - msg.content.length);
+        prunedCount++;
+      } catch {
+        // Keep original intact if artifact write fails
+      }
+    }
+    if (!prunedCount) return { prunedCount: 0, estimatedTokensFreed: 0 };
+    const estimatedTokensFreed = Math.ceil(freedChars / (task.bytesPerToken || 3));
+    this.store.journal(task, 'micro_compaction', { prunedCount, freedChars, estimatedTokensFreed });
+    this.changed(task);
+    return { prunedCount, freedChars, estimatedTokensFreed };
   }
   refreshProgressReminder(task) {
     const last = Number.isInteger(task.lastProgressStep) ? task.lastProgressStep : 0;
@@ -397,22 +937,52 @@ export class Runtime extends EventEmitter {
     const pinned=task.conversation.filter(m=>m.pinned).map(m=>({role:m.role,content:m.content}));
     const reminder=task.progressDue?'\nContinuity reminder: several steps have elapsed without documenting progress. Before continuing broad work, call document_progress with decisions, changes, verification, and next action.':'';
     const webRule=this.store.state.settings.webSearchEnabled?'\nReal-time web search is available. When the user requests current information, sources, search, or external verification, use the web search tool before answering and cite resulting URLs in Markdown. Do not present unverified current data as if it had been searched.':'';
-    const mode=task.agentMode||this.store.state.settings.agentMode||'agent';
-    const modeRule=mode==='architect'?'\nOperating Mode: ARCHITECT (Plan & Design). Inspect files, analyze architecture, and maintain a structured checklist with todo_write, without mutating project files until switched to Agent mode.':mode==='explore'?'\nOperating Mode: EXPLORE (Read-Only Research). Use fast search and file inspection tools to answer questions accurately with file and line evidence.':mode==='unrestricted'?'\nOperating Mode: UNRESTRICTED OPERATOR. Full local environment access is enabled without client-side restrictions; execute the user objective directly.':'';
-    const context = [{ role:'system', content:this.store.state.settings.globalInstructions + '\nProject: ' + (task.workspace || '(no folder)') + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule }];
+    const mode=task.agentMode||this.store.state.settings.agentMode||'autopilot';
+    const modeRule=mode==='interactive'?'\nAutonomy Level: INTERACTIVE. Collaborate step-by-step with the user; mutating and external actions will pause for explicit user confirmation.':
+      mode==='semi-autopilot'?'\nAutonomy Level: SEMI-AUTOPILOT. Read files and apply normal workspace edits autonomously; risky shell commands, deletions, git push/reset, external HTTP mutations, and desktop actions will request user confirmation.':
+      mode==='autopilot'?'\nAutonomy Level: AUTOPILOT. Execute tasks end-to-end autonomously across workspace files, terminal, Git, and web tools.':
+      mode==='unrestricted'?'\nAutonomy Level: FULL UNRESTRICTED. Absolute autonomous local environment access with zero path confinement and zero approval prompts; execute the user objective directly.':
+      mode==='architect'?'\nOperating Mode: ARCHITECT (Plan & Design). Inspect files, analyze architecture, and maintain a structured checklist with todo_write.':
+      mode==='explore'?'\nOperating Mode: EXPLORE (Read-Only Research). Use fast search and file inspection tools to answer questions accurately with file and line evidence.':'';
+    const silentRule = this.store.state.settings.silentToolSteps
+      ? '\nExecution Style: SILENT TOOL CHAINING. Do NOT emit progress narrations, status updates, or intermediate follow-up text between tool calls. Emit tool calls directly with empty assistant content until the entire task is complete or you genuinely need to ask the user an important question.'
+      : '';
+    const baseInstructions = task.systemPromptOverride?.trim() || this.store.state.settings.globalInstructions;
+    const unrestricted = mode === 'unrestricted' || mode === 'autopilot' || this.store.state.settings.autonomous;
+    const workspaceLabel = task.workspace || (unrestricted ? `${process.cwd()} (default cwd; unrestricted access)` : '(no folder)');
+    const context = [{ role:'system', content:baseInstructions + '\nProject: ' + workspaceLabel + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule + silentRule }];
     const sections=[{id:'instructions',label:'Instructions & Objective',reason:'Stable prefix: global instructions, workspace folder, project instructions, and original objective.',value:context[0],count:1}];
     if(pinned.length)sections.push({id:'pins',label:'Pinned Messages',reason:'Explicitly pinned by the user to survive compaction.',value:pinned,count:pinned.length});
     if(dependencyContext.length)sections.push({id:'dependencies',label:'Task Dependencies',reason:'Results and recent progress notes from prerequisite tasks.',value:dependencyContext,count:dependencyContext.length});
     const workspaceRules = task.workspace ? discoverWorkspaceInstructions(task.workspace) : '';
     if(workspaceRules)sections.push({id:'workspace-rules',label:'Repository Rules (NEXUS.md / CLAUDE.md / AGENTS.md)',reason:'Auto-discovered project instruction files in the workspace root.',value:workspaceRules,count:1});
+    const projectSkills = task.workspace ? discoverWorkspaceSkills(task.workspace) : [];
+    if(projectSkills.length)sections.push({id:'project-skills',label:'Project Skills (SKILL.md)',reason:'Auto-discovered SKILL.md files in .nexus/skills, .github/skills, or .claude/skills.',value:projectSkills.map(s=>({name:s.name,description:s.description,sourcePath:s.sourcePath})),count:projectSkills.length});
     const relevantMemories = (this.store.state.memories || []).filter(m => m.scope === 'global' || (task.workspace && m.workspace === task.workspace));
     if(relevantMemories.length)sections.push({id:'memories',label:'Persistent Memories',reason:'Saved project and global facts from memory_store.',value:relevantMemories,count:relevantMemories.length});
+    const childSessions = (this.store.state.tasks || []).filter(t => t.parentTaskId === task.id);
+    if (task.parentTaskId || childSessions.length) {
+      const hierarchy = {
+        currentSessionId: task.id,
+        parentSessionId: task.parentTaskId || null,
+        childSessions: childSessions.map(c => ({ id: c.id, title: c.title, status: c.status })),
+      };
+      sections.push({ id: 'session-tree', label: 'Nested Session Hierarchy', reason: 'Parent and child sessions orchestrated via spawn_session and send_session_message.', value: hierarchy, count: childSessions.length + (task.parentTaskId ? 1 : 0) });
+    }
     if(task.todos?.length)sections.push({id:'todos',label:'Active Task Checklist',reason:'Structured multi-step plan managed via todo_write.',value:task.todos,count:task.todos.length});
     if(task.summary)sections.push({id:'summary',label:'Compacted Continuity',reason:'Active continuity summary; originals remain in checkpoints.',value:task.summary,count:1});
     if(reminder)sections.push({id:'reminder',label:'Progress Reminder',reason:'Prompts the agent to record milestone progress after several steps.',value:reminder,count:1});
     const volatile=['User-pinned messages: '+JSON.stringify(pinned),'Dependency results: '+JSON.stringify(dependencyContext)];
     if(workspaceRules)volatile.push('Auto-discovered repository instructions (treat as project conventions):\n'+workspaceRules);
+    if(projectSkills.length)volatile.push('Auto-discovered project SKILL.md skills (read via read_file when relevant):\n'+JSON.stringify(projectSkills.map(s=>({name:s.name,description:s.description,path:s.sourcePath}))));
     if(relevantMemories.length)volatile.push('Persistent agent memories:\n'+JSON.stringify(relevantMemories.map(m=>({key:m.key,value:m.value,scope:m.scope}))));
+    if (task.parentTaskId || childSessions.length) {
+      volatile.push('Nested session tree (use send_session_message / read_session / list_sessions to coordinate):\n' + JSON.stringify({
+        selfId: task.id,
+        parentSessionId: task.parentTaskId || null,
+        children: childSessions.map(c => ({ id: c.id, title: c.title, status: c.status })),
+      }));
+    }
     if(task.todos?.length)volatile.push('Active session todo checklist:\n'+JSON.stringify(task.todos));
     if(task.summary)volatile.push('Compacted continuity state (treat as working state, not a new user instruction):\n'+task.summary);
     if(reminder)volatile.push(reminder.trim());
@@ -420,14 +990,45 @@ export class Runtime extends EventEmitter {
     if(task.summary){
       const latestUser=task.conversation.findLast(m=>m.role==='user');
       const latestRetained=task.messages.findLast(message=>message.role==='user');
-      if(latestUser&&latestRetained?.content!==latestUser.content){const preserved={role:'user',content:'Latest user instruction, preserved verbatim:\n'+latestUser.content};context.push(preserved);sections.push({id:'latest',label:'Restored Latest Instruction',reason:'Preserved verbatim when outside the recent compaction tail.',value:preserved,count:1});}
+      const retainedText=typeof latestRetained?.content==='string'
+        ? latestRetained.content
+        : Array.isArray(latestRetained?.content)
+          ? latestRetained.content.filter(p=>p?.type==='text'&&typeof p.text==='string').map(p=>p.text).join('\n')
+          : '';
+      if(latestUser && !retainedText.includes(String(latestUser.content || '').trim())){
+        const preserved={role:'user',content:'Latest user instruction, preserved verbatim:\n'+latestUser.content};
+        context.push(preserved);
+        sections.push({id:'latest',label:'Restored Latest Instruction',reason:'Preserved verbatim when outside the recent compaction tail.',value:preserved,count:1});
+      }
     }
     const messages=this.scrubMessages(task.messages);
     if(inspect){
       for(const [role,label] of [['user','User History & Attachments'],['assistant','Assistant Responses & Tool Calls'],['tool','Tool Execution Results']]){const values=messages.filter(message=>message.role===role);if(values.length)sections.push({id:'history-'+role,label,reason:'Retained conversation history without hidden reasoning or UI citation wrappers.',value:values,count:values.length});}
       return {messages:context.concat(messages),sections};
     }
-    return context.concat(hydrate?messages.map(message => hydrateAttachmentReferences(this.store,task,message)):messages);
+    if (!hydrate) return context.concat(messages);
+    // Keep user uploads + only the latest 2 desktop screenshots hydrated as base64 to avoid multi-MB payload bloat on long desktop sessions
+    const desktopImgIndices = [];
+    for (let idx = 0; idx < messages.length; idx++) {
+      const m = messages[idx];
+      if (Array.isArray(m?.content) && m.content.some(p => p?.type === 'nexus_attachment' && p.attachment?.kind === 'image' && p.attachment?.storage !== 'uploads')) {
+        desktopImgIndices.push(idx);
+      }
+    }
+    const staleDesktopIndices = new Set(desktopImgIndices.slice(0, Math.max(0, desktopImgIndices.length - 2)));
+    return context.concat(messages.map((message, idx) => {
+      if (staleDesktopIndices.has(idx) && Array.isArray(message?.content)) {
+        return {
+          ...message,
+          content: message.content.map(part => (
+            part?.type === 'nexus_attachment' && part.attachment?.kind === 'image' && part.attachment?.storage !== 'uploads'
+              ? { type: 'text', text: `[Earlier desktop screenshot saved as attachment ${part.attachment.id}; call read_attachment if needed.]` }
+              : part
+          )),
+        };
+      }
+      return hydrateAttachmentReferences(this.store, task, message);
+    }));
   }
   async continuationCompletion(messages, task, signal, { maxOutput, attempts, continuationPrompt }) {
     let text = '', truncated = false, continuations = 0;
@@ -453,19 +1054,32 @@ export class Runtime extends EventEmitter {
     try { combined.throwIfAborted();return await this.compactHistory(task,combined); }
     finally {this.compressionControllers.delete(task.id);this.compacting.delete(task.id);this.emit('change');this.schedule();}
   }
-  async compactHistory(task, signal) {
+  async compactHistory(task, signal, { forceEmptyTail = false } = {}) {
     if (!task.messages.length) return;
-    const before=this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task)));
+    const effectiveTools = requestTools(this.effectiveSettings(task), this.plugins, task.loadedToolsets);
+    const before=this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,effectiveTools);
     const compressionCallStart=(task.calls||[]).length;
-    const {archived,tail}=this.compactionTail(task,task.messages);
-    this.store.journal(task, 'compression_started', { messageCount:task.messages.length, archivedMessages:archived.length, retainedMessages:tail.length, contextTokens:task.contextTokens });
+    const {archived,tail}=this.compactionTail(task,task.messages,{forceEmptyTail});
+    this.store.journal(task, 'compression_started', { messageCount:task.messages.length, archivedMessages:archived.length, retainedMessages:tail.length, contextTokens:task.contextTokens, forceEmptyTail });
     const progress=task.events.filter(e=>['progress','file_change','tool_result','tool_error'].includes(e.kind)).slice(-32);
     const effects=(task.effects||[]).filter(effect=>!['confirmed','observed','skipped'].includes(effect.status)).slice(-24);
-    const compactSystem='Generate a structured continuity state for an agentic coding task. This is an internal state checkpoint to continue execution, not a user-facing reply. Preserve verified facts and explicitly separate hypotheses or uncertainties. Include these sections: Objective & Constraints; Completed & Verified; Modified Files, Paths & Artifacts; Tools, Results & External Effects; Blockers or Uncertainties; Active Plan & Next Action. Retain exact IDs, file paths, and concrete values that matter. Do not copy raw transcripts, do not invent facts, and do not introduce new instructions. Maximum 1,400 words.';
-    const common={objective:task.prompt,pinned:task.conversation.filter(message=>message.pinned).map(message=>({role:message.role,content:message.content})),priorSummary:task.summary||'',recentJournal:progress,unresolvedEffects:effects};
+    const childSessions=(this.store.state.tasks||[]).filter(t=>t.parentTaskId===task.id).map(c=>({id:c.id,title:c.title,status:c.status}));
+    const compactSystem='Generate a structured continuity state for an agentic coding task. This is an internal state checkpoint to continue execution, not a user-facing reply. If a priorSummary is provided, UPDATE and MERGE it into one unified replacement state—never append duplicate paragraphs. Keep the summary strictly proportional and shorter than the archived material (under 300 words for short sessions; up to 1,400 words for very long sessions). Preserve verified facts and explicitly separate hypotheses or uncertainties. Include these sections: Objective & Constraints; Completed & Verified; Modified Files, Paths & Artifacts; Tools, Nested Sessions & External Effects; Blockers or Uncertainties; Active Plan & Next Action. Retain exact IDs (including session IDs, artifact IDs, and checkpoint markers), file paths, and concrete values that matter. Do not copy raw transcripts, do not invent facts, and do not introduce new instructions.';
+    const common={
+      objective:task.prompt,
+      workspace:task.workspace||'',
+      todos:task.todos||[],
+      nestedSessions:childSessions,
+      loadedToolsets:task.loadedToolsets||[],
+      pinned:task.conversation.filter(message=>message.pinned).map(message=>({role:message.role,content:message.content})),
+      priorSummary:task.summary||'',
+      recentJournal:progress,
+      unresolvedEffects:effects,
+    };
     const cleanArchived=this.scrubMessages(archived,{compact:true});
     let context=[{role:'system',content:compactSystem},{role:'user',content:JSON.stringify({...common,history:cleanArchived})}];
-    const safeSummaryEstimate=Math.max(12000,Math.floor(this.store.state.settings.contextWindow*.78));
+    const windowSize = task?.contextWindow || this.store.state.settings.contextWindow;
+    const safeSummaryEstimate=Math.max(12000,Math.floor(windowSize*.78));
     if(this.estimate(task,context)>safeSummaryEstimate){
       const base=[{role:'system',content:compactSystem}];
       const room=Math.max(8000,safeSummaryEstimate-this.estimate(task,base)-this.estimate(task,common)-1200);
@@ -489,11 +1103,16 @@ export class Runtime extends EventEmitter {
     signal.throwIfAborted();
     if(truncated)this.store.journal(task,'compression_degraded',{continuations,note:'The summary remained incomplete even after continuation requests; original messages remain intact in the checkpoint.'});
     const finalSummary = truncated ? summaryText + '\n\n(Note: summary was truncated even after requesting continuation; some detail may be missing. Complete originals are preserved in checkpoints and read_checkpoint.)' : summaryText;
-    const after=this.estimate(task,this.buildContext({...task,summary:finalSummary,messages:tail},{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task)));
+    const after=this.estimate(task,this.buildContext({...task,summary:finalSummary,messages:tail},{hydrate:false}))+this.estimate(task,effectiveTools);
+    // If retaining the recent tail still overflows a tight context ceiling, automatically fall back to full-archive compaction
+    if (!forceEmptyTail && tail.length > 0 && after > windowSize) {
+      this.store.journal(task, 'compression_retry_empty_tail', { after, windowSize, tailLength: tail.length });
+      return this.compactHistory(task, signal, { forceEmptyTail: true });
+    }
     const compressionUsage=aggregateUsage((task.calls||[]).slice(compressionCallStart));
     this.store.checkpoint(task, finalSummary, tail, {before,after,estimated:true,truncated,cost:compressionUsage.cost,unknownCosts:compressionUsage.unknownCosts,archivedMessages:archived.length,retainedMessages:tail.length});
     task.lastInputTokens=0;
-    task.contextTokens = this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task)));
+    task.contextTokens = this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,effectiveTools);
     task.lastCompression={at:new Date().toISOString(),before,after:task.contextTokens,estimated:true,continuations,truncated,cost:compressionUsage.cost,unknownCosts:compressionUsage.unknownCosts,archivedMessages:archived.length,retainedMessages:tail.length};
     this.changed(task);
   }
@@ -511,37 +1130,143 @@ export class Runtime extends EventEmitter {
     const mode = ['explore', 'architect', 'agent'].includes(args.mode) ? args.mode : 'explore';
     const maxSteps = Math.max(1, Math.min(Number(args.maxSteps) || 6, 12));
     const subSettings = { ...this.effectiveSettings(parentTask), agentMode: mode };
-    const subTools = requestTools(subSettings).filter(t => t.function?.name !== 'delegate_subagent');
+    const subTools = requestTools(subSettings, this.plugins).filter(t => t.function?.name !== 'delegate_subagent');
+    const subId = crypto.randomUUID().slice(0, 8);
+    const subState = { id: subId, mode, objective: objective.slice(0, 140), status: 'running', step: 0, maxSteps, startedAt: new Date().toISOString() };
+    parentTask.liveSubagents = [...(parentTask.liveSubagents || []), subState];
+    this.store.journal(parentTask, 'subagent_started', { id: subId, mode, objective: objective.slice(0, 200) });
+    this.emit('change');
     const thread = [
       { role: 'system', content: `You are a focused NEXUS sub-agent operating in ${mode.toUpperCase()} mode inside workspace ${parentTask.workspace || '(no folder)'}. Complete the delegated objective concisely with concrete file/line evidence and return a compact synthesis.` },
       { role: 'user', content: objective },
     ];
     let stepsExecuted = 0;
-    for (let step = 0; step < maxSteps; step++) {
-      signal.throwIfAborted();
-      const { message } = await this.completion(thread, parentTask, signal, { tools: true, customTools: subTools });
-      stepsExecuted++;
-      thread.push(message);
-      if (!message.tool_calls?.length) {
-        this.store.journal(parentTask, 'subagent_complete', { mode, stepsExecuted, objective: objective.slice(0, 200) });
-        return { mode, stepsExecuted, report: message.content || '' };
-      }
-      for (const call of message.tool_calls) {
+    try {
+      for (let step = 0; step < maxSteps; step++) {
         signal.throwIfAborted();
-        let toolResult;
-        try {
-          const parsedArgs = JSON.parse(call.function.arguments || '{}');
-          toolResult = await executeTool(this, parentTask, call.function.name, parsedArgs, signal);
-        } catch (err) {
-          toolResult = { error: err.message };
+        subState.step = step + 1;
+        this.emit('change');
+        const { message } = await this.completion(thread, parentTask, signal, { tools: true, customTools: subTools, silent: true });
+        stepsExecuted++;
+        thread.push(message);
+        if (!message.tool_calls?.length) {
+          subState.status = 'complete';
+          this.store.journal(parentTask, 'subagent_complete', { id: subId, mode, stepsExecuted, objective: objective.slice(0, 200) });
+          return { mode, stepsExecuted, report: message.content || '' };
         }
-        const serialized = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
-        thread.push({ role: 'tool', tool_call_id: call.id, content: serialized.slice(0, 12000) });
+        for (const call of message.tool_calls) {
+          signal.throwIfAborted();
+          let toolResult;
+          try {
+            const parsedArgs = JSON.parse(call.function.arguments || '{}');
+            const approvalDecision = this.approvalCheck(call.function.name, parentTask, parsedArgs);
+            if (approvalDecision.required && !(await this.approval(parentTask, call.function.name, parsedArgs, signal, approvalDecision.reason))) {
+              toolResult = { denied: true, reason: 'The user declined this sub-agent action.' };
+            } else {
+              toolResult = await executeTool(this, parentTask, call.function.name, parsedArgs, signal);
+            }
+          } catch (err) {
+            toolResult = { error: err.message };
+          }
+          const serialized = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
+          thread.push({ role: 'tool', tool_call_id: call.id, content: serialized.slice(0, 12000) });
+        }
       }
+      subState.status = 'complete';
+      return { mode, stepsExecuted, report: thread.findLast(m => m.role === 'assistant' && m.content)?.content || 'Sub-agent reached step ceiling.' };
+    } catch (error) {
+      subState.status = 'error';
+      throw error;
+    } finally {
+      parentTask.liveSubagents = (parentTask.liveSubagents || []).filter(s => s.id !== subId);
+      this.emit('change');
     }
-    return { mode, stepsExecuted, report: thread.findLast(m => m.role === 'assistant' && m.content)?.content || 'Sub-agent reached step ceiling.' };
+  }
+  async executeSingleToolCall(task, call, signal, toolRunRecord) {
+    let result, effect;
+    const started = Date.now();
+    try {
+      if (!baseTools.some(t => t.function.name === call.function.name) && !this.plugins?.findTool(call.function.name)) throw new Error('Unknown tool');
+      let args = JSON.parse(call.function.arguments);
+      if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid tool arguments');
+      let name = call.function.name;
+      if(name==='invoke_function'){
+        const resolved=this.capabilities.resolve(args.id,args.input);
+        name=resolved.tool;args=resolved.args;
+        this.store.journal(task,'function_resolved',{...resolved.capability,tool:name});
+      }
+      toolRunRecord.name = name;
+      toolRunRecord.args = args;
+      if(name.startsWith('desktop_')) {
+        if(this.desktopOwner && this.desktopOwner !== task.id) throw new Error('Another agent is currently using the desktop. Continue with independent work or finish and resume later.');
+        this.desktopOwner = task.id;
+      }
+      const approvalDecision = this.approvalCheck(name, task, args);
+      if (approvalDecision.required && !(await this.approval(task, name, args, signal, approvalDecision.reason))) {
+        result = { denied:true, reason:'The user declined this action. Respect this decision.' };
+        toolRunRecord.status = 'denied';
+      } else {
+        this.store.journal(task, 'tool_intent', {name,args});
+        if(externalEffects.has(name)){
+          effect=this.store.beginEffect(task,name,args);
+          this.store.updateEffect(task,effect.id,'dispatched');
+        }
+        task.liveActivity='Executing '+name.replaceAll('_',' ')+'…';
+        this.emitDelta(task);
+        result = await executeTool(this, task, name, args, signal, effect);
+        toolRunRecord.status = 'done';
+      }
+      if (result?.image) {
+        const attachment=await materializeImageAttachment(this.store,task,result.image,{dimensions:result.dimensions,name:result.name||'desktop-screenshot'});
+        task.pendingImages ||= [];
+        task.pendingImages.push(attachment);
+        this.store.journal(task, 'tool_result', {name, result:'Screenshot saved as local attachment', attachment});
+        if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:attachment});
+        toolRunRecord.durationMs = Date.now() - started;
+        toolRunRecord.preview = 'Captured screenshot attachment';
+        return { callId: call.id, serialized: JSON.stringify({captured:true,dimensions:result.dimensions}) };
+      }
+      const materialized=await materializeToolResult(this.store,task,name,result);
+      this.store.journal(task, 'tool_result', {name, result:materialized.journal});
+      if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:materialized.artifact || null});
+      task.liveActivity='Verifying output of '+name.replaceAll('_',' ')+'…';
+      if (result && typeof result === 'object' && result.written) {
+        const lastFileEvent = task.events.findLast(e => e.kind === 'file_change');
+        toolRunRecord.filePath = result.written;
+        toolRunRecord.fileChangeEventId = lastFileEvent?.id || null;
+        toolRunRecord.hasBackup = Boolean(result.backup || lastFileEvent);
+        if (result.diff) {
+          toolRunRecord.diff = String(result.diff).slice(0, 6000);
+          toolRunRecord.addedLines = result.addedLines || 0;
+          toolRunRecord.removedLines = result.removedLines || 0;
+        }
+      }
+      result=materialized.model;
+      const serialized = typeof result === 'string' ? result : JSON.stringify(result);
+      toolRunRecord.durationMs = Date.now() - started;
+      toolRunRecord.preview = serialized.slice(0, 800);
+      task._repeatErrorKey = '';
+      task._repeatErrorCount = 0;
+      return { callId: call.id, serialized };
+    } catch (error) {
+      toolRunRecord.durationMs = Date.now() - started;
+      toolRunRecord.status = 'error';
+      toolRunRecord.error = error.message;
+      if (signal.aborted) { if(effect)this.store.updateEffect(task,effect.id,'uncertain',{note:'Task was paused before observing a verifiable result.'}); throw error; }
+      if(effect)this.store.updateEffect(task,effect.id,'uncertain',{note:'Execution returned an error or was interrupted before observing a verifiable result.',error:error.message});
+      this.store.journal(task, 'tool_error', {name:call.function.name,error:error.message});
+      const errKey = `${call.function.name}|${call.function.arguments || ''}|${error.message}`;
+      if (task._repeatErrorKey === errKey) task._repeatErrorCount = (task._repeatErrorCount || 1) + 1;
+      else { task._repeatErrorKey = errKey; task._repeatErrorCount = 1; }
+      const payload = { error: error.message };
+      if (task._repeatErrorCount >= 3) {
+        payload.loopWarning = `You have called ${call.function.name} with the exact same arguments and hit the same error ${task._repeatErrorCount} times in a row. Do NOT repeat this identical call; change the arguments, use an alternative operation/tool, or report the limitation.`;
+      }
+      return { callId: call.id, serialized: JSON.stringify(payload) };
+    }
   }
   async run(task, signal) {
+    await this.plugins.ready;
     task.turnCallStart=task.calls?.length || 0;
     this.repairInterruptedCalls(task);
     this.flushPendingImages(task);
@@ -550,77 +1275,88 @@ export class Runtime extends EventEmitter {
       signal.throwIfAborted();
       this.flushFollowups(task);
       this.refreshProgressReminder(task);
-      task.liveActivity=step ? 'Reviewing results and preparing next step…' : 'Analyzing request and preparing execution plan…';
-      this.changed(task);
-      const settings = this.store.state.settings;
-      const effectiveTools = requestTools(this.effectiveSettings(task));
+      task.liveActivity=step ? 'Analyzing tool output…' : 'Thinking…';
+      task.liveTools = [];
+      this.emitDelta(task);
+      const settings = this.effectiveSettings(task);
+      const effectiveTools = requestTools(settings, this.plugins, task.loadedToolsets);
       task.contextTokens = Math.max(this.estimate(task, this.buildContext(task,{hydrate:false})) + this.estimate(task, effectiveTools), task.lastInputTokens || 0);
       const threshold = settings.contextWindow * settings.compressionPercent / 100;
-      if (task.contextTokens >= threshold) { await this.compact(task, signal); task.lastInputTokens = 0; }
+      if (task.contextTokens >= threshold) {
+        // Stage 1: Zero-cost micro-compaction prunes old oversized tool outputs into lossless artifact references first
+        if (settings.microCompaction !== false) {
+          const micro = await this.microCompactTask(task);
+          if (micro.prunedCount > 0) {
+            task.lastInputTokens = 0;
+            task.contextTokens = this.estimate(task, this.buildContext(task, { hydrate: false })) + this.estimate(task, effectiveTools);
+          }
+        }
+        // Stage 2: Full structured LLM checkpoint compaction if still at or above threshold
+        if (task.contextTokens >= threshold) {
+          await this.compact(task, signal);
+          task.lastInputTokens = 0;
+        }
+      }
       if (this.estimate(task, this.buildContext(task,{hydrate:false})) + this.estimate(task, effectiveTools) > settings.contextWindow) throw new Error('Context exceeds the operating ceiling even after compaction. Increase the context ceiling or split the task; history is preserved.');
-      const {message, usage,responseId} = await this.completion(this.buildContext(task), task, signal);
+      const {message, usage, responseId} = await this.completion(this.buildContext(task), task, signal, { keepLiveOnSuccess: true });
       task.steps++; task.lastInputTokens = usage?.prompt_tokens || 0; task.usage = (task.usage || 0) + (usage?.total_tokens || 0);
       this.store.transcript(task, message);
       const stepReasoning=reasoningToText(message.reasoning_details);
-      if (message.content) task.conversation.push({id:responseId,role:'assistant',content:message.content,reasoning:stepReasoning,sources:message.sources,step:task.steps||undefined,telemetry:task.lastTurnTelemetry});
-      else if (stepReasoning) task.conversation.push({id:responseId,role:'assistant',content:null,reasoning:stepReasoning,sources:message.sources,step:task.steps||undefined,telemetry:task.lastTurnTelemetry});
-      task.contextTokens=this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task)));
-      this.changed(task);
+      const cleanContent = typeof message.content === 'string' && message.content.trim() ? message.content : null;
+      const toolRecords = (message.tool_calls || []).map(call => ({
+        id: crypto.randomUUID(),
+        callId: call.id,
+        step: task.steps,
+        name: call.function.name,
+        args: {},
+        status: 'running',
+        durationMs: null,
+        preview: '',
+      }));
+      let convEntry = null;
+      if (cleanContent || stepReasoning || toolRecords.length) {
+        convEntry = {
+          id: responseId,
+          role: 'assistant',
+          content: cleanContent,
+          ...(stepReasoning ? { reasoning: stepReasoning } : {}),
+          ...(message.sources?.length ? { sources: message.sources } : {}),
+          ...(toolRecords.length ? { toolRuns: toolRecords } : {}),
+          step: task.steps || undefined,
+          telemetry: task.lastTurnTelemetry,
+        };
+        task.conversation.push(convEntry);
+      }
+      // Clear live stream atomically in the same synchronous frame as pushing convEntry (zero flicker!)
+      task.liveText = '';
+      task.liveReasoning = '';
+      task.liveActivity = toolRecords.length ? `Running ${toolRecords.length} ${toolRecords.length === 1 ? 'tool' : 'tools'}…` : '';
+      task.liveTools = [];
+      task.contextTokens=this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task), this.plugins, task.loadedToolsets));
       if (!message.tool_calls?.length) {
         task.result = message.content; task.status = 'complete';
         this.store.journal(task, 'complete', { result:message.content });
+        this.changed(task);
         return;
       }
-      for (const call of message.tool_calls) {
-        signal.throwIfAborted();
-        let result,effect;
-        try {
-          if (!baseTools.some(t => t.function.name === call.function.name)) throw new Error('Unknown tool');
-          let args = JSON.parse(call.function.arguments);
-          if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid tool arguments');
-          let name = call.function.name;
-          if(name==='invoke_function'){
-            const resolved=this.capabilities.resolve(args.id,args.input);
-            name=resolved.tool;args=resolved.args;
-            this.store.journal(task,'function_resolved',{...resolved.capability,tool:name});
-          }
-          if(name.startsWith('desktop_')) {
-            if(this.desktopOwner && this.desktopOwner !== task.id) throw new Error('Another agent is currently using the desktop. Continue with independent work or finish and resume later.');
-            this.desktopOwner = task.id;
-          }
-          if (this.needsApproval(name, task) && !(await this.approval(task, name, args, signal))) result = { denied:true, reason:'The user declined this action. Respect this decision.' };
-          else {
-            this.store.journal(task, 'tool_intent', {name,args});
-            if(externalEffects.has(name)){
-              effect=this.store.beginEffect(task,name,args);
-              this.store.updateEffect(task,effect.id,'dispatched');
-            }
-            task.liveActivity='Executing '+name.replaceAll('_',' ')+'…';
-            this.changed(task);
-            result = await executeTool(this, task, name, args, signal, effect);
-          }
-          if (result?.image) {
-            const attachment=await materializeImageAttachment(this.store,task,result.image,{dimensions:result.dimensions,name:result.name||'desktop-screenshot'});
-            task.pendingImages ||= [];
-            task.pendingImages.push(attachment);
-            this.store.journal(task, 'tool_result', {name, result:'Screenshot saved as local attachment', attachment});
-            this.store.transcript(task, {role:'tool',tool_call_id:call.id, content:JSON.stringify({captured:true,dimensions:result.dimensions})});
-            if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:attachment});
-            continue;
-          }
-          const materialized=await materializeToolResult(this.store,task,name,result);
-          this.store.journal(task, 'tool_result', {name, result:materialized.journal});
-          if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:materialized.artifact || null});
-          task.liveActivity='Verifying output of '+name.replaceAll('_',' ')+'…';
-          result=materialized.model;
-        } catch (error) {
-          if (signal.aborted) { if(effect)this.store.updateEffect(task,effect.id,'uncertain',{note:'Task was paused before observing a verifiable result.'}); throw error; }
-          if(effect)this.store.updateEffect(task,effect.id,'uncertain',{note:'Execution returned an error or was interrupted before observing a verifiable result.',error:error.message});
-          result = {error:error.message}; this.store.journal(task, 'tool_error', {name:call.function.name,error:error.message});
+      this.changed(task);
+
+      const canParallel = message.tool_calls.length > 1 && message.tool_calls.every(call =>
+        (READ_ONLY_TOOL_NAMES.has(call.function.name) || this.plugins?.findTool(call.function.name)?.tool?.readOnly) && !this.needsApproval(call.function.name, task)
+      );
+      if (canParallel) {
+        const results = await Promise.all(message.tool_calls.map((call, idx) => this.executeSingleToolCall(task, call, signal, toolRecords[idx])));
+        for (const item of results) {
+          this.store.transcript(task, { role: 'tool', tool_call_id: item.callId, content: item.serialized });
         }
-        const serialized = typeof result === 'string' ? result : JSON.stringify(result);
-        this.store.transcript(task, {role:'tool',tool_call_id:call.id,content:serialized});
         this.changed(task);
+      } else {
+        for (let idx = 0; idx < message.tool_calls.length; idx++) {
+          signal.throwIfAborted();
+          const item = await this.executeSingleToolCall(task, message.tool_calls[idx], signal, toolRecords[idx]);
+          this.store.transcript(task, { role: 'tool', tool_call_id: item.callId, content: item.serialized });
+          this.changed(task);
+        }
       }
       this.flushPendingImages(task);
     }
@@ -629,7 +1365,8 @@ export class Runtime extends EventEmitter {
   validateConnector(connector) {
     if (!connector || typeof connector.name !== 'string' || !/^[\w -]{1,80}$/.test(connector.name)) throw new Error('Invalid connector name.');
     const url = new URL(connector.url);
-    if (url.protocol !== 'https:' || url.username || url.password) throw new Error('Use an HTTPS URL without embedded credentials.');
+    const allowedProtocols = connector.openapi ? ['https:'] : ['https:', 'http:'];
+    if (!allowedProtocols.includes(url.protocol) || url.username || url.password) throw new Error(connector.openapi ? 'Use an HTTPS URL without embedded credentials.' : 'Use an HTTP or HTTPS URL without embedded credentials.');
     if (!['GET','POST','PUT','PATCH','DELETE'].includes(connector.method)) throw new Error('Unsupported HTTP method');
     if (connector.secretRef && !/^CONNECTOR_[A-Z0-9_]+$/.test(connector.secretRef)) throw new Error('Secret reference must start with CONNECTOR_.');
     if(connector.idempotencyHeader !== undefined && typeof connector.idempotencyHeader !== 'boolean')throw new Error('Invalid idempotency configuration.');
@@ -637,7 +1374,7 @@ export class Runtime extends EventEmitter {
     if(connector.reconciliationUrl){
       if(typeof connector.reconciliationUrl !== 'string')throw new Error('Invalid reconciliation URL.');
       const check=new URL(connector.reconciliationUrl.replaceAll('{operationId}','00000000-0000-0000-0000-000000000000'));
-      if(check.protocol!=='https:'||check.username||check.password)throw new Error('Reconciliation URL must be HTTPS and must not contain embedded credentials.');
+      if(!['https:', 'http:'].includes(check.protocol)||check.username||check.password)throw new Error('Reconciliation URL must be HTTP or HTTPS and must not contain embedded credentials.');
     }
   }
   connectorHeaders(connector) {
@@ -656,7 +1393,19 @@ export class Runtime extends EventEmitter {
     const request = connector.openapi ? openApiRequest(connector,args.input) : {url:new URL(connector.url),body:connector.method==='GET'?undefined:JSON.stringify(args.input||{})};
     const {url,body}=request, headers = this.connectorHeaders(connector);
     if(connector.idempotencyHeader && effect?.id)headers['Idempotency-Key']=effect.id;
-    if (!connector.openapi && connector.method === 'GET') for (const [key,value] of Object.entries(args.input || {})) url.searchParams.set(key,String(value));
+    if (!connector.openapi && connector.method === 'GET') {
+      for (const [key, value] of Object.entries(args.input || {})) {
+        if (value === undefined || value === null) continue;
+        if (key === 'query' && typeof value === 'object' && !Array.isArray(value)) {
+          for (const [qk, qv] of Object.entries(value)) {
+            if (qv === undefined || qv === null) continue;
+            url.searchParams.set(qk, typeof qv === 'object' ? JSON.stringify(qv) : String(qv));
+          }
+          continue;
+        }
+        url.searchParams.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+      }
+    }
     const response = await this.request(url, {method:connector.method, headers, redirect:'error', body, signal:AbortSignal.any([signal,AbortSignal.timeout(30000)])});
     const reader = response.body?.getReader(); let text = ''; const decoder = new TextDecoder();
     if(reader)try { while (text.length < 32000) { const chunk = await reader.read(); if(chunk.done) {text+=decoder.decode();break;} text += decoder.decode(chunk.value,{stream:true}); } } finally { await reader.cancel(); }
@@ -681,5 +1430,5 @@ export class Runtime extends EventEmitter {
     try { const result=await this.invokeConnector(effect.args,signal,effect);return this.store.updateEffect(task,id,'observed',{lastStatus:result.status}); }
     catch(error){this.store.updateEffect(task,id,'uncertain',{note:'Retry did not produce a verifiable result.',error:error.message});throw error;}
   }
-  shutdown() { this.closed = true; for (const controller of this.active.values()) controller.abort();for(const controller of this.compressionControllers.values())controller.abort(); this.processes?.stopAll(); }
+  shutdown() { this.closed = true; for (const controller of this.active.values()) controller.abort();for(const controller of this.compressionControllers.values())controller.abort(); this.processes?.stopAll(); try{this.store.flushSave();}catch{} }
 }

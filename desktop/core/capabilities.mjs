@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const functionTargets=['list_files','read_file','search_files','glob_files','grep_search','write_file','replace_text','multi_edit','apply_patch','git_operation','run_command','manage_process','web_fetch','invoke_connector','invoke_mcp','read_attachment','search_history','search_journal'];
+export const functionTargets=['list_files','dir_tree','read_file','batch_read_files','search_files','glob_files','grep_search','code_outline','run_diagnostics','write_file','replace_text','multi_edit','apply_patch','delete_file','move_file','git_operation','run_command','shell_session','manage_process','web_search','web_fetch','http_request','browser_inspect','invoke_connector','invoke_mcp','scaffold_mcp_server','delegate_subagent','todo_write','memory_store','manage_automation','system_info','read_attachment','search_history','search_journal'];
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const validId=id=>typeof id==='string'&&/^[a-f0-9-]{36}$/.test(id);
 const metadata=entry=>({id:entry.id,kind:entry.kind,name:entry.name,description:entry.description,tags:entry.tags,enabled:entry.enabled,revision:entry.revision,updatedAt:entry.updatedAt});

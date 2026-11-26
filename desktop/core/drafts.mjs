@@ -5,13 +5,13 @@ import crypto from 'node:crypto';
 const uuid='[a-f0-9-]{36}';
 const keyPattern=new RegExp('^(task:'+uuid+'|new:('+uuid+')?)$');
 function validate(value){
-  if(!value || !keyPattern.test(value.key) || !Number.isSafeInteger(value.revision) || value.revision<1 || typeof value.text!=='string' || !Array.isArray(value.attachmentIds) || value.attachmentIds.some(id=>typeof id!=='string'||!new RegExp('^'+uuid+'$').test(id)))throw new Error('Borrador no válido.');
-  if(value.workspace!==undefined && typeof value.workspace!=='string')throw new Error('Carpeta de borrador no válida.');
+  if(!value || !keyPattern.test(value.key) || !Number.isSafeInteger(value.revision) || value.revision<1 || typeof value.text!=='string' || !Array.isArray(value.attachmentIds) || value.attachmentIds.some(id=>typeof id!=='string'||!new RegExp('^'+uuid+'$').test(id)))throw new Error('Invalid draft.');
+  if(value.workspace!==undefined && typeof value.workspace!=='string')throw new Error('Invalid draft workspace folder.');
   return value;
 }
 export class DraftStore {
   constructor(directory){this.directory=path.join(directory,'drafts');fs.mkdirSync(this.directory,{recursive:true});this.items=new Map();this.issues=[];this.load();}
-  filename(key){if(!keyPattern.test(key))throw new Error('Chat de borrador no válido.');return path.join(this.directory,crypto.createHash('sha256').update(key).digest('hex')+'.json');}
+  filename(key){if(!keyPattern.test(key))throw new Error('Invalid draft chat key.');return path.join(this.directory,crypto.createHash('sha256').update(key).digest('hex')+'.json');}
   load(){
     const files=new Set(fs.readdirSync(this.directory).filter(name=>/^[a-f0-9]{64}\.json(\.tmp|\.bak)?$/.test(name)).map(name=>name.replace(/\.(tmp|bak)$/,'')));
     for(const name of files){
@@ -19,13 +19,13 @@ export class DraftStore {
       for(const candidate of [primary,primary+'.tmp',primary+'.bak']){
         try{
           const value=validate(JSON.parse(fs.readFileSync(candidate,'utf8')));
-          if(this.filename(value.key)!==primary)throw new Error('Referencia de borrador incorrecta.');
+          if(this.filename(value.key)!==primary)throw new Error('Mismatched draft key reference.');
           this.items.set(value.key,value);recovered=true;
-          if(candidate!==primary)this.issues.push('Se recuperó un borrador desde una copia local.');
+          if(candidate!==primary)this.issues.push('A draft was recovered from a local backup copy.');
           break;
         }catch{}
       }
-      if(!recovered)this.issues.push('Un borrador no se pudo leer; sus archivos originales se conservan.');
+      if(!recovered)this.issues.push('A draft could not be read; original files are preserved.');
     }
   }
   list(){return {items:Object.fromEntries(this.items),issues:[...this.issues]};}

@@ -16,7 +16,7 @@ export class ResponseJournal {
   }
   write(entry){
     const buffer=Buffer.from(JSON.stringify(entry)+'\n');let offset=0;
-    while(offset<buffer.length){const written=fs.writeSync(this.fd,buffer,offset,buffer.length-offset);if(!written)throw new Error('No se pudo guardar la respuesta en curso.');offset+=written;}
+    while(offset<buffer.length){const written=fs.writeSync(this.fd,buffer,offset,buffer.length-offset);if(!written)throw new Error('Could not persist active streaming response.');offset+=written;}
   }
   update(text){
     if(text===this.text)return;

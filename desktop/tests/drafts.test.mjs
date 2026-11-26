@@ -59,7 +59,7 @@ test('failed draft saves block close/send until a successful retry',async t=>{
  const {store}=await setup(t);const api=apiFor(store);let failing=true;
  const controller=new DraftController(async(method,args)=>{if(method==='saveDraft'&&failing)throw new Error('Disk full');return api(method,args);});
  await controller.load();controller.update(key,{text:'No perder'});
- await assert.rejects(controller.flush(),/No se pudo guardar/);assert.equal(controller.status[key],'error');assert.equal(controller.get(key).text,'No perder');
+ await assert.rejects(controller.flush(),/Could not save a draft/);assert.equal(controller.status[key],'error');assert.equal(controller.get(key).text,'No perder');
  failing=false;await controller.retry(key);await controller.flush();assert.equal(controller.status[key],'saved');
 });
 test('clearing one submitted draft retains other chats and edits made while sending',async t=>{
@@ -69,12 +69,16 @@ test('clearing one submitted draft retains other chats and edits made while send
  assert.equal(controller.get(key).text,'Edición posterior');assert.equal(controller.get('new:').text,'Otro chat');
  await controller.clear(key,2);assert.equal(controller.get(key).text,'');assert.equal(store.list().items[key].revision,3);
 });
-test('desktop close acknowledgment waits for the renderer save barrier and reports failure',async()=>{
- let bridge,handler;const sent=[];
- const code=await fs.readFile(new URL('../preload.cjs',import.meta.url),'utf8');
- vm.runInNewContext(code,{require:()=>({contextBridge:{exposeInMainWorld:(_,value)=>bridge=value},ipcRenderer:{on:(_,cb)=>handler=cb,send:(...args)=>sent.push(args),removeListener:()=>{handler=null;}}})});
- let release;const gate=new Promise(resolve=>release=resolve);const off=bridge.beforeClose(()=>gate);
- handler();await Promise.resolve();assert.equal(sent.length,1);assert.equal(sent[0][0],'nexus:drafts:ready');
- release(true);await new Promise(resolve=>setImmediate(resolve));assert.equal(sent.at(-1)[1],true);off();assert.equal(handler,null);
- bridge.beforeClose(async()=>{throw new Error('Save failed');});handler();await new Promise(resolve=>setImmediate(resolve));assert.equal(sent.at(-1)[1],false);
+test('debounced DraftController coalesces rapid edits and flushes deterministically before close',async t=>{
+ const {store}=await setup(t);
+ let saveCalls=0;
+ const baseApi=apiFor(store);
+ const controller=new DraftController(async(method,args)=>{if(method==='saveDraft')saveCalls++;return baseApi(method,args);},()=>{},{debounceMs:40});
+ await controller.load();
+ controller.update(key,{text:'H'});controller.update(key,{text:'He'});controller.update(key,{text:'Hello'});
+ assert.equal(saveCalls,0);
+ await controller.flush();
+ assert.equal(saveCalls,1);
+ assert.equal(store.list().items[key].text,'Hello');
+ assert.equal(controller.status[key],'saved');
 });

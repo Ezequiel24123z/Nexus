@@ -2,3 +2,5 @@ node_modules/
 ui/
 release/
 test-results/
+native-host/bin/
+native-host/obj/

@@ -23,14 +23,29 @@ export function networkFailure(error,provider) {
     code==='ECONNREFUSED'?'The service refused the connection.':'The connection was interrupted before completing the response.';
   return new Error('Could not connect to '+provider+'. '+reason+' Your message is preserved; you can resume the chat.');
 }
-export function providerHttpFailure(status,provider) {
+export function extractSafeProviderDetail(bodyText = '', secret = '') {
+  if (!bodyText || typeof bodyText !== 'string') return '';
+  try {
+    const parsed = JSON.parse(bodyText);
+    const msg = parsed?.error?.message || parsed?.message || '';
+    if (typeof msg !== 'string' || !msg.trim()) return '';
+    let clean = msg.trim().slice(0, 260);
+    if (secret && secret.length > 4) clean = clean.replaceAll(secret, '[redacted]');
+    return clean;
+  } catch {
+    return '';
+  }
+}
+
+export function providerHttpFailure(status,provider,detail='') {
   const reason=status===401?'The API key or token was rejected; check it in Settings.':
     status===403?'Your account does not have access to this model or resource.':
     status===429?'Rate or concurrency limit reached; wait a moment and resume the chat.':
     [502,503,504].includes(status)?'The service or model is temporarily unavailable; you can resume the chat.':
     status===400?'The request was rejected by the provider. Check the model ID, context window, and parameters.':
     'Check the model and your account status; you can resume the chat.';
-  const error=new Error(provider+' returned HTTP '+status+'. '+reason);
+  const suffix = detail ? ' Detail: ' + detail : '';
+  const error=new Error(provider+' returned HTTP '+status+'. '+reason+suffix);
   error.retryable=[408,502,503,504].includes(status);
   return error;
 }
