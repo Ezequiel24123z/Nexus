@@ -2,6 +2,26 @@
 
 All notable changes to **NEXUS** are documented in this file.
 
+## [1.2.0] - 2026-11-26
+
+### Added
+- **Structured User Memory, Priorities & Working Style System (`core/memory.mjs` + `MemoryView.jsx`)**:
+  - Dedicated **Memory & Profile** studio in the main sidebar and Command Palette (`Ctrl+K`) with 6 categories (`priority`, `preference`, `constraint`, `workflow`, `profile`, `fact`), 4 priority levels (`critical`, `high`, `normal`, `low`), pinning, tags, Global vs. Project scopes, live **Prompt Preview**, and Markdown/JSON export & import.
+  - Upgraded `memory_store` tool (`list`, `search`, `remember`, `update`, `forget`, `profile`) promoted into `CORE_TOOL_NAMES` so agents always preserve and respect user priorities, working style, and hard constraints—even when Lazy Toolsets are active.
+  - Priority-ranked structured Markdown memory profile injection into `runtime.buildContext()` with seamless backward-compatible migration of legacy memories.
+- **Real JavaScript WebView2 Browser Inspection & DOM Actions (`native-host/NativeBrowser.cs`)**:
+  - Wired `NEXUS.exe --browser-inspect` into `core/server.mjs` and `browser_inspect` so `renderJs: true` executes real JavaScript inside an offscreen Edge WebView2 instance (supporting SPAs, `waitMs`, `waitForSelector`, scripted DOM `actions` for `click`/`type`/`select`/`scroll`/`wait`/`eval`, optional Account Mode cookies, interactive CSS selector extraction, and `captureScreenshot` while preserving full extracted DOM text).
+  - Semi-Autopilot automatically gates interactive `browser_inspect` calls (`actions` / `useAccountSession`) while keeping passive reads frictionless; static HTTP fallback transparently reports `renderedJs: false` with `renderJsNote`.
+- **Windows UI Automation, Privacy-Safe Window Capture & Multi-Monitor Desktop Control**:
+  - Added `desktop_windows` (`NEXUS.exe --list-windows`) to enumerate all monitors and visible desktop windows (`hwnd`, `title`, `processName`, `bounds`, `active`).
+  - Added `desktop_ui_tree` (`desktop/native/ui-tree.ps1`) using native Windows UI Automation (`UIAutomationClient`) to inspect buttons, inputs, tabs, values, and exact clickable `(x, y)` center coordinates without capturing pixels.
+  - Upgraded `desktop_screenshot` (`NativeDesktop.cs`) with **window-only capture via Win32 `PrintWindow`** (`windowTitle`/`hwnd` so unrelated sensitive windows are never captured), multi-monitor selection (`monitor: 0 | 1 | "all"`), and region cropping.
+  - Upgraded `desktop_action` with `focus_window`, `move`, and `drag`.
+- **Realistic Configurable Browser HTTP Headers**:
+  - Unified standard Edge/Chrome Windows browser headers (`User-Agent`, `Sec-CH-UA`, `Accept-Language`, `Sec-Fetch-*`) across `web_fetch`, `browser_inspect`, and `web_search` instead of identifying as `NEXUS-Agent`, with optional custom `webUserAgent` override in Settings and `nexus.config.json`.
+- **Inline Session Renaming Anytime**:
+  - Rename any session (root or nested child) anytime—even while the agent is actively running—by clicking the topbar title / pencil icon, double-clicking or clicking the pencil icon in the sidebar, or saving from Chat Settings.
+
 ## [1.1.0] - 2026-11-26
 
 ### Added

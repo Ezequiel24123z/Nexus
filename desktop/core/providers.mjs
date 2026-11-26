@@ -47,7 +47,7 @@ export async function resolveCopilotAuth(rawToken, { request = fetch, base = 'ht
     headers: {
       Authorization: 'token ' + token,
       Accept: 'application/json',
-      'User-Agent': 'NEXUS-Desktop/1.1',
+      'User-Agent': 'NEXUS-Desktop/1.2',
       'Editor-Version': 'vscode/1.99.0',
       'Editor-Plugin-Version': 'copilot-chat/0.26.0',
     },

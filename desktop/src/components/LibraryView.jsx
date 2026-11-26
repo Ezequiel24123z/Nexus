@@ -133,23 +133,31 @@ export default function LibraryView({ state, act, notify, navigate }) {
 
         {subTab === 'memories' && (
           <div className="panel-card">
-            <h2>Persistent Agent Memories</h2>
-            <p className="hint">Automatically injected into matching future sessions.</p>
+            <div className="row-between" style={{ marginBottom: 8 }}>
+              <div>
+                <h2 style={{ margin: 0 }}>Persistent User & Project Memories</h2>
+                <p className="hint" style={{ margin: '4px 0 0' }}>Priorities, preferences, constraints, and facts automatically injected into sessions.</p>
+              </div>
+              <button type="button" className="btn-secondary" onClick={() => navigate('memory')}><Brain size={14} /> Open Full Memory Studio</button>
+            </div>
             <form className="row" style={{ marginBottom: 16, flexWrap: 'wrap' }} onSubmit={async e => {
               e.preventDefault();
               if (!memKey.trim() || !memVal.trim()) return;
-              const list = await act('memorySave', { key: memKey, value: memVal, scope: memScope });
+              const list = await act('memorySave', { key: memKey, value: memVal, scope: memScope, category: 'preference', priority: 'high' });
               if (list) { setMemories(list); setMemKey(''); setMemVal(''); notify('Memory stored.', 'ok'); }
             }}>
               <input placeholder="Topic / key" value={memKey} onChange={e => setMemKey(e.target.value)} style={{ flex: 1, minWidth: 160 }} />
-              <input placeholder="Fact, convention, or preference to remember…" value={memVal} onChange={e => setMemVal(e.target.value)} style={{ flex: 2, minWidth: 240 }} />
+              <input placeholder="Preference, priority, or rule to remember…" value={memVal} onChange={e => setMemVal(e.target.value)} style={{ flex: 2, minWidth: 240 }} />
               <select value={memScope} onChange={e => setMemScope(e.target.value)} style={{ width: 120 }}><option value="global">Global</option><option value="project">Project</option></select>
               <button className="btn-primary"><Plus size={14} /> Remember</button>
             </form>
             {memories.map(m => (
               <div key={m.id} className="list-row">
                 <div>
-                  <strong>{m.key}</strong> <span className="pill" style={{ marginLeft: 6 }}>{m.scope}</span>
+                  <strong>{m.key}</strong>
+                  <span className="pill" style={{ marginLeft: 6 }}>{m.category || 'fact'}</span>
+                  <span className="pill info" style={{ marginLeft: 4 }}>{m.priority || 'normal'}</span>
+                  <span className="pill" style={{ marginLeft: 4 }}>{m.scope}</span>
                   <p className="hint" style={{ margin: '4px 0 0' }}>{m.value}</p>
                 </div>
                 <button type="button" className="btn-danger" onClick={async () => setMemories(await act('memoryDelete', { id: m.id }) || [])}><Trash2 size={14} /></button>

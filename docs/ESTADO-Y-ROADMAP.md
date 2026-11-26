@@ -1,6 +1,19 @@
-# Status & Roadmap (`v1.1.0` Standalone Native Release)
+# Status & Roadmap (`v1.2.0` Standalone Native Release)
 
 Updated: November 26, 2026.
+
+## Implemented in NEXUS `v1.2.0`
+
+- **Structured User Memory, Priorities & Working Style System (`core/memory.mjs` + `MemoryView.jsx`)**:
+  - Dedicated **Memory & Profile** view in the sidebar & Command Palette with 6 categories (`priority`, `preference`, `constraint`, `workflow`, `profile`, `fact`), 4 priority levels (`critical`, `high`, `normal`, `low`), pinning, tags, Global vs. Project scopes, live **Prompt Preview**, and Markdown/JSON export & import.
+  - Priority-ranked Markdown context injection into `runtime.buildContext()` and upgraded `memory_store` (`list`, `search`, `remember`, `update`, `forget`, `profile`) promoted into `CORE_TOOL_NAMES` so user preferences and priorities are always respected across sessions.
+- **Native Headless Edge WebView2 JS Rendering & DOM Automation (`NativeBrowser.cs`)**:
+  - `browser_inspect` now wires directly to `NEXUS.exe --browser-inspect`, executing real JavaScript for SPAs (`renderJs: true`, `waitMs`, `waitForSelector`), running scripted DOM `actions` (`click`, `type`, `select`, `scroll`, `wait`, `eval`), optionally reusing Account Mode cookies, returning interactive CSS selectors, and capturing screenshots while preserving full extracted DOM text.
+  - Semi-Autopilot gates interactive/account browser actions while passive reads remain frictionless.
+- **Windows UI Automation, Privacy-Safe Window Capture & Multi-Monitor Support (`NativeDesktop.cs` + `ui-tree.ps1`)**:
+  - `desktop_windows` (`--list-windows`) enumerates all monitors and visible windows; `desktop_ui_tree` inspects the real Windows UI Automation accessibility tree returning buttons, inputs, values, and exact click centers with zero screenshots; `desktop_screenshot` supports window-only capture (`PrintWindow`), multi-monitor (`0`, `1`, `"all"`), and region crops; `desktop_action` adds `focus_window`, `move`, and `drag`.
+- **Realistic Configurable Browser HTTP Headers**:
+  - Standard Edge/Chrome Windows browser headers across `web_fetch`, `browser_inspect`, and `web_search` (no longer exposing `NEXUS-Agent`), with optional custom `webUserAgent` override in Settings and `nexus.config.json`.
 
 ## Implemented in NEXUS `v1.1.0`
 

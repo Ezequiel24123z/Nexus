@@ -328,6 +328,15 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
                 <div><strong>OpenRouter Native Web Search</strong><p>Allows OpenRouter models to invoke server-side web search with structured citations.</p></div>
                 <input type="checkbox" className="switch-input" checked={!!s.webSearchEnabled} onChange={e => setSetting('webSearchEnabled', e.target.checked)} />
               </label>
+              <label className="field" style={{ marginTop: 12 }}>
+                <span>Web Tool User-Agent Override (blank = standard Edge/Chrome Windows browser)</span>
+                <input
+                  key={s.webUserAgent || 'default-ua'}
+                  defaultValue={s.webUserAgent || ''}
+                  placeholder="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 …"
+                  onBlur={e => setSetting('webUserAgent', e.target.value.trim())}
+                />
+              </label>
             </section>
 
             <section className="panel-card wide">

@@ -38,7 +38,7 @@ export class McpManager extends EventEmitter{
  async open(name){
   const server=this.store.state.mcpServers.find(s=>s.name===name);if(!server)throw new Error('MCP server not found');validateServer(server);
   this.mark(name,{status:'connecting',tools:[],resources:[],prompts:[]});
-  const client=new Client({name:'nexus-desktop',version:'1.1.0'},{capabilities:{}});
+  const client=new Client({name:'nexus-desktop',version:'1.2.0'},{capabilities:{}});
   const secret=ref=>{const v=this.getSecret(ref);if(!v)throw new Error('Configure secret '+ref);return v;};
   try{
    let transport;

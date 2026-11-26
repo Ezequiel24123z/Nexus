@@ -672,12 +672,32 @@ export function htmlToReadableText(html = '') {
     .trim();
 }
 
-export async function fetchWebResource(urlInput, { extractText = true, offset = 0, length = 12000, request = fetch, signal } = {}) {
+export const DEFAULT_BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0';
+
+export function buildBrowserHeaders(customUserAgent = '', extra = {}) {
+  const ua = String(customUserAgent || '').trim() || DEFAULT_BROWSER_USER_AGENT;
+  return {
+    'User-Agent': ua,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-CH-UA': '"Chromium";v="134", "Microsoft Edge";v="134", "Not:A-Brand";v="24"',
+    'Sec-CH-UA-Mobile': '?0',
+    'Sec-CH-UA-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1',
+    ...extra,
+  };
+}
+
+export async function fetchWebResource(urlInput, { extractText = true, offset = 0, length = 12000, userAgent = '', request = fetch, signal } = {}) {
   let parsed;
   try { parsed = new URL(urlInput); } catch { throw new Error('Invalid URL.'); }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS URLs are supported.');
   const response = await request(parsed.href, {
-    headers: { 'User-Agent': 'NEXUS-Agent/1.1 (+https://github.com/Ezequiel24123z/Nexus)' },
+    headers: buildBrowserHeaders(userAgent),
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
   });
   const contentType = response.headers.get('content-type') || '';
@@ -1255,15 +1275,39 @@ export class StatefulShellManager {
   }
 }
 
-export async function inspectWebPage(urlInput, { extractLinks = true, extractForms = true, renderJs = false, browserInspect, request = fetch, signal } = {}) {
+export async function inspectWebPage(urlInput, {
+  extractLinks = true,
+  extractForms = true,
+  renderJs = false,
+  waitMs,
+  waitForSelector = '',
+  actions = null,
+  useAccountSession = false,
+  captureScreenshot = false,
+  userAgent = '',
+  browserInspect,
+  request = fetch,
+  signal,
+} = {}) {
   let parsed;
   try { parsed = new URL(urlInput); } catch { throw new Error('Invalid URL.'); }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only HTTP and HTTPS URLs are supported.');
-  if (renderJs && typeof browserInspect === 'function') {
-    return browserInspect(parsed.href, { extractLinks, extractForms, signal });
+  const needsJsEngine = Boolean(renderJs || (Array.isArray(actions) && actions.length > 0) || waitForSelector || captureScreenshot || useAccountSession);
+  if (needsJsEngine && typeof browserInspect === 'function') {
+    return browserInspect(parsed.href, {
+      extractLinks,
+      extractForms,
+      waitMs,
+      waitForSelector,
+      actions,
+      useAccountSession,
+      captureScreenshot,
+      userAgent: userAgent || DEFAULT_BROWSER_USER_AGENT,
+      signal,
+    });
   }
   const response = await request(parsed.href, {
-    headers: { 'User-Agent': 'NEXUS-Agent/1.1 (+https://github.com/Ezequiel24123z/Nexus)' },
+    headers: buildBrowserHeaders(userAgent),
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25000)]) : AbortSignal.timeout(25000),
   });
   const html = await response.text();
@@ -1299,6 +1343,9 @@ export async function inspectWebPage(urlInput, { extractLinks = true, extractFor
     url: parsed.href,
     status: response.status,
     title,
+    renderedJs: false,
+    engine: 'http-fetch',
+    ...(needsJsEngine ? { renderJsNote: 'Native WebView2 host (NEXUS.exe) is unavailable in this environment; fell back to static HTTP fetch (JavaScript did not execute).' } : {}),
     text,
     links,
     forms,
@@ -1371,15 +1418,11 @@ export async function moveFileWithBackup(store, task, source, dest, reqSource, r
   return { moved: true, from: reqSource, to: reqDest, written: reqDest, backup };
 }
 
-export async function searchWebDuckDuckGo(query, { maxResults = 8, request = fetch, signal } = {}) {
+export async function searchWebDuckDuckGo(query, { maxResults = 8, userAgent = '', request = fetch, signal } = {}) {
   const q = String(query || '').trim();
   if (!q) throw new Error('Provide a non-empty search query.');
   const limit = Math.max(1, Math.min(Number(maxResults) || 8, 15));
-  const browserHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-  };
+  const browserHeaders = buildBrowserHeaders(userAgent);
   const clean = s => String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
 
   // 1. Primary: DuckDuckGo HTML (skip HTTP 202 anti-bot challenge)

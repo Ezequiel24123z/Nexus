@@ -12,6 +12,7 @@ import {validateChatOptions, agentModes} from './chat-options.mjs';
 import {requestTools,affinitySession} from './model-request.mjs';
 import {CapabilityLibrary} from './capabilities.mjs';
 import {PluginManager, discoverWorkspaceSkills} from './plugins.mjs';
+import {selectMemoriesForContext, formatMemoriesForPrompt} from './memory.mjs';
 import {openApiRequest,validateOpenApiConnector} from './openapi.mjs';
 import {modelConnection,completionRequest,allProviders,resolveCopilotAuth} from './providers.mjs';
 import {isNetworkFailure,retryableNetworkFailure,networkFailure,providerHttpFailure,extractSafeProviderDetail} from './provider-errors.mjs';
@@ -67,6 +68,9 @@ export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
     if (matchesSemiAutoRule(rule, name, args)) {
       return { risky: false, reason: '' };
     }
+  }
+  if (name === 'browser_inspect' && ((Array.isArray(args?.actions) && args.actions.length > 0) || args?.useAccountSession)) {
+    return { risky: true, reason: `Interactive browser automation (${args?.url || 'page'})` };
   }
   if (READ_ONLY_TOOL_NAMES.has(name) || ['document_progress', 'todo_write', 'memory_store', 'search_capabilities', 'get_capability', 'get_connector'].includes(name)) {
     return { risky: false, reason: '' };
@@ -292,6 +296,7 @@ export class Runtime extends EventEmitter {
       if(!['low','medium','high'].includes(input.webSearchContext))throw new Error('Invalid web search context size');
       s.webSearchContext=input.webSearchContext;
     }
+    if(typeof input.webUserAgent==='string'&&input.webUserAgent.length<=400)s.webUserAgent=input.webUserAgent.trim();
     if(typeof input.globalInstructions === 'string')s.globalInstructions=input.globalInstructions;
     if (typeof input.model === 'string' && input.model.length < 180) s.model = input.model;
     if(input.favoriteModels!==undefined){if(!Array.isArray(input.favoriteModels)||input.favoriteModels.length>100||input.favoriteModels.some(id=>typeof id!=='string'||!id.trim()||id.length>180))throw new Error('Invalid favorite models list.');s.favoriteModels=[...new Set(input.favoriteModels.map(id=>id.trim()))];}
@@ -385,11 +390,18 @@ export class Runtime extends EventEmitter {
   }
   updateChat(input){
     const task=this.store.task(input.id),options=validateChatOptions(input);
-    if(Object.keys(options).some(key=>options[key]!==task[key])&&(this.active.has(task.id)||this.compacting.has(task.id)))throw new Error('Pause the task and wait for the active call to finish before changing model, mode, or thinking.');
+    const optionChanged = key => {
+      const next = options[key];
+      const prev = task[key];
+      if (next === prev) return false;
+      if ((next === null || next === undefined || next === '') && (prev === null || prev === undefined || prev === '')) return false;
+      return true;
+    };
+    if(Object.keys(options).some(optionChanged)&&(this.active.has(task.id)||this.compacting.has(task.id)))throw new Error('Pause the task and wait for the active call to finish before changing model, mode, or thinking.');
     if(input.projectId&& !this.store.state.projects.some(project=>project.id===input.projectId))throw new Error('Project not found');
     Object.assign(task,options);
     if(options.model)task.engine=modelConnection(options.model,this.store.state.settings).id;
-    if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim();
+    if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim().slice(0,120);
     if(typeof input.pinned==='boolean')task.pinned=input.pinned;
     if(input.projectId!==undefined)task.projectId=input.projectId||null;
     if(typeof input.workspace==='string')task.workspace=input.workspace;
@@ -683,7 +695,8 @@ export class Runtime extends EventEmitter {
     if (task?.sessionAutoApprove) return { required: false, reason: '' };
     const level = task?.agentMode || this.store.state.settings.agentMode || 'autopilot';
     if (level === 'unrestricted') return { required: false, reason: '' };
-    if (READ_ONLY_TOOL_NAMES.has(name) || this.plugins?.findTool(name)?.tool?.readOnly || ['document_progress', 'todo_write', 'memory_store'].includes(name)) {
+    const isInteractiveBrowser = name === 'browser_inspect' && ((Array.isArray(args?.actions) && args.actions.length > 0) || Boolean(args?.useAccountSession));
+    if (!isInteractiveBrowser && (READ_ONLY_TOOL_NAMES.has(name) || this.plugins?.findTool(name)?.tool?.readOnly || ['document_progress', 'todo_write', 'memory_store'].includes(name))) {
       return { required: false, reason: '' };
     }
     if (level === 'interactive') {
@@ -967,8 +980,9 @@ export class Runtime extends EventEmitter {
     if(workspaceRules)sections.push({id:'workspace-rules',label:'Repository Rules (NEXUS.md / CLAUDE.md / AGENTS.md)',reason:'Auto-discovered project instruction files in the workspace root.',value:workspaceRules,count:1});
     const projectSkills = task.workspace ? discoverWorkspaceSkills(task.workspace) : [];
     if(projectSkills.length)sections.push({id:'project-skills',label:'Project Skills (SKILL.md)',reason:'Auto-discovered SKILL.md files in .nexus/skills, .github/skills, or .claude/skills.',value:projectSkills.map(s=>({name:s.name,description:s.description,sourcePath:s.sourcePath})),count:projectSkills.length});
-    const relevantMemories = (this.store.state.memories || []).filter(m => m.scope === 'global' || (task.workspace && m.workspace === task.workspace));
-    if(relevantMemories.length)sections.push({id:'memories',label:'Persistent Memories',reason:'Saved project and global facts from memory_store.',value:relevantMemories,count:relevantMemories.length});
+    const relevantMemories = selectMemoriesForContext(this.store.state.memories || [], { workspace: task.workspace || '' });
+    const formattedMemories = formatMemoriesForPrompt(relevantMemories);
+    if(relevantMemories.length)sections.push({id:'memories',label:'User Memory, Priorities & Preferences',reason:'Structured persistent user priorities, preferences, constraints, workflows, and project facts.',value:relevantMemories,count:relevantMemories.length});
     const childSessions = (this.store.state.tasks || []).filter(t => t.parentTaskId === task.id);
     if (task.parentTaskId || childSessions.length) {
       const hierarchy = {
@@ -984,7 +998,7 @@ export class Runtime extends EventEmitter {
     const volatile=['User-pinned messages: '+JSON.stringify(pinned),'Dependency results: '+JSON.stringify(dependencyContext)];
     if(workspaceRules)volatile.push('Auto-discovered repository instructions (treat as project conventions):\n'+workspaceRules);
     if(projectSkills.length)volatile.push('Auto-discovered project SKILL.md skills (read via read_file when relevant):\n'+JSON.stringify(projectSkills.map(s=>({name:s.name,description:s.description,path:s.sourcePath}))));
-    if(relevantMemories.length)volatile.push('Persistent agent memories:\n'+JSON.stringify(relevantMemories.map(m=>({key:m.key,value:m.value,scope:m.scope}))));
+    if(formattedMemories)volatile.push('User memory profile (respect constraints, priorities, and preferences):\n'+formattedMemories);
     if (task.parentTaskId || childSessions.length) {
       volatile.push('Nested session tree (use send_session_message / read_session / list_sessions to coordinate):\n' + JSON.stringify({
         selfId: task.id,
@@ -1226,14 +1240,22 @@ export class Runtime extends EventEmitter {
         toolRunRecord.status = 'done';
       }
       if (result?.image) {
-        const attachment=await materializeImageAttachment(this.store,task,result.image,{dimensions:result.dimensions,name:result.name||'desktop-screenshot'});
+        const { image: rawImage, dimensions, name: imgName, ...restResult } = result;
+        const attachment=await materializeImageAttachment(this.store,task,rawImage,{dimensions,name:imgName||'desktop-screenshot'});
         task.pendingImages ||= [];
         task.pendingImages.push(attachment);
         this.store.journal(task, 'tool_result', {name, result:'Screenshot saved as local attachment', attachment});
         if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:attachment});
         toolRunRecord.durationMs = Date.now() - started;
         toolRunRecord.preview = 'Captured screenshot attachment';
-        return { callId: call.id, serialized: JSON.stringify({captured:true,dimensions:result.dimensions}) };
+        const hasExtraPayload = Object.keys(restResult).length > 0;
+        if (hasExtraPayload) {
+          const materializedExtra = await materializeToolResult(this.store, task, name, { ...restResult, capturedScreenshot: true, dimensions });
+          const serializedExtra = typeof materializedExtra.model === 'string' ? materializedExtra.model : JSON.stringify(materializedExtra.model);
+          toolRunRecord.preview = serializedExtra.slice(0, 800);
+          return { callId: call.id, serialized: serializedExtra };
+        }
+        return { callId: call.id, serialized: JSON.stringify({captured:true,dimensions}) };
       }
       const materialized=await materializeToolResult(this.store,task,name,result);
       this.store.journal(task, 'tool_result', {name, result:materialized.journal});

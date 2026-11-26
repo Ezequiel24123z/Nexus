@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   Plus, Search, Settings2, Folder, FolderOpen, MessageSquare, BookOpen, ListTodo,
   Network, Plug, Swords, PanelLeft, Sun, Moon, Pin, Trash2, GitFork, RefreshCw, X,
-  ChevronRight, Globe, Clock, Sparkles
+  ChevronRight, Globe, Clock, Sparkles, Brain, Pencil
 } from 'lucide-react';
 import { installNexusBridge } from './bridge.mjs';
 import './styles/tokens.css';
@@ -14,6 +14,7 @@ import ChatView from './components/ChatView.jsx';
 import ArenaView from './components/ArenaView.jsx';
 import StudioView from './components/StudioView.jsx';
 import LibraryView from './components/LibraryView.jsx';
+import MemoryView from './components/MemoryView.jsx';
 import GalleryView from './components/GalleryView.jsx';
 import ConnectorsView from './components/ConnectorsView.jsx';
 import McpView from './components/McpView.jsx';
@@ -87,8 +88,34 @@ function App() {
   const [toasts, setToasts] = useState([]);
   const [projectModal, setProjectModal] = useState(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [renaming, setRenaming] = useState(null);
   const [loaded, setLoaded] = useState({ id: null, conversation: [], conversationStart: 0, events: [], eventsStart: 0 });
   const toastSeq = useRef(0);
+  const renameCommitRef = useRef(false);
+
+  const startRename = (targetTask, location) => {
+    if (!targetTask) return;
+    renameCommitRef.current = false;
+    setRenaming({ id: targetTask.id, value: targetTask.title || '', original: targetTask.title || '', location });
+  };
+
+  const commitRename = async () => {
+    if (!renaming || renameCommitRef.current) return;
+    renameCommitRef.current = true;
+    const nextTitle = renaming.value.trim();
+    const targetId = renaming.id;
+    const orig = renaming.original;
+    setRenaming(null);
+    if (!nextTitle || nextTitle === orig) return;
+    if (await act('updateChat', { id: targetId, title: nextTitle })) {
+      notify('Session renamed.', 'ok');
+    }
+  };
+
+  const cancelRename = () => {
+    renameCommitRef.current = true;
+    setRenaming(null);
+  };
 
   const notify = (message, kind = 'info') => {
     const id = ++toastSeq.current;
@@ -204,6 +231,7 @@ function App() {
   const isDark = appearance.resolvedTheme !== 'light';
 
   const navItems = [
+    ['memory', Brain, 'Memory & Profile'],
     ['browser', Globe, 'Private Browser'],
     ['gallery', Sparkles, 'Skills & Plugins'],
     ['arena', Swords, 'Model Arena'],
@@ -217,6 +245,7 @@ function App() {
 
   const viewTitle = {
     chat: task?.title || currentProject?.name || 'New Chat',
+    memory: 'User Memory & Profile',
     browser: 'Private Browser',
     gallery: 'Skills & Plugins Gallery',
     arena: 'Model Arena',
@@ -258,6 +287,7 @@ function App() {
             <button key={id} type="button" className={`nav-btn ${view === id ? 'active' : ''}`} onClick={() => setView(id)}>
               <Icon size={15} />
               <span>{label}</span>
+              {id === 'memory' && (state.memoryCount || 0) > 0 && <span className="nav-badge tabular">{state.memoryCount}</span>}
               {id === 'queue' && activeCount > 0 && <span className="nav-badge tabular">{activeCount}</span>}
               {id === 'automations' && enabledAutomations > 0 && <span className="nav-badge tabular">{enabledAutomations}</span>}
             </button>
@@ -305,25 +335,49 @@ function App() {
             }
             const renderTaskRow = (t, depth = 0) => {
               const kids = childrenOf.get(t.id) || [];
+              const isRenamingHere = renaming?.id === t.id && renaming?.location === 'sidebar';
               return (
                 <React.Fragment key={t.id}>
                   <div className={`chat-item ${selected === t.id && view === 'chat' ? 'selected' : ''} ${depth > 0 ? 'nested-item' : ''}`} style={depth > 0 ? { marginLeft: Math.min(depth * 14, 28) } : undefined}>
-                    <button type="button" className="chat-item-main" onClick={() => openTask(t.id)}>
-                      <i className={`status-dot ${t.status}`} />
-                      <span>{t.title}</span>
-                      {kids.length > 0 && <small className="tag-chip tabular" style={{ fontSize: 9.5, padding: '0 5px' }}>{kids.length}</small>}
-                      {t.pinned && <Pin size={11} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
-                    </button>
-                    <div className="chat-item-actions">
-                      <button type="button" title={t.pinned ? 'Unpin' : 'Pin'} onClick={() => act('updateChat', { id: t.id, pinned: !t.pinned })}><Pin size={11} /></button>
-                      <button type="button" title="Fork chat" onClick={async () => { const r = await act('forkTask', { id: t.id }); if (r?.id) openTask(r.id); }}><GitFork size={11} /></button>
-                      <button type="button" title="Delete chat" onClick={async () => {
-                        if (await act('deleteTask', { id: t.id })) {
-                          if (selected === t.id) setSelected(null);
-                          notify('Chat deleted.', 'ok');
-                        }
-                      }}><Trash2 size={11} /></button>
-                    </div>
+                    {isRenamingHere ? (
+                      <div className="chat-item-main" style={{ paddingRight: 6 }}>
+                        <i className={`status-dot ${t.status}`} />
+                        <input
+                          aria-label="Rename session"
+                          autoFocus
+                          maxLength={120}
+                          value={renaming.value}
+                          onFocus={e => e.target.select()}
+                          onChange={e => setRenaming(prev => prev ? { ...prev, value: e.target.value } : prev)}
+                          onBlur={() => void commitRename()}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') { e.preventDefault(); void commitRename(); }
+                            else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                          }}
+                          style={{ flex: 1, minWidth: 0, padding: '2px 6px', fontSize: 12.5, height: 24 }}
+                        />
+                      </div>
+                    ) : (
+                      <>
+                        <button type="button" className="chat-item-main" onClick={() => openTask(t.id)} onDoubleClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }} title="Click to open · Double-click to rename">
+                          <i className={`status-dot ${t.status}`} />
+                          <span>{t.title}</span>
+                          {kids.length > 0 && <small className="tag-chip tabular" style={{ fontSize: 9.5, padding: '0 5px' }}>{kids.length}</small>}
+                          {t.pinned && <Pin size={11} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
+                        </button>
+                        <div className="chat-item-actions">
+                          <button type="button" title="Rename session" aria-label="Rename session" onClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }}><Pencil size={11} /></button>
+                          <button type="button" title={t.pinned ? 'Unpin' : 'Pin'} onClick={() => act('updateChat', { id: t.id, pinned: !t.pinned })}><Pin size={11} /></button>
+                          <button type="button" title="Fork chat" onClick={async () => { const r = await act('forkTask', { id: t.id }); if (r?.id) openTask(r.id); }}><GitFork size={11} /></button>
+                          <button type="button" title="Delete chat" onClick={async () => {
+                            if (await act('deleteTask', { id: t.id })) {
+                              if (selected === t.id) setSelected(null);
+                              notify('Chat deleted.', 'ok');
+                            }
+                          }}><Trash2 size={11} /></button>
+                        </div>
+                      </>
+                    )}
                   </div>
                   {kids.map(child => renderTaskRow(child, depth + 1))}
                 </React.Fragment>
@@ -354,7 +408,45 @@ function App() {
             <button type="button" className="btn-icon" title="Toggle sidebar · Ctrl+B" aria-label="Toggle sidebar" onClick={() => setSidebarCollapsed(c => !c)}><PanelLeft size={16} /></button>
             <span className="topbar-crumb">NEXUS</span>
             <ChevronRight size={13} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />
-            <span className="topbar-title">{viewTitle}</span>
+            {view === 'chat' && task && renaming?.id === task.id && renaming?.location === 'topbar' ? (
+              <input
+                aria-label="Rename active session"
+                autoFocus
+                maxLength={120}
+                value={renaming.value}
+                onFocus={e => e.target.select()}
+                onChange={e => setRenaming(prev => prev ? { ...prev, value: e.target.value } : prev)}
+                onBlur={() => void commitRename()}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') { e.preventDefault(); void commitRename(); }
+                  else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                }}
+                style={{ width: 280, maxWidth: '40vw', padding: '3px 8px', fontSize: 13.5, fontWeight: 550, height: 28 }}
+              />
+            ) : view === 'chat' && task ? (
+              <div className="row" style={{ gap: 4, minWidth: 0 }}>
+                <span
+                  className="topbar-title"
+                  style={{ cursor: 'pointer' }}
+                  title="Click to rename session"
+                  onClick={() => startRename(task, 'topbar')}
+                >
+                  {viewTitle}
+                </span>
+                <button
+                  type="button"
+                  className="btn-icon"
+                  style={{ width: 24, height: 24, opacity: 0.7 }}
+                  title="Rename session"
+                  aria-label="Rename active session"
+                  onClick={() => startRename(task, 'topbar')}
+                >
+                  <Pencil size={12} />
+                </button>
+              </div>
+            ) : (
+              <span className="topbar-title">{viewTitle}</span>
+            )}
           </div>
 
           <div className="topbar-right">
@@ -427,6 +519,7 @@ function App() {
             }}
           />
         )}
+        {view === 'memory' && <MemoryView state={state} workspace={activeWorkspace} act={act} notify={notify} />}
         {view === 'gallery' && <GalleryView act={act} notify={notify} navigate={setView} />}
         {view === 'arena' && <ArenaView state={state} models={models} workspace={activeWorkspace} setWorkspace={setWorkspace} projectId={projectId} openTask={openTask} act={act} notify={notify} />}
         {view === 'files' && <StudioView workspace={activeWorkspace} setWorkspace={setWorkspace} act={act} notify={notify} onOpenInChat={path => { setWorkspace(path); newChat(); }} />}

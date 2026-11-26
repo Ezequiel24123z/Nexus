@@ -29,7 +29,8 @@ import { inspectContext, contextSection, inspectCosts, previewCheckpoint } from 
 import { searchConversation, conversationWindow, taskResults, previewTaskResult } from './chat-workspace.mjs';
 import { validateChatOptions, validateModelCapabilities } from './chat-options.mjs';
 import { modelConnection, providerCatalog, checkArliConnection, checkProviderConnection, SECRET_KEYS, allProviders } from './providers.mjs';
-import { inspectGitWorkspace, executeGitOperation, inspectSystemEnvironment, detectLocalCopilotToken, scaffoldMcpServer, runSelfImprovement, runCodeDiagnostics, discoverWorkspaceMcpServers, globWorkspaceFiles } from './coding-engine.mjs';
+import { inspectGitWorkspace, executeGitOperation, inspectSystemEnvironment, detectLocalCopilotToken, scaffoldMcpServer, runSelfImprovement, runCodeDiagnostics, discoverWorkspaceMcpServers, globWorkspaceFiles, DEFAULT_BROWSER_USER_AGENT } from './coding-engine.mjs';
+import { normalizeMemories, sortMemories, upsertMemory, removeMemory, selectMemoriesForContext, formatMemoriesForPrompt, exportMemoriesMarkdown, importMemoriesJson } from './memory.mjs';
 import { assertImageCapability } from './attachments.mjs';
 import { externalWebUrl } from './web-links.mjs';
 
@@ -117,6 +118,7 @@ export async function createNexusServer({
   requireToken = true,
   nativeHost = false,
   desktopHandler = null,
+  browserInspectHandler = null,
 } = {}) {
   const store = new Store(dataDir);
   const drafts = new DraftStore(dataDir);
@@ -136,16 +138,43 @@ export async function createNexusServer({
     return candidates.find(p => fs.existsSync(p)) || null;
   };
 
-  const defaultDesktop = async (name, args, signal) => {
+  const defaultDesktop = async (name, args = {}, signal) => {
     if (typeof desktopHandler === 'function') return desktopHandler(name, args, signal);
     if (process.platform !== 'win32') throw new Error('Desktop control currently requires Windows.');
     const hostExe = resolveNativeHostExe();
+    if (name === 'desktop_windows') {
+      if (hostExe) {
+        const res = await command(hostExe, ['--list-windows'], { signal, timeout: 12000 });
+        if (res.exitCode !== 0) throw new Error('Failed to list desktop windows: ' + res.output.trim().slice(0, 300));
+        return JSON.parse(res.output.trim());
+      }
+      const script = [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        '$mons = @(); $i = 0; foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $mons += @{ index=$i; primary=$s.Primary; deviceName=$s.DeviceName; bounds=@{ x=$s.Bounds.X; y=$s.Bounds.Y; width=$s.Bounds.Width; height=$s.Bounds.Height } }; $i++ }',
+        '$wins = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | Select-Object -First 60 | ForEach-Object { @{ hwnd=[long]$_.MainWindowHandle; title=$_.MainWindowTitle; processName=$_.ProcessName; pid=$_.Id } })',
+        '[Console]::Out.Write((@{ monitors=$mons; windows=$wins } | ConvertTo-Json -Depth 5 -Compress))',
+      ].join('; ');
+      const res = await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { signal, timeout: 12000 });
+      if (res.exitCode !== 0) throw new Error('Failed to list desktop windows: ' + res.output.trim().slice(0, 300));
+      return JSON.parse(res.output.trim());
+    }
+    if (name === 'desktop_ui_tree') {
+      const encoded = Buffer.from(JSON.stringify(args || {}), 'utf8').toString('base64');
+      const script = path.join(desktopRoot, 'native', 'ui-tree.ps1');
+      const res = await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Payload', encoded], { signal, timeout: 15000 });
+      if (res.exitCode !== 0) throw new Error('UI Automation inspection failed: ' + res.output.trim().slice(0, 400));
+      return JSON.parse(res.output.trim());
+    }
     if (name === 'desktop_screenshot') {
       const tempImg = path.join(os.tmpdir(), 'nexus-shot-' + crypto.randomUUID() + '.jpg');
       try {
         let res;
         if (hostExe) {
-          res = await command(hostExe, ['--screenshot', tempImg], { signal, timeout: 15000 });
+          const shotArgs = ['--screenshot', tempImg];
+          if (args && (args.windowTitle || args.hwnd || args.monitor !== undefined || args.region)) {
+            shotArgs.push(Buffer.from(JSON.stringify(args), 'utf8').toString('base64'));
+          }
+          res = await command(hostExe, shotArgs, { signal, timeout: 15000 });
         } else {
           const psPath = tempImg.replace(/'/g, "''");
           const script = [
@@ -157,7 +186,7 @@ export async function createNexusServer({
             '$g.Dispose()',
             `$bmp.Save('${psPath}', [System.Drawing.Imaging.ImageFormat]::Jpeg)`,
             '$bmp.Dispose()',
-            '$out = @{ physicalWidth=$b.Width; physicalHeight=$b.Height; imageWidth=$b.Width; imageHeight=$b.Height; scaleFactor=1 }',
+            '$out = @{ physicalWidth=$b.Width; physicalHeight=$b.Height; imageWidth=$b.Width; imageHeight=$b.Height; scaleFactor=1; origin=@{ x=$b.X; y=$b.Y }; scope="monitor" }',
             '[Console]::Out.Write(($out | ConvertTo-Json -Compress))',
           ].join('; ');
           res = await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { signal, timeout: 15000 });
@@ -167,19 +196,23 @@ export async function createNexusServer({
         const imgBuf = await fsp.readFile(tempImg);
         return {
           image: 'data:image/jpeg;base64,' + imgBuf.toString('base64'),
+          name: parsed.windowTitle ? ('window-' + parsed.windowTitle.slice(0, 32)) : 'desktop-screenshot',
           dimensions: {
             physicalWidth: parsed.physicalWidth,
             physicalHeight: parsed.physicalHeight,
             image: { width: parsed.imageWidth, height: parsed.imageHeight },
             scaleFactor: parsed.scaleFactor,
-            origin: { x: 0, y: 0 },
+            origin: parsed.origin || { x: 0, y: 0 },
+            scope: parsed.scope || 'monitor',
+            ...(parsed.windowTitle ? { windowTitle: parsed.windowTitle } : {}),
+            ...(parsed.monitor !== undefined && parsed.monitor !== null ? { monitor: parsed.monitor } : {}),
           },
         };
       } finally {
         await fsp.rm(tempImg, { force: true }).catch(() => {});
       }
     }
-    if (!['click', 'double_click', 'right_click', 'type', 'key', 'scroll'].includes(args.action)) {
+    if (!['focus_window', 'click', 'double_click', 'right_click', 'move', 'drag', 'type', 'key', 'scroll'].includes(args.action)) {
       throw new Error('Unsupported desktop action: ' + args.action);
     }
     const encoded = Buffer.from(JSON.stringify(args), 'utf8').toString('base64');
@@ -190,10 +223,65 @@ export async function createNexusServer({
     return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Payload', encoded], { signal, timeout: 15000 });
   };
 
+  let tor;
+  const defaultBrowserInspect = async (url, opts = {}) => {
+    if (typeof browserInspectHandler === 'function') return browserInspectHandler(url, opts);
+    const hostExe = process.platform === 'win32' ? resolveNativeHostExe() : null;
+    if (!hostExe) {
+      // Transparently fall back to static HTTP fetch with realistic browser headers when NEXUS.exe is absent
+      const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, tor) : '';
+      const fetcher = (u, o) => (proxyUrl ? proxiedFetch(u, o, proxyUrl) : fetch(u, o));
+      return inspectWebPage(url, {
+        extractLinks: opts.extractLinks !== false,
+        extractForms: opts.extractForms !== false,
+        renderJs: false,
+        userAgent: opts.userAgent || store.state.settings.webUserAgent || DEFAULT_BROWSER_USER_AGENT,
+        request: fetcher,
+        signal: opts.signal,
+      }).then(res => ({
+        ...res,
+        renderJsNote: 'Native WebView2 host (NEXUS.exe) is not built or unavailable here; fell back to static HTTP fetch (JavaScript did not execute).',
+      }));
+    }
+    const tempShot = opts.captureScreenshot ? path.join(os.tmpdir(), 'nexus-browser-' + crypto.randomUUID() + '.png') : '';
+    const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, tor) : '';
+    const payload = {
+      url,
+      waitMs: opts.waitMs ?? 1200,
+      waitForSelector: opts.waitForSelector || '',
+      actions: Array.isArray(opts.actions) ? opts.actions : undefined,
+      useAccountSession: Boolean(opts.useAccountSession),
+      dataDir,
+      proxyUrl,
+      userAgent: opts.userAgent || store.state.settings.webUserAgent || DEFAULT_BROWSER_USER_AGENT,
+      extractLinks: opts.extractLinks !== false,
+      extractForms: opts.extractForms !== false,
+      screenshotPath: tempShot || undefined,
+    };
+    const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+    try {
+      const res = await command(hostExe, ['--browser-inspect', encoded], { signal: opts.signal, timeout: 45000 });
+      if (res.exitCode !== 0) {
+        throw new Error('Native WebView2 browser_inspect failed: ' + res.output.trim().slice(0, 400));
+      }
+      const parsed = JSON.parse(res.output.trim());
+      if (tempShot && fs.existsSync(tempShot)) {
+        const buf = await fsp.readFile(tempShot);
+        parsed.image = 'data:image/png;base64,' + buf.toString('base64');
+        parsed.name = 'browser-' + (new URL(url).hostname || 'page');
+        parsed.dimensions = { physicalWidth: 1280, physicalHeight: 900, image: { width: 1280, height: 900 }, scaleFactor: 1, origin: { x: 0, y: 0 }, scope: 'browser' };
+      }
+      return parsed;
+    } finally {
+      if (tempShot) await fsp.rm(tempShot, { force: true }).catch(() => {});
+    }
+  };
+
   const runtime = new Runtime(store, {
     mcp,
     getSecret: name => vault.get(name),
     desktop: defaultDesktop,
+    browserInspect: defaultBrowserInspect,
   });
   void runtime.capabilities;
 
@@ -202,7 +290,7 @@ export async function createNexusServer({
   automations.start(30000);
 
   const terminals = new InteractiveTerminalManager();
-  const tor = new TorManager(dataDir, { bundledDir: desktopRoot });
+  tor = new TorManager(dataDir, { bundledDir: desktopRoot });
   runtime.tor = tor;
 
   const configFile = new ConfigFileManager(dataDir, runtime);
@@ -842,37 +930,48 @@ export async function createNexusServer({
       case 'processStart': return runtime.processes.start({ command: args.command, cwd: args.workspace || process.cwd(), label: args.label });
       case 'processOutput': return runtime.processes.get(args.id);
       case 'processStop': return runtime.processes.stop(args.id);
-      case 'memoriesList': return store.state.memories || [];
+      case 'memoriesList': {
+        store.state.memories = normalizeMemories(store.state.memories || []);
+        return sortMemories(store.state.memories);
+      }
       case 'memorySave': {
-        store.state.memories ||= [];
-        if (typeof args.key !== 'string' || !args.key.trim() || typeof args.value !== 'string' || !args.value.trim()) throw new Error('Key and value are required.');
-        const scope = args.scope === 'project' ? 'project' : 'global';
-        const workspace = scope === 'project' ? (args.workspace || '') : '';
-        const existing = store.state.memories.find(m => m.id === args.id || (m.key.toLowerCase() === args.key.trim().toLowerCase() && m.scope === scope && m.workspace === workspace));
-        if (existing) {
-          existing.key = args.key.trim().slice(0, 120);
-          existing.value = args.value.trim().slice(0, 4000);
-          existing.scope = scope;
-          existing.workspace = workspace;
-          existing.updatedAt = new Date().toISOString();
-        } else {
-          store.state.memories.push({
-            id: crypto.randomUUID(),
-            key: args.key.trim().slice(0, 120),
-            value: args.value.trim().slice(0, 4000),
-            scope,
-            workspace,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          });
-        }
+        store.state.memories = normalizeMemories(store.state.memories || []);
+        upsertMemory(store.state.memories, args, {
+          defaultScope: args.scope === 'project' ? 'project' : 'global',
+          defaultWorkspace: args.workspace || '',
+          defaultSource: 'user',
+        });
         runtime.changed(null);
-        return store.state.memories;
+        return sortMemories(store.state.memories);
       }
       case 'memoryDelete': {
-        store.state.memories = (store.state.memories || []).filter(m => m.id !== args.id);
+        const res = removeMemory(store.state.memories || [], { id: args.id, key: args.key });
+        store.state.memories = res.memories;
         runtime.changed(null);
-        return store.state.memories;
+        return sortMemories(store.state.memories);
+      }
+      case 'memoriesPreview': {
+        store.state.memories = normalizeMemories(store.state.memories || []);
+        const selected = selectMemoriesForContext(store.state.memories, { workspace: args.workspace || '' });
+        return {
+          count: selected.length,
+          total: store.state.memories.length,
+          markdown: formatMemoriesForPrompt(selected),
+        };
+      }
+      case 'memoriesExport': {
+        store.state.memories = normalizeMemories(store.state.memories || []);
+        return {
+          filename: 'nexus-user-memories.md',
+          markdown: exportMemoriesMarkdown(store.state.memories),
+          json: JSON.stringify(sortMemories(store.state.memories), null, 2),
+        };
+      }
+      case 'memoriesImport': {
+        store.state.memories = normalizeMemories(store.state.memories || []);
+        const summary = importMemoriesJson(store.state.memories, args.json);
+        runtime.changed(null);
+        return { ...summary, memories: sortMemories(store.state.memories) };
       }
       case 'systemInfo': return inspectSystemEnvironment(args.workspace || process.cwd());
       case 'exportTaskMarkdown': {

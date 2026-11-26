@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
@@ -7,10 +8,11 @@ using System.Text.Json;
 namespace NexusHost;
 
 /// <summary>
-/// Pure native C# Win32 desktop automation & screenshot helper invoked via:
-///   NEXUS.exe --screenshot <outputJpgPath>
-///   NEXUS.exe --desktop-action <base64JsonPayload>
-/// Runs zero PowerShell scripts, avoiding AMSI/Defender false positives and reducing capture latency ~15x.
+/// Pure native C# Win32 desktop automation, window enumeration &amp; privacy-safe screenshot helper invoked via:
+///   NEXUS.exe --list-windows
+///   NEXUS.exe --screenshot &lt;outputJpgPath&gt; [base64OptionsJson]
+///   NEXUS.exe --desktop-action &lt;base64JsonPayload&gt;
+/// Runs zero PowerShell scripts for screenshots/input, supports multi-monitor &amp; window-scoped capture.
 /// </summary>
 internal static class NativeDesktop
 {
@@ -23,6 +25,8 @@ internal static class NativeDesktop
     private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
     private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     private const uint MOUSEEVENTF_WHEEL = 0x0800;
+    private const uint PW_RENDERFULLCONTENT = 0x00000002;
+    private const int SW_RESTORE = 9;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint type; public InputUnion U; }
@@ -40,67 +44,270 @@ internal static class NativeDesktop
     [StructLayout(LayoutKind.Sequential)]
     private struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] private static extern int GetWindowTextLengthW(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
 
-    public static int RunScreenshot(string outputPath)
+    private sealed record WindowEntry(long Hwnd, string Title, string ProcessName, int Pid, Rectangle Bounds, bool Active, bool Minimized);
+
+    private static List<WindowEntry> EnumerateVisibleWindows()
+    {
+        var results = new List<WindowEntry>();
+        IntPtr fg = GetForegroundWindow();
+        EnumWindows((hWnd, _) =>
+        {
+            if (!IsWindowVisible(hWnd)) return true;
+            int len = GetWindowTextLengthW(hWnd);
+            if (len <= 0) return true;
+            var sb = new StringBuilder(len + 1);
+            GetWindowTextW(hWnd, sb, sb.Capacity);
+            string title = sb.ToString().Trim();
+            if (string.IsNullOrEmpty(title)) return true;
+            if (!GetWindowRect(hWnd, out var rc)) return true;
+            int w = rc.Right - rc.Left;
+            int h = rc.Bottom - rc.Top;
+            if (w < 40 || h < 30) return true;
+
+            GetWindowThreadProcessId(hWnd, out uint pid);
+            string procName = "";
+            try { procName = Process.GetProcessById((int)pid).ProcessName; } catch { }
+            results.Add(new WindowEntry(
+                hWnd.ToInt64(),
+                title,
+                procName,
+                (int)pid,
+                new Rectangle(rc.Left, rc.Top, w, h),
+                hWnd == fg,
+                IsIconic(hWnd)
+            ));
+            return results.Count < 80;
+        }, IntPtr.Zero);
+        return results;
+    }
+
+    private static WindowEntry? FindWindow(long hwnd, string? titleQuery)
+    {
+        var windows = EnumerateVisibleWindows();
+        if (hwnd != 0)
+        {
+            var byHwnd = windows.FirstOrDefault(w => w.Hwnd == hwnd);
+            if (byHwnd != null) return byHwnd;
+            IntPtr ptr = new(hwnd);
+            if (GetWindowRect(ptr, out var rc))
+            {
+                return new WindowEntry(hwnd, "", "", 0, new Rectangle(rc.Left, rc.Top, Math.Max(1, rc.Right - rc.Left), Math.Max(1, rc.Bottom - rc.Top)), false, IsIconic(ptr));
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(titleQuery))
+        {
+            string q = titleQuery.Trim();
+            return windows.FirstOrDefault(w => w.Title.Contains(q, StringComparison.OrdinalIgnoreCase))
+                ?? windows.FirstOrDefault(w => w.ProcessName.Contains(q, StringComparison.OrdinalIgnoreCase));
+        }
+        return null;
+    }
+
+    public static int RunListWindows()
     {
         try
         {
             SetProcessDPIAware();
-            var bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
-            using var raw = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format24bppRgb);
-            using (var g = Graphics.FromImage(raw))
+            var screens = Screen.AllScreens;
+            var monitors = screens.Select((s, idx) => new
             {
-                g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+                index = idx,
+                primary = s.Primary,
+                deviceName = s.DeviceName,
+                bounds = new { x = s.Bounds.X, y = s.Bounds.Y, width = s.Bounds.Width, height = s.Bounds.Height },
+            }).ToArray();
+
+            var windows = EnumerateVisibleWindows().Select(w => new
+            {
+                hwnd = w.Hwnd,
+                title = w.Title,
+                processName = w.ProcessName,
+                pid = w.Pid,
+                active = w.Active,
+                minimized = w.Minimized,
+                bounds = new { x = w.Bounds.X, y = w.Bounds.Y, width = w.Bounds.Width, height = w.Bounds.Height },
+            }).ToArray();
+
+            Console.Out.Write(JsonSerializer.Serialize(new { monitors, windows }));
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.Write(ex.Message);
+            return 1;
+        }
+    }
+
+    public static int RunScreenshot(string outputPath, string? base64Options = null)
+    {
+        try
+        {
+            SetProcessDPIAware();
+            long targetHwnd = 0;
+            string? windowTitle = null;
+            string? monitorMode = null;
+            int? monitorIndex = null;
+            Rectangle? region = null;
+
+            if (!string.IsNullOrWhiteSpace(base64Options))
+            {
+                string optJson = Encoding.UTF8.GetString(Convert.FromBase64String(base64Options));
+                using var doc = JsonDocument.Parse(optJson);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("hwnd", out var hEl) && hEl.ValueKind == JsonValueKind.Number) targetHwnd = hEl.GetInt64();
+                if (root.TryGetProperty("windowTitle", out var wtEl) && wtEl.ValueKind == JsonValueKind.String) windowTitle = wtEl.GetString();
+                if (root.TryGetProperty("monitor", out var mEl))
+                {
+                    if (mEl.ValueKind == JsonValueKind.String) monitorMode = mEl.GetString();
+                    else if (mEl.ValueKind == JsonValueKind.Number) monitorIndex = mEl.GetInt32();
+                }
+                if (root.TryGetProperty("region", out var rEl) && rEl.ValueKind == JsonValueKind.Object)
+                {
+                    int rx = rEl.TryGetProperty("x", out var xE) ? xE.GetInt32() : 0;
+                    int ry = rEl.TryGetProperty("y", out var yE) ? yE.GetInt32() : 0;
+                    int rw = rEl.TryGetProperty("width", out var wE) ? Math.Max(16, wE.GetInt32()) : 800;
+                    int rh = rEl.TryGetProperty("height", out var hE2) ? Math.Max(16, hE2.GetInt32()) : 600;
+                    region = new Rectangle(rx, ry, rw, rh);
+                }
             }
 
-            const double maxW = 1920.0;
-            double scale = bounds.Width > maxW ? bounds.Width / maxW : 1.0;
-            int tw = (int)Math.Round(bounds.Width / scale);
-            int th = (int)Math.Round(bounds.Height / scale);
+            Rectangle bounds;
+            string scope = "monitor";
+            string? capturedWindowTitle = null;
+            int? capturedMonitor = 0;
+            Bitmap raw;
 
-            Bitmap target = raw;
-            Bitmap? resized = null;
-            try
+            if (targetHwnd != 0 || !string.IsNullOrWhiteSpace(windowTitle))
             {
-                if (scale > 1.0)
+                var win = FindWindow(targetHwnd, windowTitle)
+                    ?? throw new InvalidOperationException($"Window not found ({windowTitle ?? targetHwnd.ToString()}). Call desktop_windows first to list visible windows.");
+                bounds = win.Bounds;
+                scope = "window";
+                capturedWindowTitle = win.Title;
+                capturedMonitor = null;
+                raw = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format24bppRgb);
+                using (var g = Graphics.FromImage(raw))
                 {
-                    resized = new Bitmap(tw, th, PixelFormat.Format24bppRgb);
-                    using var ng = Graphics.FromImage(resized);
-                    ng.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    ng.DrawImage(raw, 0, 0, tw, th);
-                    target = resized;
+                    IntPtr hdc = g.GetHdc();
+                    bool printed = false;
+                    try { printed = PrintWindow(new IntPtr(win.Hwnd), hdc, PW_RENDERFULLCONTENT); }
+                    finally { g.ReleaseHdc(hdc); }
+                    if (!printed)
+                    {
+                        g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+                    }
                 }
-
-                var jpegCodec = ImageCodecInfo.GetImageEncoders().FirstOrDefault(c => c.MimeType == "image/jpeg");
-                if (jpegCodec != null)
+            }
+            else if (region.HasValue)
+            {
+                bounds = region.Value;
+                scope = "region";
+                capturedMonitor = null;
+                raw = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format24bppRgb);
+                using (var g = Graphics.FromImage(raw))
                 {
-                    using var ep = new EncoderParameters(1);
-                    ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 82L);
-                    target.Save(outputPath, jpegCodec, ep);
+                    g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+                }
+            }
+            else
+            {
+                var all = Screen.AllScreens;
+                if (string.Equals(monitorMode, "all", StringComparison.OrdinalIgnoreCase))
+                {
+                    bounds = SystemInformation.VirtualScreen;
+                    scope = "all-monitors";
+                    capturedMonitor = null;
+                }
+                else if (monitorIndex.HasValue && monitorIndex.Value >= 0 && monitorIndex.Value < all.Length)
+                {
+                    bounds = all[monitorIndex.Value].Bounds;
+                    capturedMonitor = monitorIndex.Value;
                 }
                 else
                 {
-                    target.Save(outputPath, ImageFormat.Jpeg);
+                    bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
+                    capturedMonitor = Array.FindIndex(all, s => s.Primary);
+                    if (capturedMonitor < 0) capturedMonitor = 0;
+                }
+                raw = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format24bppRgb);
+                using (var g = Graphics.FromImage(raw))
+                {
+                    g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
                 }
             }
-            finally
-            {
-                resized?.Dispose();
-            }
 
-            Console.Out.Write(JsonSerializer.Serialize(new
+            using (raw)
             {
-                physicalWidth = bounds.Width,
-                physicalHeight = bounds.Height,
-                imageWidth = tw,
-                imageHeight = th,
-                scaleFactor = Math.Round(scale, 4),
-            }));
+                const double maxW = 1920.0;
+                double scale = bounds.Width > maxW ? bounds.Width / maxW : 1.0;
+                int tw = (int)Math.Round(bounds.Width / scale);
+                int th = (int)Math.Round(bounds.Height / scale);
+
+                Bitmap target = raw;
+                Bitmap? resized = null;
+                try
+                {
+                    if (scale > 1.0)
+                    {
+                        resized = new Bitmap(tw, th, PixelFormat.Format24bppRgb);
+                        using var ng = Graphics.FromImage(resized);
+                        ng.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        ng.DrawImage(raw, 0, 0, tw, th);
+                        target = resized;
+                    }
+
+                    var jpegCodec = ImageCodecInfo.GetImageEncoders().FirstOrDefault(c => c.MimeType == "image/jpeg");
+                    if (jpegCodec != null)
+                    {
+                        using var ep = new EncoderParameters(1);
+                        ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 82L);
+                        target.Save(outputPath, jpegCodec, ep);
+                    }
+                    else
+                    {
+                        target.Save(outputPath, ImageFormat.Jpeg);
+                    }
+                }
+                finally
+                {
+                    resized?.Dispose();
+                }
+
+                Console.Out.Write(JsonSerializer.Serialize(new
+                {
+                    physicalWidth = bounds.Width,
+                    physicalHeight = bounds.Height,
+                    imageWidth = tw,
+                    imageHeight = th,
+                    scaleFactor = Math.Round(scale, 4),
+                    origin = new { x = bounds.X, y = bounds.Y },
+                    scope,
+                    windowTitle = capturedWindowTitle,
+                    monitor = capturedMonitor,
+                }));
+            }
             return 0;
         }
         catch (Exception ex)
@@ -124,6 +331,44 @@ internal static class NativeDesktop
             {
                 case "validate":
                     break;
+                case "focus_window":
+                {
+                    long hwnd = root.TryGetProperty("hwnd", out var hEl) && hEl.ValueKind == JsonValueKind.Number ? hEl.GetInt64() : 0;
+                    string? title = root.TryGetProperty("windowTitle", out var wtEl) && wtEl.ValueKind == JsonValueKind.String ? wtEl.GetString() : null;
+                    var win = FindWindow(hwnd, title)
+                        ?? throw new InvalidOperationException("Target window not found.");
+                    IntPtr ptr = new(win.Hwnd);
+                    if (IsIconic(ptr)) ShowWindow(ptr, SW_RESTORE);
+                    SetForegroundWindow(ptr);
+                    break;
+                }
+                case "move":
+                {
+                    if (!root.TryGetProperty("x", out var xEl) || !root.TryGetProperty("y", out var yEl))
+                        throw new InvalidOperationException("Coordinates x and y are required.");
+                    SetCursorPos(xEl.GetInt32(), yEl.GetInt32());
+                    break;
+                }
+                case "drag":
+                {
+                    if (!root.TryGetProperty("x", out var xEl) || !root.TryGetProperty("y", out var yEl)
+                        || !root.TryGetProperty("toX", out var txEl) || !root.TryGetProperty("toY", out var tyEl))
+                        throw new InvalidOperationException("drag requires x, y, toX, and toY coordinates.");
+                    int sx = xEl.GetInt32(), sy = yEl.GetInt32(), ex = txEl.GetInt32(), ey = tyEl.GetInt32();
+                    SetCursorPos(sx, sy);
+                    Thread.Sleep(40);
+                    SendMouse(MOUSEEVENTF_LEFTDOWN, 0);
+                    const int steps = 12;
+                    for (int i = 1; i <= steps; i++)
+                    {
+                        int nx = sx + (ex - sx) * i / steps;
+                        int ny = sy + (ey - sy) * i / steps;
+                        SetCursorPos(nx, ny);
+                        Thread.Sleep(15);
+                    }
+                    SendMouse(MOUSEEVENTF_LEFTUP, 0);
+                    break;
+                }
                 case "click":
                 case "double_click":
                 case "right_click":

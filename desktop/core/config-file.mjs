@@ -25,6 +25,7 @@ const CONFIG_KEYS = [
   'webSearchContext',
   'webMaxResults',
   'webMaxUses',
+  'webUserAgent',
   'globalInstructions',
   'contextWindow',
   'compressionPercent',
