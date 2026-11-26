@@ -19,13 +19,15 @@ export default function ChatSettings({ task, state, act, close }) {
       <h2>Chat Settings</h2>
       <form onSubmit={async e => {
         e.preventDefault();
+        const nextTemp = form.temperature === '' ? null : Number(form.temperature);
+        const prevTemp = task.temperature ?? null;
         const payload = {
           id: task.id,
-          title: form.title,
-          model: form.model,
+          title: form.title.trim(),
           projectId: form.projectId,
-          temperature: form.temperature === '' ? null : Number(form.temperature),
-          systemPromptOverride: form.systemPromptOverride,
+          ...(form.model !== task.model ? { model: form.model } : {}),
+          ...(nextTemp !== prevTemp ? { temperature: nextTemp } : {}),
+          ...((form.systemPromptOverride || '') !== (task.systemPromptOverride || '') ? { systemPromptOverride: form.systemPromptOverride } : {}),
         };
         if (await act('updateChat', payload)) close();
       }}>

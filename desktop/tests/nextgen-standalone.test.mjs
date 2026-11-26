@@ -1222,6 +1222,15 @@ test('v1.2.0 Native WebView2 browser_inspect, realistic browser HTTP headers, an
   await executeTool(runtime, task, 'desktop_action', { action: 'focus_window', windowTitle: 'Notepad' }, signal);
   await executeTool(runtime, task, 'desktop_action', { action: 'drag', x: 10, y: 10, toX: 80, toY: 80 }, signal);
   assert.equal(desktopCalls.length, 5);
+
+  // 4. Session can be renamed anytime, even while actively running or with null/empty unchanged optional fields
+  runtime.active.set(task.id, new AbortController());
+  try {
+    runtime.updateChat({ id: task.id, title: 'Renamed While Active', temperature: null, systemPromptOverride: '' });
+    assert.equal(task.title, 'Renamed While Active');
+  } finally {
+    runtime.active.delete(task.id);
+  }
 });
 
 

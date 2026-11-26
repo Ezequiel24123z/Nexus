@@ -390,11 +390,18 @@ export class Runtime extends EventEmitter {
   }
   updateChat(input){
     const task=this.store.task(input.id),options=validateChatOptions(input);
-    if(Object.keys(options).some(key=>options[key]!==task[key])&&(this.active.has(task.id)||this.compacting.has(task.id)))throw new Error('Pause the task and wait for the active call to finish before changing model, mode, or thinking.');
+    const optionChanged = key => {
+      const next = options[key];
+      const prev = task[key];
+      if (next === prev) return false;
+      if ((next === null || next === undefined || next === '') && (prev === null || prev === undefined || prev === '')) return false;
+      return true;
+    };
+    if(Object.keys(options).some(optionChanged)&&(this.active.has(task.id)||this.compacting.has(task.id)))throw new Error('Pause the task and wait for the active call to finish before changing model, mode, or thinking.');
     if(input.projectId&& !this.store.state.projects.some(project=>project.id===input.projectId))throw new Error('Project not found');
     Object.assign(task,options);
     if(options.model)task.engine=modelConnection(options.model,this.store.state.settings).id;
-    if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim();
+    if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim().slice(0,120);
     if(typeof input.pinned==='boolean')task.pinned=input.pinned;
     if(input.projectId!==undefined)task.projectId=input.projectId||null;
     if(typeof input.workspace==='string')task.workspace=input.workspace;

@@ -19,6 +19,8 @@ All notable changes to **NEXUS** are documented in this file.
   - Upgraded `desktop_action` with `focus_window`, `move`, and `drag`.
 - **Realistic Configurable Browser HTTP Headers**:
   - Unified standard Edge/Chrome Windows browser headers (`User-Agent`, `Sec-CH-UA`, `Accept-Language`, `Sec-Fetch-*`) across `web_fetch`, `browser_inspect`, and `web_search` instead of identifying as `NEXUS-Agent`, with optional custom `webUserAgent` override in Settings and `nexus.config.json`.
+- **Inline Session Renaming Anytime**:
+  - Rename any session (root or nested child) anytime—even while the agent is actively running—by clicking the topbar title / pencil icon, double-clicking or clicking the pencil icon in the sidebar, or saving from Chat Settings.
 
 ## [1.1.0] - 2026-11-26
 
