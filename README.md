@@ -54,7 +54,7 @@ Switch globally or per chat across **10 built-in providers** plus **unlimited us
 - **Local Automations & Multi-Model Arena**: Schedule recurring autonomous missions (interval, daily, weekly, 5-field cron, one-shot) via `AutomationsView` or `manage_automation`, and benchmark 2–4 models side-by-side in **Model Arena**.
 
 ### 8. Zero-Flicker Studio UI & 2-Stage Lossless Compaction
-- **Studio Themes & Live Hackability**: Obsidian Dark, Studio Paper Light, and Midnight Slate themes, accent color picker, Live Custom CSS editor, block-memoized streaming Markdown with **Mermaid** (`securityLevel: 'strict'`) and **KaTeX**, inline unified diffs with 1-click **Revert**, `@`-file and `/`-slash autocomplete, 40-turn progressive DOM windowing, and raw `nexus.config.json` editor.
+- **Studio Themes & Live Hackability**: Obsidian Dark, Studio Paper Light, and Midnight Slate themes, accent color picker, Live Custom CSS editor, block-memoized streaming Markdown with **Mermaid** (`securityLevel: 'strict'`) and **KaTeX**, inline unified diffs with 1-click **Revert**, instant inline session renaming anytime (topbar, sidebar, or while running), `@`-file and `/`-slash autocomplete, 40-turn progressive DOM windowing, and raw `nexus.config.json` editor.
 - **2-Stage Lossless Compaction**: Stage 1 `$0` Micro-Compaction prunes old oversized tool outputs into lossless artifact references before Stage 2 structured checkpoint compaction. Originals and pinned messages are always preserved; hidden reasoning is never resent across turns.
 
 ---
