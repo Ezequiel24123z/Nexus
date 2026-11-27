@@ -14,10 +14,15 @@ export async function materializeToolResult(store, task, name, result) {
   const bytes = Buffer.byteLength(serialized, 'utf8');
   if (NEVER_REWRAP.has(name) || bytes <= limit) return { journal:result, model:serialized, artifact:null };
   const id = crypto.randomUUID();
-  const directory = path.join(store.directoryFor(task.id), 'artifacts');
-  await fs.mkdir(directory, {recursive:true});
-  const filename = path.join(directory, id + '.json');
-  await fs.writeFile(filename, serialized, 'utf8');
+  if (task?.ephemeral) {
+    task._ramArtifacts ||= new Map();
+    task._ramArtifacts.set(id, serialized);
+  } else {
+    const directory = path.join(store.directoryFor(task.id), 'artifacts');
+    await fs.mkdir(directory, {recursive:true});
+    const filename = path.join(directory, id + '.json');
+    await fs.writeFile(filename, serialized, 'utf8');
+  }
   const artifact = {id, name, bytes, sha256:crypto.createHash('sha256').update(serialized).digest('hex'), format:'json'};
   const preview = serialized.slice(0, 1800);
   const reference = {artifact, preview, truncated:true, hint:'Full output saved locally. Use read_artifact with this id, offset, and length (up to 24000) to retrieve slices without re-wrapping.'};
@@ -26,17 +31,29 @@ export async function materializeToolResult(store, task, name, result) {
 
 export async function saveRawArtifact(store, task, name, serialized) {
   const id = crypto.randomUUID();
-  const directory = path.join(store.directoryFor(task.id), 'artifacts');
-  await fs.mkdir(directory, { recursive: true });
-  await fs.writeFile(path.join(directory, id + '.json'), serialized, 'utf8');
+  if (task?.ephemeral) {
+    task._ramArtifacts ||= new Map();
+    task._ramArtifacts.set(id, serialized);
+  } else {
+    const directory = path.join(store.directoryFor(task.id), 'artifacts');
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, id + '.json'), serialized, 'utf8');
+  }
   return { id, name, bytes: Buffer.byteLength(serialized, 'utf8') };
 }
 
 export async function readArtifact(store, task, id, offset = 0, length = 8000) {
   if(typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid artifact identifier.');
   if(!Number.isInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 1 || length > 24000) throw new Error('Invalid artifact range.');
-  const filename = path.join(store.directoryFor(task.id), 'artifacts', id + '.json');
-  const data = await fs.readFile(filename, 'utf8').catch(error => { if(error.code === 'ENOENT') throw new Error('Artifact not found in this task.'); throw error; });
+  let data;
+  if (task?._ramArtifacts?.has(id)) {
+    data = task._ramArtifacts.get(id);
+  } else if (task?.ephemeral) {
+    throw new Error('Artifact not found in this RAM-only session.');
+  } else {
+    const filename = path.join(store.directoryFor(task.id), 'artifacts', id + '.json');
+    data = await fs.readFile(filename, 'utf8').catch(error => { if(error.code === 'ENOENT') throw new Error('Artifact not found in this task.'); throw error; });
+  }
   return {id, offset, length:Math.min(length,data.length-offset), totalBytes:Buffer.byteLength(data,'utf8'), content:data.slice(offset,offset+length), next:offset+length<data.length?offset+length:null};
 }
 
@@ -54,9 +71,14 @@ export async function materializeImageAttachment(store, task, dataUrl, {name = '
   const data = Buffer.from(match[2], 'base64');
   if (!data.length) throw new Error('The image capture is empty.');
   const id = crypto.randomUUID();
-  const directory = path.join(store.directoryFor(task.id), 'attachments');
-  await fs.mkdir(directory, {recursive:true});
-  await fs.writeFile(path.join(directory, id + '.' + extension), data);
+  if (task?.ephemeral) {
+    task._ramAttachments ||= new Map();
+    task._ramAttachments.set(id, data.toString('base64'));
+  } else {
+    const directory = path.join(store.directoryFor(task.id), 'attachments');
+    await fs.mkdir(directory, {recursive:true});
+    await fs.writeFile(path.join(directory, id + '.' + extension), data);
+  }
   return {id, name, mime, bytes:data.length, extension, dimensions:dimensions || null, kind:'image',createdAt:new Date().toISOString()};
 }
 
@@ -69,6 +91,9 @@ export function hydrateAttachmentReferences(store, task, message) {
     const attachment = part.attachment;
     if (!attachment || attachment.kind !== 'image' || !attachmentId(attachment.id) || !imageTypes.has(attachment.mime)) {
       return {type:'text', text:'[Local attachment unavailable: invalid reference.]'};
+    }
+    if (task?._ramAttachments?.has(attachment.id)) {
+      return {type:'image_url', image_url:{url:'data:' + attachment.mime + ';base64,' + task._ramAttachments.get(attachment.id)}};
     }
     const filename = attachment.storage==='uploads'
       ? path.join(store.directory,'uploads',attachment.id,'original')

@@ -3,7 +3,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {readArtifact} from './artifacts.mjs';
-import { proxiedFetch, resolveEffectiveProxyUrl } from './privacy-proxy.mjs';
+import { createNexusFetcher } from './privacy-proxy.mjs';
+import { executeWebSearch } from './search-engines.mjs';
+import { runFastAgentBrowser, formatAgentSnapshotText } from './agent-browser.mjs';
 import {catalogPage,functionTargets} from './capabilities.mjs';
 import {
   MEMORY_CATEGORIES,
@@ -37,6 +39,8 @@ import {
   deleteFileWithBackup,
   moveFileWithBackup,
   searchWebDuckDuckGo,
+  runElevatedCommand,
+  buildChatMediaItem,
 } from './coding-engine.mjs';
 
 export const READ_ONLY_TOOL_NAMES = new Set([
@@ -72,6 +76,7 @@ export const READ_ONLY_TOOL_NAMES = new Set([
   'read_session',
   'desktop_windows',
   'desktop_ui_tree',
+  'present_media',
 ]);
 
 export const CORE_TOOL_NAMES = new Set([
@@ -91,6 +96,10 @@ export const CORE_TOOL_NAMES = new Set([
   'todo_write',
   'todo_read',
   'memory_store',
+  'manage_session',
+  'manage_project',
+  'manage_privacy',
+  'present_media',
   'document_progress',
   'read_artifact',
   'read_checkpoint',
@@ -100,7 +109,7 @@ export const TOOLSET_GROUPS = {
   git: ['git_operation', 'delete_file', 'move_file', 'run_diagnostics'],
   shell_processes: ['shell_session', 'manage_process', 'system_info'],
   web_browser: ['web_search', 'web_fetch', 'browser_inspect', 'http_request'],
-  sessions: ['spawn_session', 'list_sessions', 'send_session_message', 'read_session', 'delegate_subagent'],
+  sessions: ['spawn_session', 'list_sessions', 'send_session_message', 'read_session', 'manage_session', 'manage_project', 'delegate_subagent'],
   capabilities_mcp: ['search_capabilities', 'get_capability', 'save_capability', 'invoke_function', 'list_mcp_servers', 'list_mcp_tools', 'invoke_mcp', 'scaffold_mcp_server'],
   connectors: ['list_connectors', 'get_connector', 'create_connector', 'invoke_connector', 'list_effects', 'reconcile_effect', 'verify_effect', 'retry_effect'],
   memory_history: ['memory_store', 'search_journal', 'search_history', 'list_attachments', 'read_attachment', 'search_files'],
@@ -178,23 +187,27 @@ export const baseTools = [
   def('delete_file', 'Delete a file while saving an automatic backup copy so the user can revert in 1 click.', { path: str('File path to delete'), reason: str('Reason for deletion') }, ['path', 'reason']),
   def('move_file', 'Rename or move a file with automatic backup and journal tracking.', { from: str('Source file path'), to: str('Destination file path'), reason: str('Reason for move') }, ['from', 'to', 'reason']),
   def('git_operation', 'Execute structured Git operations in the workspace (or custom cwd in autonomous/unrestricted mode): status, diff, log, branch, checkout, checkout_new (creates a new branch via git checkout -b), discard, stash, pull, push, stage, unstage, commit, worktree_list, worktree_add, or worktree_remove.', { operation: { type: 'string', enum: ['status', 'diff', 'log', 'branch', 'checkout', 'checkout_new', 'discard', 'stash', 'pull', 'push', 'stage', 'unstage', 'commit', 'worktree_list', 'worktree_add', 'worktree_remove'] }, cwd: str('Optional repository directory path (in autonomous/unrestricted mode)'), staged: { type: 'boolean', description: 'For diff: inspect staged changes' }, target: str('Optional file path for diff/stage/unstage/discard'), paths: { type: 'array', items: { type: 'string' }, description: 'File paths for stage/unstage' }, message: str('Commit or stash message'), stageAll: { type: 'boolean', description: 'Stage all changes before commit' }, create: { type: 'boolean', description: 'Create new branch on checkout (or use operation: checkout_new)' }, createBranch: { type: 'boolean', description: 'Alias for create on checkout' }, pop: { type: 'boolean', description: 'Pop latest stash' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, path: str('Target directory for worktree_add or worktree_remove'), branch: str('Branch name for checkout, checkout_new, or worktree_add') }, ['operation']),
-  def('run_command', 'Execute a PowerShell command with the user Windows permissions. Unsandboxed. No automatic timeout; user can pause.', { command: str('PowerShell command'), reason: str('Purpose of command') }, ['command', 'reason']),
-  def('shell_session', 'Execute a command in a persistent stateful shell session for this task that preserves working directory (cd) and environment variables across calls.', { command: str('Command to run in the persistent session'), env: { type: 'object', additionalProperties: true, description: 'Optional environment variables to set or persist' }, reason: str('Purpose of command') }, ['command']),
+  def('run_command', 'Execute a PowerShell command with Windows permissions. Set elevated=true (or enable Admin Rights on the session) to run as Windows Administrator (VPN adapters, services, firewall, system tasks). Unsandboxed; no automatic timeout.', { command: str('PowerShell command'), reason: str('Purpose of command'), elevated: { type: 'boolean', description: 'Run with Windows Administrator privileges (uses process admin or triggers UAC RunAs)' } }, ['command', 'reason']),
+  def('shell_session', 'Execute a command in a persistent stateful shell session for this task that preserves working directory (cd) and environment variables across calls. Pass elevated=true to execute an elevated Windows Administrator command.', { command: str('Command to run in the persistent session'), env: { type: 'object', additionalProperties: true, description: 'Optional environment variables to set or persist' }, elevated: { type: 'boolean', description: 'Run this command with Windows Administrator privileges' }, reason: str('Purpose of command') }, ['command']),
   def('run_diagnostics', 'Run fast syntax and type diagnostics (node --check, JSON validation) across a file or workspace directory.', { path: str('Optional relative file or directory path (default ".")') }),
   def('http_request', 'Send a direct, unrestricted HTTP or HTTPS request (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS) to any local, LAN, or external endpoint with custom headers and body.', { url: str('HTTP or HTTPS URL'), method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] }, headers: { type: 'object', additionalProperties: true }, body: { type: ['string', 'object'], additionalProperties: true } }, ['url']),
-  def('browser_inspect', 'Inspect or interact with a web page or local dev server. With renderJs: true (or actions/waitForSelector/captureScreenshot), renders full JavaScript inside native Windows Edge WebView2, extracts headings/links/forms/interactive CSS selectors, and can execute click/type/select/scroll/wait/eval steps.', { url: str('HTTP or HTTPS URL'), renderJs: { type: 'boolean', description: 'Execute JavaScript in headless native Edge WebView2 (recommended for SPAs and dynamic pages)' }, waitMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Milliseconds to wait after page load for JS rendering (default 1200)' }, waitForSelector: str('Optional CSS selector to wait for before extracting content'), actions: { type: 'array', description: 'Optional sequential DOM actions to execute before extraction', items: { type: 'object', properties: { type: { type: 'string', enum: ['click', 'type', 'select', 'scroll', 'wait', 'eval'] }, selector: str('CSS selector for click/type/select/wait'), text: str('Text to type'), value: str('Option value for select'), y: { type: 'integer', description: 'Vertical pixels for scroll' }, ms: { type: 'integer', minimum: 50, maximum: 12000 }, script: str('JS function body for eval') }, required: ['type'], additionalProperties: false } }, useAccountSession: { type: 'boolean', description: 'Reuse NEXUS Account Mode browser profile cookies instead of ephemeral InPrivate' }, captureScreenshot: { type: 'boolean', description: 'Also capture and attach a PNG screenshot of the rendered page' }, extractLinks: { type: 'boolean' }, extractForms: { type: 'boolean' } }, ['url']),
+  def('browser_inspect', 'Specialized dual-mode Agent & Standard Browser. Use engine="agent-fast" (zero-bloat Markdown + @e1..@eN interactive refs, works over Tor/.onion) or engine="agent-js" / renderJs=true (native Edge WebView2 with JS rendering, resource blocking, live @e1..@eN accessibility refs, and DOM actions targeting ref or selector).', { url: str('HTTP or HTTPS URL (supports .onion when Tor is active)'), engine: { type: 'string', enum: ['auto', 'agent-fast', 'agent-js', 'standard'], description: 'agent-fast = ultra-fast zero-bloat ref snapshot; agent-js = WebView2 JS + @eN refs + resource blocking; standard = full WebView2 render' }, renderJs: { type: 'boolean', description: 'Execute JavaScript in headless native Edge WebView2 (recommended for SPAs and dynamic pages)' }, waitMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Milliseconds to wait after page load for JS rendering (default 1200)' }, waitForSelector: str('Optional CSS selector to wait for before extracting content'), actions: { type: 'array', description: 'Optional sequential DOM actions to execute before extraction (target by ref like "@e3" or CSS selector)', items: { type: 'object', properties: { type: { type: 'string', enum: ['click', 'type', 'select', 'press_key', 'scroll', 'wait', 'eval'] }, ref: str('Compact element ref from snapshot (e.g. "@e4")'), selector: str('CSS selector for click/type/select/wait'), text: str('Text to type or key name for press_key (e.g. Enter, Tab, Escape)'), value: str('Option value for select'), y: { type: 'integer', description: 'Vertical pixels for scroll' }, ms: { type: 'integer', minimum: 50, maximum: 12000 }, script: str('JS function body for eval') }, required: ['type'], additionalProperties: false } }, useAccountSession: { type: 'boolean', description: 'Reuse NEXUS Account Mode browser profile cookies instead of ephemeral InPrivate' }, captureScreenshot: { type: 'boolean', description: 'Also capture and attach a PNG screenshot of the rendered page' }, extractLinks: { type: 'boolean' }, extractForms: { type: 'boolean' } }, ['url']),
   def('manage_process', 'Start, inspect, read output from, list, or stop long-running background processes (dev servers, watchers, builds).', { action: { type: 'string', enum: ['start', 'status', 'output', 'stop', 'list'] }, id: str('Process ID for status/output/stop'), command: str('Shell command when action is start'), label: str('Short label for the background process') }, ['action']),
   def('todo_write', 'Create or update the structured task checklist (plan) for this session to track multi-step engineering progress.', { todos: { type: 'array', items: { type: 'object', properties: { id: str('Short kebab-case ID'), title: str('Actionable task description'), status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'blocked'] }, priority: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['id', 'title', 'status'], additionalProperties: false } } }, ['todos']),
   def('todo_read', 'Read the current structured task checklist for this session.', {}),
   def('memory_store', 'Manage persistent structured user & project memories across sessions: user priorities, preferences, working style, hard constraints, workflows, personal profile, and project facts.', { action: { type: 'string', enum: ['list', 'search', 'remember', 'update', 'forget', 'profile'] }, id: str('Memory ID for update/forget'), key: str('Short descriptive topic/key'), value: str('Detailed preference, priority, constraint, workflow, or fact to remember'), category: { type: 'string', enum: MEMORY_CATEGORIES, description: 'priority | preference | constraint | workflow | profile | fact' }, priority: { type: 'string', enum: MEMORY_PRIORITIES, description: 'critical | high | normal | low' }, scope: { type: 'string', enum: ['project', 'global'], description: 'Scope (global for user-wide preferences/priorities, project for workspace-specific rules)' }, tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for fast recall' }, pinned: { type: 'boolean', description: 'Pin to always inject verbatim into context' }, query: str('Search query for action="search"') }, ['action']),
-  def('web_search', 'Search the live web using built-in DuckDuckGo search (works on every provider without needing an API key). Returns titles, URLs, and snippets.', { query: str('Search query'), maxResults: { type: 'integer', minimum: 1, maximum: 15 } }, ['query']),
+  def('web_search', 'Search the live web or Tor .onion hidden services using privacy-ranked engines: auto (privacy-first cascade), searxng (self-hosted zero-log), duckduckgo, mojeek, brave (ZDR API), kagi, langsearch, tavily, exa, ahmia (.onion), torch (.onion via Tor), onion (ahmia+torch via Tor), or bing-rss.', { query: str('Search query'), provider: { type: 'string', enum: ['auto', 'searxng', 'duckduckgo', 'mojeek', 'brave', 'kagi', 'langsearch', 'tavily', 'exa', 'ahmia', 'torch', 'onion', 'bing-rss'], description: 'Optional provider override (defaults to Settings searchProvider)' }, maxResults: { type: 'integer', minimum: 1, maximum: 15 } }, ['query']),
   def('web_fetch', 'Fetch an HTTP/HTTPS URL and extract clean readable text/markdown or JSON content with pagination.', { url: str('HTTP or HTTPS URL'), extractText: { type: 'boolean', description: 'Convert HTML to clean readable text (default true)' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 100, maximum: 24000 } }, ['url']),
   def('manage_automation', 'Create, list, toggle, trigger, or delete local scheduled/cron automations that run autonomously in NEXUS.', { action: { type: 'string', enum: ['list', 'create', 'toggle', 'run', 'delete'] }, id: str('Automation ID (required for toggle, run, delete)'), name: str('Automation name (required for create)'), prompt: str('Task prompt to execute (required for create)'), workspace: str('Optional workspace directory for the automation'), scheduleType: { type: 'string', enum: ['interval', 'daily', 'weekly', 'cron', 'once'] }, everyMinutes: { type: 'integer', minimum: 1 }, hour: { type: 'integer', minimum: 0, maximum: 23 }, minute: { type: 'integer', minimum: 0, maximum: 59 }, weekday: { type: 'integer', minimum: 0, maximum: 6 }, cronExpression: str('5-field cron expression'), runAt: str('ISO timestamp for once'), enabled: { type: 'boolean' }, model: str('Optional model ID'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted', 'agent', 'architect', 'explore'] } }, ['action']),
   def('delegate_subagent', 'Spawn an isolated sub-agent with its own clean context window to research a question, review code, or execute a bounded sub-task, returning a concise report.', { objective: str('Clear, self-contained task or research question for the sub-agent'), mode: { type: 'string', enum: ['explore', 'architect', 'agent'], description: 'Operating mode for the sub-agent (default explore)' }, maxSteps: { type: 'integer', minimum: 1, maximum: 12, description: 'Maximum tool steps for the sub-agent (default 6)' } }, ['objective']),
-  def('spawn_session', 'Spawn a real persistent nested child session under the current session. Runs independently (and in parallel across separate folders/worktrees) and can exchange messages with parent/peer sessions.', { title: str('Short title for the child session'), prompt: str('Complete self-contained kickoff objective for the child session'), workspace: str('Optional workspace or git worktree path (defaults to current session workspace)'), model: str('Optional model ID override'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted'] }, notifyParentOnIdle: { type: 'boolean', description: 'Automatically notify this parent session when the child completes (default true)' } }, ['prompt']),
-  def('list_sessions', 'List the parent session, nested child sessions, and peer workspace sessions with their IDs, titles, statuses, and latest output previews.', { scope: { type: 'string', enum: ['tree', 'all'], description: 'tree = parent/children/siblings (default), all = all sessions' } }),
+  def('spawn_session', 'Spawn a nested child session under the current session. Runs independently (and in parallel across separate folders/worktrees) and can exchange messages with parent/peer sessions. Set ephemeral=true for RAM-Only zero-disk-trace sessions (sensitive/high-risk tasks) or ephemeral=false for regular persistent sessions.', { title: str('Short title for the child session'), prompt: str('Complete self-contained kickoff objective for the child session'), workspace: str('Optional workspace or git worktree path (defaults to current session workspace)'), model: str('Optional model ID override'), agentMode: { type: 'string', enum: ['interactive', 'semi-autopilot', 'autopilot', 'unrestricted'] }, ephemeral: { type: 'boolean', description: 'RAM-Only zero-disk-trace session (defaults to inheriting parent ephemeral mode)' }, adminMode: { type: 'boolean', description: 'Grant per-session Windows Administrator rights (default false)' }, notifyParentOnIdle: { type: 'boolean', description: 'Automatically notify this parent session when the child completes (default true)' } }, ['prompt']),
+  def('list_sessions', 'List the parent session, nested child sessions, and peer workspace sessions with their IDs, titles, statuses, storage mode (RAM-Only vs Regular), and latest output previews.', { scope: { type: 'string', enum: ['tree', 'all'], description: 'tree = parent/children/siblings (default), all = all sessions' } }),
   def('send_session_message', 'Send a message directly to another NEXUS session (child, parent, or peer) to delegate follow-ups, steer active work, or report results. Wakes the target session automatically.', { sessionId: str('Target session ID from spawn_session or list_sessions'), message: str('Message content to deliver to the target session') }, ['sessionId', 'message']),
   def('read_session', 'Read status, recent messages, todos, and result of a nested child or peer session. Set wait: true to wait for the session to finish.', { sessionId: str('Target session ID'), wait: { type: 'boolean', description: 'Wait until the target session finishes or errors (default false)' }, timeoutSeconds: { type: 'integer', minimum: 1, maximum: 300, description: 'Max seconds to wait when wait is true (default 60)' } }, ['sessionId']),
+  def('manage_project', 'List, create, update, or delete rooted NEXUS Projects so sessions can be organized by root folder and shared project instructions.', { action: { type: 'string', enum: ['list', 'create', 'update', 'delete'] }, id: str('Project ID for update/delete'), projectId: str('Alias for id'), name: str('Project name'), newName: str('New name when updating'), workspace: str('Root workspace folder path for the project'), instructions: str('Project-specific system instructions'), assignCurrentSession: { type: 'boolean', description: 'When creating, immediately assign the current session to this new project' } }, ['action']),
+  def('manage_session', 'Inspect, organize, or migrate the current session (or another sessionId): rename title anytime, assign/unassign a Project, link a root workspace folder, pin/unpin, or live-migrate storage between RAM-Only (ephemeral=true, immediately purges disk traces) and Regular persistent storage (ephemeral=false).', { action: { type: 'string', enum: ['info', 'rename', 'assign_project', 'set_workspace', 'pin', 'set_ephemeral'] }, sessionId: str('Optional target session ID (defaults to current session)'), title: str('New concise session title for action="rename"'), projectId: str('Target project ID for action="assign_project" (empty string to unassign)'), projectName: str('Target project name for action="assign_project"'), unassign: { type: 'boolean', description: 'Detach session from its current project' }, adoptWorkspace: { type: 'boolean', description: 'Also adopt the project root folder as session workspace (default true)' }, workspace: str('Workspace folder path for action="set_workspace"'), pinned: { type: 'boolean', description: 'Pin state for action="pin"' }, ephemeral: { type: 'boolean', description: 'For action="set_ephemeral": true migrates to RAM-Only and purges disk traces; false migrates to Regular persistent storage' }, reason: str('Optional reason explaining why the session storage mode was migrated') }, ['action']),
+  def('present_media', 'Display local documents (Markdown, PDF, JSON, CSV, code, text), images (PNG/JPG/WebP/GIF/SVG), videos (MP4/WebM/MOV/MKV with streaming player), or audio directly inline inside the chat for the user to inspect, play, or open.', { path: str('Local file path (relative to workspace or absolute) to display inline'), title: str('Optional display title'), caption: str('Optional caption shown beneath the media card'), kind: { type: 'string', enum: ['auto', 'image', 'video', 'audio', 'pdf', 'document'], description: 'Media type (default auto-detected from file extension)' }, items: { type: 'array', description: 'Optional list of multiple files to present together as a media gallery', items: { type: 'object', properties: { path: str('File path'), title: str('Title'), caption: str('Caption'), kind: { type: 'string', enum: ['auto', 'image', 'video', 'audio', 'pdf', 'document'] } }, required: ['path'], additionalProperties: false } } }),
+  def('manage_privacy', 'Inspect or configure NEXUS privacy, OPSEC scorecard, WireGuard VPN (.conf import/connect/disconnect), Tor, Double-Hop WireGuard->Tor, 1-Click Stealth Mode (preserves prompt caching), Reversible PII Scrubber, private/.onion search engines, and browser privacy settings whenever the user asks.', { action: { type: 'string', enum: ['status', 'explain', 'set_routing', 'stealth', 'set_search', 'set_pii', 'set_browser', 'wireguard_import', 'wireguard_connect', 'wireguard_disconnect', 'tor_start', 'tor_stop', 'tor_new_identity'] }, mode: { type: 'string', enum: ['direct', 'wireguard', 'wireguard-tor', 'managed-tor', 'tor', 'socks5', 'http'], description: 'Routing mode for action="set_routing"' }, proxyUrl: str('Custom SOCKS5/HTTP proxy URL'), routeAllTraffic: { type: 'boolean', description: 'Encrypt ALL NEXUS outbound traffic (LLMs, search, browser, updates)' }, routeAgentTraffic: { type: 'boolean', description: 'Route AI web tools through proxy' }, killSwitch: { type: 'boolean', description: 'Fail-closed kill-switch blocking direct clearnet leaks' }, enabled: { type: 'boolean', description: 'Enable/disable flag for stealth or set_pii' }, provider: { type: 'string', enum: ['auto', 'searxng', 'duckduckgo', 'mojeek', 'brave', 'kagi', 'langsearch', 'tavily', 'exa', 'ahmia', 'torch', 'onion', 'bing-rss'] }, strictZeroTrack: { type: 'boolean' }, searxUrl: str('Custom SearXNG instance URL'), torchOnionUrl: str('Custom Torch .onion URL'), rules: { type: 'array', items: { type: 'string' }, description: 'Replace full custom PII redaction rule list' }, addRules: { type: 'array', items: { type: 'string' }, description: 'Append custom PII redaction rules (e.g. "secret@corp.com" or "Codename => [PROJ]")' }, removeRules: { type: 'array', items: { type: 'string' } }, persistentProfile: { type: 'boolean', description: 'false = InPrivate zero-trace, true = Account Mode' }, blockTrackers: { type: 'boolean' }, antiFingerprint: { type: 'boolean' }, engineMode: { type: 'string', enum: ['dual', 'agent-fast', 'agent-js', 'standard'] }, filePath: str('Local path to a WireGuard .conf file for wireguard_import'), configText: str('Raw WireGuard .conf text for wireguard_import'), name: str('Friendly label for imported WireGuard profile'), profileId: str('WireGuard profile ID for wireguard_connect'), chainTor: { type: 'boolean', description: 'When true on wireguard_connect, activates Double-Hop WireGuard -> Tor' }, autoInstall: { type: 'boolean', description: 'Auto-install wireproxy/Tor binaries if missing (default true)' } }, ['action']),
   def('create_dynamic_tool', 'Self-evolution tool: author and hot-register a brand-new JavaScript tool directly inside NEXUS so you and future sessions can call it immediately without restarting.', { name: str('Lowercase snake_case tool name (e.g. parse_log_errors)'), description: str('What this tool does'), readOnly: { type: 'boolean', description: 'True if tool does not mutate files or external systems' }, parameters: { type: 'object', description: 'JSON Schema object for tool parameters', additionalProperties: true }, handlerCode: str('Async JS function body using (args, { fs, fsSync, path, os, net, dns, crypto, execFileAsync, require, fetch, workspace }) where fs supports both async promises (await fs.readFile) and common sync helpers (fs.existsSync, fs.statSync, fs.readFileSync); returns a JSON-serializable result') }, ['name', 'description', 'handlerCode']),
   def('system_info', 'Inspect the host operating system, hardware resources, working directory, and installed developer runtimes (node, git, python, gh).', {}),
   def('document_progress', 'Record architectural decisions, modified files, test verification results, and next steps. Call after major milestones and before finishing.', { decisions: str('Decisions and rationale'), changes: str('Modified files and summary'), verification: str('Tests executed and results'), next: str('Remaining work and risks') }, ['decisions', 'changes', 'verification', 'next']),
@@ -218,7 +231,6 @@ export const baseTools = [
 
 const checkpointName = /^checkpoint-(\d+)\.json$/;
 async function readCheckpoint(store, task, args = {}) {
-  const directory = store.directoryFor(task.id);
   const requested = args.checkpoints === undefined ? null : args.checkpoints;
   if (requested !== null && (!Array.isArray(requested) || !requested.length || requested.some(n => !Number.isInteger(n) || n < 1))) throw new Error('Invalid checkpoint list: use positive integers.');
   const numbers = requested === null ? null : [...new Set(requested)].sort((a, b) => a - b);
@@ -227,6 +239,33 @@ async function readCheckpoint(store, task, args = {}) {
   const offset = args.offset === undefined ? 0 : args.offset;
   const length = args.length === undefined ? 8000 : Math.min(args.length, 20000);
   if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 1) throw new Error('Invalid range: offset >= 0 and length between 1 and 20000.');
+  if (task?.ephemeral) {
+    const ramList = Array.isArray(task.ramCheckpoints) ? task.ramCheckpoints : [];
+    const available = ramList.map((_, i) => i + 1);
+    if (numbers === null) {
+      return {
+        available,
+        checkpoints: ramList.map((data, i) => ({
+          checkpoint: i + 1,
+          at: data.at,
+          summaryChars: String(data.summary || '').length,
+          messageCount: (data.messages || []).length,
+          messagesBytes: Buffer.byteLength(JSON.stringify(data.messages || []), 'utf8'),
+        })),
+        hint: 'Use checkpoints:[N] with section, offset, and length to read exact pre-compaction details.',
+      };
+    }
+    const results = numbers.map(n => {
+      const data = ramList[n - 1];
+      if (!data) throw new Error('Checkpoint ' + n + ' not found in this RAM-only session.');
+      const summary = typeof data.summary === 'string' ? data.summary : '';
+      const serialized = JSON.stringify(data.messages || []);
+      const content = section === 'summary' ? summary : serialized;
+      return { checkpoint: n, file: `ram-checkpoint-${n}`, at: data.at, section, offset, length: Math.max(0, Math.min(length, content.length - offset)), totalChars: content.length, messageCount: (data.messages || []).length, summaryChars: summary.length, content: content.slice(offset, offset + length), next: offset + length < content.length ? offset + length : null };
+    });
+    return results.length === 1 ? results[0] : { checkpoints: results };
+  }
+  const directory = store.directoryFor(task.id);
   const available = (await fs.readdir(directory).catch(error => { if (error.code === 'ENOENT') return []; throw error; }))
     .filter(name => checkpointName.test(name))
     .map(name => Number(checkpointName.exec(name)[1]))
@@ -272,7 +311,18 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
       }
     }
     runtime.changed(task);
-    return { loaded: requested, activeToolsets: task.loadedToolsets, activatedTools: [...new Set(activated)], note: 'These tools are now active and callable on your next step.' };
+    const uniqueActivated = [...new Set(activated)];
+    const installedPluginCount = runtime.plugins ? runtime.plugins.list().length : 0;
+    const emptyPluginsOnly = requested.length === 1 && requested[0] === 'plugins' && uniqueActivated.length === 0;
+    return {
+      loaded: requested,
+      activeToolsets: task.loadedToolsets,
+      activatedTools: uniqueActivated,
+      installedPluginsCount: installedPluginCount,
+      note: emptyPluginsOnly
+        ? 'No custom JS plugins are currently installed (0 plugin tools activated). Install plugins from the Skills & Plugins Gallery or author one with create_dynamic_tool.'
+        : 'These tools are now active and callable on your next step.',
+    };
   }
   if(name==='search_capabilities')return runtime.capabilities.list({query:args.query,kind:args.kind,offset:args.offset,limit:20});
   if(name==='get_capability'){const entry=runtime.capabilities.get(args.id);return {...entry,...(entry.kind==='function'?{schema:baseTools.find(tool=>tool.function.name===entry.tool)?.function.parameters}:{})};}
@@ -296,9 +346,14 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
   if(name==='invoke_mcp')return runtime.mcp.call(args.server,args.tool,args.input,signal);
   if(name==='search_history'){
     if(typeof args.query!=='string')throw new Error('Invalid search query');
-    const data=await fs.readFile(path.join(store.directoryFor(task.id),'transcript.jsonl'),'utf8').catch(()=> '');
-    const matches=data.split('\n').filter(line=>line && line.toLowerCase().includes(args.query.toLowerCase()));
+    const qLower = args.query.toLowerCase();
     const offset=Number.isInteger(args.offset)&&args.offset>=0?args.offset:0;
+    if (task?.ephemeral) {
+      const matches = (task.messages || []).filter(m => JSON.stringify(m).toLowerCase().includes(qLower)).map(message => ({ at: task.createdAt, message }));
+      return { total: matches.length, offset, entries: matches.slice(offset, offset + 10), next: offset + 10 < matches.length ? offset + 10 : null };
+    }
+    const data=await fs.readFile(path.join(store.directoryFor(task.id),'transcript.jsonl'),'utf8').catch(()=> '');
+    const matches=data.split('\n').filter(line=>line && line.toLowerCase().includes(qLower));
     return {total:matches.length,offset,entries:matches.slice(offset,offset+10).map(line=>JSON.parse(line)),next:offset+10<matches.length?offset+10:null};
   }
   if(name==='read_artifact')return readArtifact(store,task,args.id,args.offset || 0,args.length || 8000);
@@ -370,29 +425,47 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     }
     throw new Error('Unsupported memory_store action.');
   }
-  const toolFetch = (url, opts) => {
-    const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, runtime.tor) : '';
-    if (proxyUrl && runtime.request === fetch) return proxiedFetch(url, opts, proxyUrl);
-    return runtime.request(url, opts);
-  };
+  const toolFetch = createNexusFetcher(() => store.state.settings, runtime.tor, { baseFetch: runtime.request, scope: 'agent', wgManager: runtime.wireguard || null });
   const webUa = store.state.settings.webUserAgent || '';
-  if(name==='web_search')return searchWebDuckDuckGo(args.query, { maxResults: args.maxResults, userAgent: webUa, request: toolFetch, signal });
-  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, userAgent: webUa, request: toolFetch, signal });
-  if(name==='http_request')return executeHttpRequest(args, { request: toolFetch, signal });
-  if(name==='browser_inspect')return inspectWebPage(args.url, {
-    extractLinks: args.extractLinks !== false,
-    extractForms: args.extractForms !== false,
-    renderJs: Boolean(args.renderJs),
-    waitMs: args.waitMs,
-    waitForSelector: args.waitForSelector || '',
-    actions: args.actions || null,
-    useAccountSession: Boolean(args.useAccountSession),
-    captureScreenshot: Boolean(args.captureScreenshot),
-    userAgent: webUa,
-    browserInspect: runtime.browserInspect,
+  if(name==='web_search')return executeWebSearch(args.query, {
+    provider: args.provider || '',
+    maxResults: args.maxResults,
+    settings: store.state.settings,
+    getSecret: k => runtime.getSecret?.(k) || null,
+    torRunning: Boolean(runtime.tor?.isRunning?.()),
     request: toolFetch,
     signal,
   });
+  if(name==='web_fetch')return fetchWebResource(args.url, { extractText: args.extractText !== false, offset: args.offset, length: args.length, userAgent: webUa, request: toolFetch, signal });
+  if(name==='http_request')return executeHttpRequest(args, { request: toolFetch, signal });
+  if(name==='browser_inspect'){
+    const prefEngine = args.engine && args.engine !== 'auto' ? args.engine : (store.state.settings.browserEngineMode || 'dual');
+    const wantsJs = Boolean(args.renderJs || args.waitForSelector || (Array.isArray(args.actions) && args.actions.length) || args.captureScreenshot || args.useAccountSession || prefEngine === 'agent-js' || prefEngine === 'standard');
+    if (prefEngine === 'agent-fast' && !args.renderJs && !args.actions?.length && !args.captureScreenshot && !args.waitForSelector) {
+      return runFastAgentBrowser(args.url, { request: toolFetch, userAgent: webUa, signal });
+    }
+    if (!wantsJs && prefEngine === 'dual') {
+      return runFastAgentBrowser(args.url, { request: toolFetch, userAgent: webUa, signal });
+    }
+    return inspectWebPage(args.url, {
+      extractLinks: args.extractLinks !== false,
+      extractForms: args.extractForms !== false,
+      renderJs: wantsJs,
+      agentMode: prefEngine !== 'standard',
+      waitMs: args.waitMs,
+      waitForSelector: args.waitForSelector || '',
+      actions: args.actions || null,
+      useAccountSession: Boolean(args.useAccountSession),
+      captureScreenshot: Boolean(args.captureScreenshot),
+      userAgent: webUa,
+      browserInspect: runtime.browserInspect,
+      request: toolFetch,
+      signal,
+    });
+  }
+  if(name==='manage_project')return runtime.manageProject(task, args);
+  if(name==='manage_session')return runtime.manageSession(task, args);
+  if(name==='manage_privacy')return runtime.managePrivacy(task, args);
   if(name==='manage_automation'){
     if(!runtime.automations)throw new Error('Automations scheduler is not attached to this runtime.');
     if(args.action==='list')return { automations: runtime.automations.list() };
@@ -442,8 +515,12 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     return { saved: true, entry: entry.id };
   }
   if (name === 'search_journal') {
+    const qLower = String(args.query).toLowerCase();
+    if (task?.ephemeral) {
+      return { entries: (task.events || []).filter(e => JSON.stringify(e).toLowerCase().includes(qLower)).slice(-30) };
+    }
     const data = await fs.readFile(path.join(store.directoryFor(task.id), 'journal.jsonl'), 'utf8').catch(() => '');
-    return { entries: data.split('\n').filter(line => line.toLowerCase().includes(String(args.query).toLowerCase())).slice(-30).map(line => JSON.parse(line)) };
+    return { entries: data.split('\n').filter(line => line.toLowerCase().includes(qLower)).slice(-30).map(line => JSON.parse(line)) };
   }
   if (name === 'list_connectors') return catalogPage(store.state.connectors.map(item=>({name:item.name,method:item.method,description:String(item.description||'').slice(0,600),imported:!!item.openapi})),{query:args.query,offset:args.offset,limit:20});
   if (name === 'get_connector') {const connector=store.state.connectors.find(item=>item.name===args.name);if(!connector)throw new Error('Connector not found.');return connector;}
@@ -461,9 +538,44 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
   const effectiveMode = task.agentMode || store.state.settings.agentMode || 'autopilot';
   const unrestricted = effectiveMode === 'unrestricted' || store.state.settings.autonomous;
   const effectiveWorkspace = task.workspace || (unrestricted ? process.cwd() : '');
+  if (name === 'present_media') {
+    const rawItems = Array.isArray(args.items) && args.items.length
+      ? args.items.slice(0, 12)
+      : (args.path ? [{ path: args.path, title: args.title, caption: args.caption, kind: args.kind }] : []);
+    if (!rawItems.length) throw new Error('present_media requires "path" or a non-empty "items" array.');
+    const mediaResolve = unrestricted
+      ? async (reqPath) => path.resolve(effectiveWorkspace || process.cwd(), reqPath)
+      : async (reqPath) => {
+          if (!effectiveWorkspace) throw new Error('Select a workspace folder to present relative files.');
+          return workspacePath(effectiveWorkspace, reqPath, false);
+        };
+    const presented = [];
+    for (const spec of rawItems) {
+      const resolved = await mediaResolve(spec.path);
+      const item = await buildChatMediaItem(resolved, {
+        title: spec.title || '',
+        caption: spec.caption || '',
+        kind: spec.kind || 'auto',
+        registerMedia: runtime.registerMedia,
+      });
+      presented.push(item);
+    }
+    return { presented: true, count: presented.length, chatMedia: presented };
+  }
   if (!effectiveWorkspace) throw new Error('Select a project workspace folder to use file, Git, or terminal tools.');
-  if (name === 'run_command') return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(args.command)], { cwd: effectiveWorkspace, signal, timeout:0 });
-  if (name === 'shell_session') return runtime.shells.exec(task.id, args.command, { defaultCwd: effectiveWorkspace, envOverrides: args.env, signal, timeout: 60000 });
+  const wantsElevated = args.elevated === true || (Boolean(task.adminMode) && args.elevated !== false && name === 'run_command');
+  if (name === 'run_command') {
+    if (wantsElevated) {
+      return runElevatedCommand(args.command, { cwd: effectiveWorkspace, signal, timeout: 0 });
+    }
+    return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(args.command)], { cwd: effectiveWorkspace, signal, timeout:0 });
+  }
+  if (name === 'shell_session') {
+    if (args.elevated === true) {
+      return runElevatedCommand(args.command, { cwd: effectiveWorkspace, signal, timeout: 90000 });
+    }
+    return runtime.shells.exec(task.id, args.command, { defaultCwd: effectiveWorkspace, envOverrides: args.env, signal, timeout: 60000 });
+  }
   if (name === 'git_operation') {
     const mutatingGitOps = new Set(['commit', 'checkout', 'checkout_new', 'discard', 'stash', 'pull', 'push', 'stage', 'unstage', 'worktree_add', 'worktree_remove']);
     if (!task.workspace && mutatingGitOps.has(args.operation) && !args.cwd) {
@@ -528,17 +640,31 @@ export async function executeTool(runtime, task, name, args, signal, effect) {
     const matches = []; let visited = 0;
     const relToRoot = path.relative(effectiveWorkspace, target);
     const displayBase = (!relToRoot || (!relToRoot.startsWith('..') && !path.isAbsolute(relToRoot))) ? effectiveWorkspace : target;
+    const scanFile = async filename => {
+      signal?.throwIfAborted();
+      visited++;
+      if ((await fs.stat(filename)).size > 200000) return;
+      const text = await fs.readFile(filename, 'utf8');
+      if (text.includes('\u0000')) return;
+      const dispPath = path.relative(displayBase, filename).replace(/\\/g, '/') || path.basename(filename);
+      text.split(/\r?\n/).forEach((line, index) => {
+        if (matches.length < 100 && line.toLowerCase().includes(args.query.toLowerCase())) {
+          matches.push({ path: dispPath, line: index + 1, text: line.slice(0, 400) });
+        }
+      });
+    };
+    if ((await fs.stat(target)).isFile()) {
+      await scanFile(target);
+      return { matches, visited, bounded: matches.length >= 100 };
+    }
     const walk = async directory => {
       for(const entry of await fs.readdir(directory,{withFileTypes:true})) {
-        signal.throwIfAborted();
+        signal?.throwIfAborted();
         if(matches.length>=100 || visited>=2000)return;
         if(entry.isSymbolicLink() || ['node_modules','.git','dist','release','.next'].includes(entry.name))continue;
         const filename = await resolvePath(effectiveWorkspace,path.relative(effectiveWorkspace,path.join(directory,entry.name)));
         if(entry.isDirectory()){await walk(filename);continue;}
-        visited++;
-        if((await fs.stat(filename)).size>200000)continue;
-        const text=await fs.readFile(filename,'utf8');if(text.includes('\u0000'))continue;
-        text.split(/\r?\n/).forEach((line,index)=>{if(matches.length<100 && line.toLowerCase().includes(args.query.toLowerCase()))matches.push({path:path.relative(displayBase,filename).replace(/\\/g,'/'),line:index+1,text:line.slice(0,400)});});
+        await scanFile(filename);
       }
     };
     await walk(target);return {matches,visited,bounded:visited>=2000||matches.length>=100};

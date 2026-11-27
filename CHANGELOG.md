@@ -2,6 +2,62 @@
 
 All notable changes to **NEXUS** are documented in this file.
 
+## [1.4.0] - 2026-11-27
+
+### Added
+- **App-Scoped WireGuard VPN (`wireproxy`) & Double-Hop WireGuard → Tor Chaining (`core/wireguard-manager.mjs`, `core/tor-manager.mjs`, `PrivateBrowserView.jsx`)**:
+  - Embedded zero-admin user-space WireGuard client (`wireproxy.exe` on `127.0.0.1:9060`) that routes ONLY NEXUS without installing Windows adapters or altering system routing tables.
+  - 1-click `.conf` file or paste import for **Mullvad** (€4.50/mo with Monero, zero email), **IVPN**, **Proton VPN**, **AirVPN**, and custom WireGuard profiles, with private keys stored encrypted inside the Windows DPAPI vault (`WIREGUARD_PROFILES_JSON`) and never exposed to the UI.
+  - Added two app-scoped routing modes: **WireGuard VPN** (low-latency daily driver, zero CAPTCHAs) and **Double-Hop WireGuard → Tor** (`torrc` `Socks5Proxy 127.0.0.1:9060` so your ISP never even sees Tor traffic while the VPN never sees destinations).
+- **Reversible Outbound PII & Local Path Scrubber + 1-Click Stealth Mode (`core/pii-scrubber.mjs`, `core/runtime.mjs`)**:
+  - Automatically redacts your Windows home path (`C:\Users\<you>` → `C:\Users\operator`), username, PC hostname, and custom sensitive strings from outbound cloud LLM prompts (skipped for local loopback models), and transparently restores them before local tool execution so coding workflows never break.
+  - Added **1-Click Stealth Mode** activating All-App VPN/Tor routing, Fail-Closed Kill-Switch, Outbound PII Scrubber, InPrivate Browser, Tracker Shield, and Strict Zero-Track Search while **explicitly preserving `promptCaching` and `cacheAffinity`**.
+- **Bidirectional RAM-Only ↔ Regular Sessions (`core/store.mjs`, `core/artifacts.mjs`, `ChatView.jsx`, `manage_session`, `spawn_session`)**:
+  - Choose **RAM-Only** (zero disk writes — excluded from `workspace.json`, SQLite, journals, artifacts, and exports) or **Regular** when creating new chats or nested child sessions (`spawn_session` inherits RAM-Only from ephemeral parents automatically).
+  - Live bidirectional migration anytime by the user (header pill) OR autonomously by the AI via `manage_session(action="set_ephemeral", ephemeral=true|false)`: migrating to RAM-Only immediately purges all disk traces (`tasks/<id>/` + store entry) while keeping the conversation alive in RAM; migrating back to Regular materializes the full session and history cleanly to disk.
+- **Per-Session Windows Administrator Rights (`core/coding-engine.mjs`, `native-host/Program.cs`, `ChatView.jsx`, `SettingsView.jsx`)**:
+  - Grant or revoke **Admin Rights** per session (`adminMode`) directly from the chat composer, active session header, or Spawn Child modal so specific sessions can execute elevated PowerShell commands (`run_command` / `shell_session` with `elevated: true`) for VPN adapters, Windows services, firewall rules, and system admin tasks via Windows UAC or process elevation.
+  - Added live **Windows Privilege Level** indicator and **Restart as Admin** action (`relaunchElevated`) in Settings → System & Host.
+- **Inline Chat Documents, Images, Audio & Streaming Video Viewer (`present_media`, `ChatMediaCard.jsx`, `/api/media/:id`)**:
+  - Added core tool `present_media` so the AI can display local **images** (inline preview + fullscreen Lightbox), **videos** (`<video controls>` with Range-capable `206 Partial Content` streaming for smooth scrubbing), **audio**, **PDFs** (embedded native Edge PDF reader), and **documents** (rendered Markdown, formatted CSV tables, code/JSON preview + Copy & Open in Windows) directly inside the chat stream.
+  - Upgraded user chat attachments so attached images, videos, audio, and PDFs also render inline inside messages.
+- **AI Live Privacy Awareness & `manage_privacy` Core Tool (`core/runtime.mjs`, `core/tools.mjs`, `PrivateBrowserView.jsx`)**:
+  - Automatically injects live `[Active Privacy & Network Posture]` (routing mode, WireGuard/Tor status, All-App traffic, Kill-Switch, Stealth Mode, PII Scrubber, Search engine, Prompt Caching, OPSEC score) into every session's context so changes immediately reflect in the AI.
+  - Added core tool `manage_privacy` (`status`, `explain`, `set_routing`, `stealth`, `set_search`, `set_pii`, `set_browser`, `wireguard_import`, `wireguard_connect`, `wireguard_disconnect`, `tor_start`, `tor_stop`, `tor_new_identity`) + an interactive ranked Protection & Mode Guide directly under the Network Routing selector in the UI.
+
+### Fixed
+- Attached `node.exe` core daemon to a Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) in `Program.cs`, added `--parent-pid` auto-exit watchdog in `server.mjs`, and prevented `ConfigFileManager` `fs.watch` from echo-writing back to `nexus.config.json`—eliminating stale orphaned daemon races that could revert `wireguard-tor` / routing selections back to `direct`.
+- Fixed RFC 7233 suffix HTTP Range (`bytes=-N` → `206` instead of `416`) on `/api/media/:id` for smooth MP4 video seeking, plus proper `413 Payload Too Large` with socket draining and `Connection: close` on oversized `/api/invoke` requests (preventing keep-alive poisoning).
+- Hardened `PiiScrubber` with unambiguous opaque sentinels (`C:\Users\__NEXUS_USER__`, `__NEXUS_HOST__`, preventing collisions with English prose/code), zero-character-leak `summary()` masking, and RFC 1918 LAN private IPv4/IPv6 detection in `isLocalModelEndpoint`.
+- Fixed `delegate_subagent` so reaching `maxSteps` runs a final tool-free synthesis turn (and unscrubs PII placeholders in subagent tool args) instead of returning empty whitespace.
+- Fixed SemVer 2.0.0 pre-release precedence in `compareSemver` (`1.4.0-rc.1 < 1.4.0`), added `runtimes/` and scoped target-dir process shutdown + retry logging to the portable auto-updater script, fixed `cssEscape()`/`attrEscape()` in `agent-browser.mjs`, enabled single-file searching in both `grep_search` and `search_files`, fixed `signal?.throwIfAborted()` in `search_files`, ignored `#` comments in WireGuard provider inference while flagging defaulted `AllowedIPs`, clarified empty `plugins` toolset activation, and stabilized Windows `ENOTEMPTY` cleanup in `chat-workspace.test.mjs`.
+
+## [1.3.0] - 2026-11-27
+
+### Added
+- **App-Wide Tor / SOCKS5h Encryption & Fail-Closed Kill-Switch (`core/privacy-proxy.mjs` + `server.mjs`)**:
+  - Upgraded `proxiedFetch` to true streaming `ReadableStream` responses so real-time LLM SSE streaming works seamlessly over Tor/SOCKS5h.
+  - Added unified `createNexusFetcher` with **Route ALL App Traffic Through Tor** (`torRouteAllTraffic`: encrypts LLM APIs, web search, Agent Browser, MCP HTTP calls, Skills downloads, and GitHub update checks through SOCKS5h with remote DNS resolution, while keeping `localhost`/`127.0.0.1` local for Ollama/vLLM) and a **Fail-Closed Kill-Switch** (`torStrictFailClosed`).
+  - Added live **Anonymity & OPSEC Scorecard (`buildPrivacyAudit`, 0–100)** inside the Private Browser drawer with real-time security checks and actionable OPSEC hardening recommendations for untraceable communications.
+- **Multi-Tier Zero-Track, AI & Tor `.onion` Search Suite (`core/search-engines.mjs`)**:
+  - Added 13 configurable search modes: **Auto Privacy-First Cascade**, **SearXNG** (self-hosted/private JSON & HTML metasearch), **DuckDuckGo HTML**, **Mojeek** (independent zero-tracking index), **Brave Search API** (Zero Data Retention), **Kagi Search API** (zero ads/tracking), **LangSearch**, **Tavily**, **Exa**, **Ahmia** (`.onion` index), **Torch** (`.onion` hidden-service search strictly over Tor), **Combined Tor `.onion`**, and optional **Bing RSS** (disabled when **Strict Zero-Track Mode** is enabled).
+  - Added DPAPI vault inputs for `SEARCH_BRAVE_KEY`, `SEARCH_KAGI_KEY`, `SEARCH_LANGSEARCH_KEY`, `SEARCH_TAVILY_KEY`, `SEARCH_EXA_KEY`, and `SEARCH_MOJEEK_KEY` in Settings, plus an interactive private/onion search bar inside the Agent Browser view.
+- **Dual-Mode Specialized Agent Browser (`core/agent-browser.mjs` + `NativeBrowser.cs` + `PrivateBrowserView.jsx` + `BrowserSidePanel.jsx`)**:
+  - Added a fast zero-bloat **Agent Browser** engine (`agent-fast`) that strips ads/trackers and emits compact `@e1..@eN` interactive accessibility refs, forms, links, and clean Markdown (80–90% fewer tokens, 100% Tor/SOCKS5h & `.onion` compatible).
+  - Upgraded headless WebView2 `NativeBrowser.cs` (`agent-js`) with live `data-nexus-ref="eN"` DOM tagging, `@eN` ref-based actions (`click`/`type`/`select`/`press_key`), tracker & heavy-media resource blocking, and anti-fingerprinting (`DNT`/`GPC`/`sendBeacon` block).
+  - Added a **Standard Visual ↔ Agent View (`@eN`)** toggle in both the full Private Browser and the chat Side Browser Panel.
+- **In-App GitHub Auto-Updater & Custom System Prompt Protection (`core/updater.mjs` + `core/store.mjs`)**:
+  - Added GitHub Releases update detection (`checkUpdate`), SHA-256 checksum verification, automatic pre-update snapshots of `nexus.config.json`, `workspace.json`, and custom prompts into `%APPDATA%\NEXUS\backups\`, and one-click portable binary updates that never touch user profile data.
+  - Added automatic **Custom System Prompt Protection** (`globalInstructionsCustomized` flag + dedicated always-preserved `customSystemPrompt` personal addendum + 1-click **Backup Prompts** and **Reset Base to Stock** in Settings) so future releases never overwrite user-customized prompts.
+- **Visual Changelog & Release Timeline (`core/changelog.mjs` + `ChangelogView.jsx`)**:
+  - Added a dedicated **Changelog & Updates** view accessible from the sidebar footer (`v1.3.0`) and Command Palette (`Ctrl+K`) with a vertical milestone timeline, category filters (`Added`, `Security`, `Improved`, `Fixed`), live search, and the GitHub Auto-Updater bar.
+- **AI Self-Management Tools for Projects & Sessions (`manage_project` + `manage_session`)**:
+  - Promoted `manage_project` (list, get, create, update, delete, assign current session) and `manage_session` (get, rename, assign/unassign project, set workspace, pin) into `CORE_TOOL_NAMES` so the AI can organize projects and sessions autonomously even under Lazy Toolsets, with Semi-Autopilot gating destructive project deletion.
+
+### Security
+- Enforced a hard fail-closed `.onion` guard in `createNexusFetcher` and `search-engines.mjs` so `.onion` URLs and Torch searches can never leak to clearnet DNS resolvers when Tor is inactive.
+- Kept all Tor/SOCKS5h routing strictly app-scoped to NEXUS without modifying Windows system proxy settings or attempting to bypass corporate/Defender network controls.
+
 ## [1.2.0] - 2026-11-26
 
 ### Added

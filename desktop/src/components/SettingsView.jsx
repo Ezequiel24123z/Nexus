@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   KeyRound, CheckCircle2, RefreshCw, Plus, Trash2, FolderOpen, Terminal,
-  Palette, Cpu, Sliders, FileJson, ShieldOff, Database, Globe
+  Palette, Cpu, Sliders, FileJson, ShieldOff, Database, Globe, ShieldCheck, Archive, History
 } from 'lucide-react';
 import StoragePanel from '../StoragePanel.jsx';
 import { PROVIDER_META, AUTONOMY_LEVELS, normalizeAutonomyId, detectProviderId, formatMoney, cleanError } from '../lib/format.mjs';
@@ -33,7 +33,7 @@ function SecretRow({ name, label, act, notify }) {
   );
 }
 
-export default function SettingsView({ state, appearance, models, reloadModels, balance, balanceBusy, refreshBalance, act, notify }) {
+export default function SettingsView({ state, appearance, models, reloadModels, balance, balanceBusy, refreshBalance, act, notify, navigate, updateStatus, onRefreshUpdate }) {
   const s = state.settings;
   const customProviders = s.customProviders || [];
   const activeProvider = detectProviderId(s.model, customProviders);
@@ -45,6 +45,7 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
   const [checkMsg, setCheckMsg] = useState('');
   const [customUrl, setCustomUrl] = useState(s.customBaseUrl || 'http://localhost:11434/v1');
   const [globalInstr, setGlobalInstr] = useState(s.globalInstructions || '');
+  const [customAddendum, setCustomAddendum] = useState(s.customSystemPrompt || '');
   const [customCss, setCustomCss] = useState(s.customCss || '');
   const [extraBodyText, setExtraBodyText] = useState(s.extraBody ? JSON.stringify(s.extraBody, null, 2) : '');
   const [extraHeadersText, setExtraHeadersText] = useState(s.extraHeaders ? JSON.stringify(s.extraHeaders, null, 2) : '');
@@ -64,6 +65,7 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
   const [newDenyRule, setNewDenyRule] = useState('');
 
   useEffect(() => { setGlobalInstr(s.globalInstructions || ''); }, [s.globalInstructions]);
+  useEffect(() => { setCustomAddendum(s.customSystemPrompt || ''); }, [s.customSystemPrompt]);
   useEffect(() => { setCustomCss(s.customCss || ''); }, [s.customCss]);
 
   useEffect(() => {
@@ -262,6 +264,19 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
               <label className="field"><span>Secret Key Name</span><input className="mono" value={connSecretName} onChange={e => setConnSecretName(e.target.value.toUpperCase())} /></label>
               <SecretRow name={connSecretName} label="Secret Value" act={act} notify={notify} />
             </section>
+
+            <section className="panel-card wide">
+              <h2>Private & AI Search Engine API Keys (DPAPI Vault)</h2>
+              <p className="hint">Optional keys for zero-tracking or AI-native search APIs (SearXNG, DuckDuckGo, Mojeek HTML, Ahmia, and Torch .onion work with zero keys). Configure search routing in the Private Browser view.</p>
+              <div className="grid-2">
+                <SecretRow name="SEARCH_BRAVE_KEY" label="Brave Search API (Zero Data Retention)" act={act} notify={notify} />
+                <SecretRow name="SEARCH_KAGI_KEY" label="Kagi Search API (Zero Ads / Zero Tracking)" act={act} notify={notify} />
+                <SecretRow name="SEARCH_LANGSEARCH_KEY" label="LangSearch API (AI Semantic Search)" act={act} notify={notify} />
+                <SecretRow name="SEARCH_TAVILY_KEY" label="Tavily AI Search API" act={act} notify={notify} />
+                <SecretRow name="SEARCH_EXA_KEY" label="Exa Neural Search API" act={act} notify={notify} />
+                <SecretRow name="SEARCH_MOJEEK_KEY" label="Mojeek Official API (optional)" act={act} notify={notify} />
+              </div>
+            </section>
           </div>
         )}
 
@@ -340,10 +355,36 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
             </section>
 
             <section className="panel-card wide">
-              <h2>Global System Instructions</h2>
-              <p className="hint">Injected on every turn alongside project rules, auto-discovered NEXUS.md / CLAUDE.md / AGENTS.md, and persistent memories.</p>
-              <textarea rows={7} value={globalInstr} onChange={e => setGlobalInstr(e.target.value)} style={{ marginBottom: 10 }} />
-              <button type="button" className="btn-primary" disabled={globalInstr === s.globalInstructions} onClick={() => { void setSetting('globalInstructions', globalInstr); notify('Global instructions updated.', 'ok'); }}>Save Global Instructions</button>
+              <div className="row-between" style={{ marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+                <div className="row" style={{ gap: 8 }}>
+                  <h2 style={{ margin: 0 }}>Global System Instructions & Custom Prompt Protection</h2>
+                  <span className={`pill ${s.globalInstructionsCustomized ? 'ok' : 'info'}`}>
+                    <ShieldCheck size={12} /> {s.globalInstructionsCustomized ? 'Customized · Update-Protected' : 'Stock Default · Auto-Upgrades Safely'}
+                  </span>
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <button type="button" className="btn-secondary" style={{ fontSize: 12 }} onClick={async () => {
+                    const res = await act('backupCustomPrompts');
+                    if (res?.ok) notify(`Backed up custom prompts to ${res.backupDir}`, 'ok');
+                  }}><Archive size={13} /> Backup Prompts</button>
+                  {s.globalInstructionsCustomized && (
+                    <button type="button" className="btn-secondary" style={{ fontSize: 12 }} onClick={async () => {
+                      await act('settings', { resetGlobalInstructions: true });
+                      notify('Restored latest stock base instructions (your Custom Prompt Addendum below is untouched).', 'ok');
+                    }}>Reset Base to Stock</button>
+                  )}
+                </div>
+              </div>
+              <p className="hint">Any edit you make to Global System Instructions is automatically flagged as customized and will NEVER be overwritten by future NEXUS releases or GitHub auto-updates.</p>
+              <textarea rows={6} value={globalInstr} onChange={e => setGlobalInstr(e.target.value)} style={{ marginBottom: 10 }} />
+              <button type="button" className="btn-primary" disabled={globalInstr === s.globalInstructions} onClick={() => { void setSetting('globalInstructions', globalInstr); notify('Global instructions saved & locked against update overwrites.', 'ok'); }}>Save Global Instructions</button>
+
+              <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--border-subtle)' }}>
+                <h3 style={{ margin: '0 0 4px', fontSize: 14 }}>Personal Custom System Prompt Addendum (Always Preserved)</h3>
+                <p className="hint">Recommended place for your permanent persona, tone, rules, or private directives. Appended on every turn and completely decoupled from NEXUS stock updates.</p>
+                <textarea rows={4} value={customAddendum} onChange={e => setCustomAddendum(e.target.value)} placeholder="Write your permanent custom system directives here — never overwritten on upgrade…" style={{ marginBottom: 10 }} />
+                <button type="button" className="btn-primary" disabled={customAddendum === (s.customSystemPrompt || '')} onClick={() => { void setSetting('customSystemPrompt', customAddendum); notify('Custom system prompt addendum saved.', 'ok'); }}>Save Personal Addendum</button>
+              </div>
             </section>
           </div>
         )}
@@ -515,6 +556,17 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
                 <div style={{ display: 'grid', gap: 8 }}>
                   <div className="list-row"><span className="hint">App Architecture</span><strong>{hostInfo.nativeHost ? 'Native Windows .NET 10 + WebView2 (Zero Electron)' : 'Standalone Local Core + Browser'}</strong></div>
                   <div className="list-row"><span className="hint">Engine Version</span><strong className="mono">NEXUS v{hostInfo.version} · Node {hostInfo.nodeVersion}</strong></div>
+                  <div className="list-row">
+                    <span className="hint">Windows Privileges</span>
+                    <div className="row" style={{ gap: 8 }}>
+                      <span className={`pill ${hostInfo.isElevated ? 'warn' : 'ok'}`}>{hostInfo.isElevated ? 'Administrator (Elevated)' : 'Standard User'}</span>
+                      {hostInfo.nativeHost && !hostInfo.isElevated && (
+                        <button type="button" className="btn-secondary" style={{ fontSize: 11.5, padding: '3px 8px' }} onClick={() => void api('relaunchElevated').catch(e => notify(cleanError(e), 'error'))}>
+                          Restart as Admin
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   <div className="list-row"><span className="hint">Global Summon Hotkey</span><strong className="mono">Ctrl + Shift + Space</strong></div>
                   <div className="list-row"><span className="hint">Data Directory</span><strong className="mono" style={{ fontSize: 11.5 }}>{hostInfo.dataDir}</strong></div>
                   <div className="list-row"><span className="hint">Live Config File</span><strong className="mono" style={{ fontSize: 11.5 }}>{hostInfo.configPath}</strong></div>
@@ -533,6 +585,31 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
                   ))}
                 </div>
               ) : <p className="hint">Inspecting environment…</p>}
+            </section>
+
+            <section className="panel-card">
+              <h2>GitHub Auto-Updates & Prompt Safety</h2>
+              <label className="switch-row">
+                <div><strong>Automatically Check GitHub Releases on Startup</strong><p>Checks for new releases in the background (routed through Tor when All-App Tor is active) without auto-installing until you approve.</p></div>
+                <input type="checkbox" className="switch-input" checked={s.autoCheckUpdates !== false} onChange={e => setSetting('autoCheckUpdates', e.target.checked)} />
+              </label>
+              <label className="field" style={{ marginTop: 10 }}>
+                <span>GitHub Release Repository (owner/repo)</span>
+                <input className="mono" key={s.updateRepo || 'Ezequiel24123z/Nexus'} defaultValue={s.updateRepo || 'Ezequiel24123z/Nexus'} onBlur={e => setSetting('updateRepo', e.target.value.trim() || 'Ezequiel24123z/Nexus')} />
+              </label>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                <button type="button" className="btn-secondary" onClick={() => void onRefreshUpdate?.()}>
+                  <RefreshCw size={13} /> Check GitHub Now
+                </button>
+                <button type="button" className="btn-primary" onClick={() => navigate?.('changelog')}>
+                  <History size={13} /> Open Changelog & Updater
+                </button>
+              </div>
+              {updateStatus?.updateAvailable && (
+                <p className="hint" style={{ color: 'var(--ok-fg)', marginTop: 8 }}>
+                  Update ready: NEXUS v{updateStatus.latestVersion} (installed: v{updateStatus.currentVersion}).
+                </p>
+              )}
             </section>
 
             <section className="panel-card wide">

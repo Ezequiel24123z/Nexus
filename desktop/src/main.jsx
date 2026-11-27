@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   Plus, Search, Settings2, Folder, FolderOpen, MessageSquare, BookOpen, ListTodo,
   Network, Plug, Swords, PanelLeft, Sun, Moon, Pin, Trash2, GitFork, RefreshCw, X,
-  ChevronRight, Globe, Clock, Sparkles, Brain, Pencil
+  ChevronRight, Globe, Clock, Sparkles, Brain, Pencil, History, Ghost, ShieldAlert
 } from 'lucide-react';
 import { installNexusBridge } from './bridge.mjs';
 import './styles/tokens.css';
@@ -22,6 +22,7 @@ import TasksView from './components/TasksView.jsx';
 import SettingsView from './components/SettingsView.jsx';
 import PrivateBrowserView from './components/PrivateBrowserView.jsx';
 import AutomationsView from './components/AutomationsView.jsx';
+import ChangelogView from './components/ChangelogView.jsx';
 import Modal from './components/Modal.jsx';
 import useDrafts from './useDrafts.jsx';
 import { mergeById } from './chat-state.mjs';
@@ -89,6 +90,7 @@ function App() {
   const [projectModal, setProjectModal] = useState(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [renaming, setRenaming] = useState(null);
+  const [updateStatus, setUpdateStatus] = useState(null);
   const [loaded, setLoaded] = useState({ id: null, conversation: [], conversationStart: 0, events: [], eventsStart: 0 });
   const toastSeq = useRef(0);
   const renameCommitRef = useRef(false);
@@ -136,6 +138,13 @@ function App() {
   };
 
   const reloadModels = () => api('models', { sort: 'intelligence-high-to-low' }).then(setModels).catch(() => {});
+  const refreshUpdate = async () => {
+    try {
+      const res = await api('checkUpdate');
+      setUpdateStatus(res);
+      return res;
+    } catch { return null; }
+  };
   const refreshBalance = async () => {
     setBalanceBusy(true);
     try { setBalance(await api('balance')); } catch {}
@@ -143,7 +152,12 @@ function App() {
   };
 
   useEffect(() => {
-    api('snapshot').then(setState).catch(e => notify(cleanError(e), 'error'));
+    api('snapshot').then(snap => {
+      setState(snap);
+      if (snap?.settings?.autoCheckUpdates !== false) {
+        setTimeout(() => { void refreshUpdate(); }, 2500);
+      }
+    }).catch(e => notify(cleanError(e), 'error'));
     const off = window.nexus.subscribe(setState);
     void reloadModels();
     void refreshBalance();
@@ -246,7 +260,7 @@ function App() {
   const viewTitle = {
     chat: task?.title || currentProject?.name || 'New Chat',
     memory: 'User Memory & Profile',
-    browser: 'Private Browser',
+    browser: 'Private & Agent Browser',
     gallery: 'Skills & Plugins Gallery',
     arena: 'Model Arena',
     files: 'Code & Git Studio',
@@ -255,6 +269,7 @@ function App() {
     library: 'Library',
     connectors: 'Connectors',
     mcp: 'MCP Extensions',
+    changelog: 'Release Timeline & Updates',
     settings: 'Settings',
   }[view];
 
@@ -362,6 +377,8 @@ function App() {
                         <button type="button" className="chat-item-main" onClick={() => openTask(t.id)} onDoubleClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }} title="Click to open · Double-click to rename">
                           <i className={`status-dot ${t.status}`} />
                           <span>{t.title}</span>
+                          {t.ephemeral && <small className="tag-chip ram-tag" title="RAM-Only Ephemeral Session (zero disk traces)">RAM</small>}
+                          {t.adminMode && <small className="tag-chip admin-tag" title="Windows Administrator Rights enabled">ADM</small>}
                           {kids.length > 0 && <small className="tag-chip tabular" style={{ fontSize: 9.5, padding: '0 5px' }}>{kids.length}</small>}
                           {t.pinned && <Pin size={11} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
                         </button>
@@ -396,6 +413,13 @@ function App() {
             </div>
             <button type="button" className="btn-icon" aria-label="Refresh balance" disabled={balanceBusy} onClick={refreshBalance}><RefreshCw size={13} className={balanceBusy ? 'spin' : ''} /></button>
           </div>
+          <button type="button" className={`nav-btn ${view === 'changelog' ? 'active' : ''}`} onClick={() => setView('changelog')}>
+            <History size={15} />
+            <span>Changelog & Updates</span>
+            {updateStatus?.updateAvailable
+              ? <span className="nav-badge" style={{ background: 'var(--ok-bg)', color: 'var(--ok-fg)' }}>v{updateStatus.latestVersion}</span>
+              : <span className="nav-badge mono" style={{ opacity: 0.75 }}>v{updateStatus?.currentVersion || '1.4.0'}</span>}
+          </button>
           <button type="button" className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
             <Settings2 size={15} /><span>Settings & Config</span>
           </button>
@@ -433,6 +457,8 @@ function App() {
                 >
                   {viewTitle}
                 </span>
+                {task.ephemeral && <span className="pill ram-pill" title="RAM-Only session (zero disk traces)"><Ghost size={11} /> RAM-Only</span>}
+                {task.adminMode && <span className="pill warn" title="Windows Administrator rights active for this session"><ShieldAlert size={11} /> Admin</span>}
                 <button
                   type="button"
                   className="btn-icon"
@@ -528,6 +554,15 @@ function App() {
         {view === 'library' && <LibraryView state={state} act={act} notify={notify} navigate={setView} />}
         {view === 'connectors' && <ConnectorsView act={act} count={state.connectorCount ?? state.connectors.length} notify={notify} />}
         {view === 'mcp' && <McpView state={state} workspace={activeWorkspace} act={act} notify={notify} />}
+        {view === 'changelog' && (
+          <ChangelogView
+            state={state}
+            act={act}
+            notify={notify}
+            updateStatus={updateStatus}
+            onRefreshUpdate={refreshUpdate}
+          />
+        )}
         {view === 'settings' && (
           <SettingsView
             state={state}
@@ -539,6 +574,9 @@ function App() {
             refreshBalance={refreshBalance}
             act={act}
             notify={notify}
+            navigate={setView}
+            updateStatus={updateStatus}
+            onRefreshUpdate={refreshUpdate}
           />
         )}
       </main>

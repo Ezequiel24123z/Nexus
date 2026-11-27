@@ -34,6 +34,7 @@ export class TorManager extends EventEmitter {
     this.error = null;
     this.version = null;
     this.logs = [];
+    this.upstreamSocks5 = '';
     this.installingPromise = null;
     this.startingPromise = null;
   }
@@ -85,6 +86,7 @@ export class TorManager extends EventEmitter {
       socksPort: this.socksPort,
       controlPort: this.controlPort,
       socksUrl: this.getSocksUrl(),
+      upstreamSocks5: this.upstreamSocks5 || null,
       version: this.version,
       error: this.error,
       logs: this.logs.slice(-25),
@@ -219,8 +221,9 @@ export class TorManager extends EventEmitter {
     return this.installingPromise;
   }
 
-  async start({ autoInstall = true, waitForBootstrap = true, timeoutMs = 45000 } = {}) {
-    if (this.statusState === 'running' && this.bootstrapPct >= 100 && this.isRunning()) {
+  async start({ autoInstall = true, waitForBootstrap = true, timeoutMs = 45000, upstreamSocks5 = '' } = {}) {
+    const normalizedUpstream = String(upstreamSocks5 || '').trim().replace(/^socks5h?:\/\//i, '');
+    if (this.statusState === 'running' && this.bootstrapPct >= 100 && this.isRunning() && this.upstreamSocks5 === normalizedUpstream) {
       return this.status();
     }
     if (this.startingPromise) return this.startingPromise;
@@ -238,7 +241,10 @@ export class TorManager extends EventEmitter {
       await fsp.mkdir(this.torDataDir, { recursive: true });
       this.error = null;
       this.bootstrapPct = 0;
-      this.bootstrapSummary = 'Starting local Tor daemon…';
+      this.upstreamSocks5 = normalizedUpstream;
+      this.bootstrapSummary = normalizedUpstream
+        ? `Starting Tor chained inside WireGuard (${normalizedUpstream})…`
+        : 'Starting local Tor daemon…';
       this.statusState = 'starting';
       this.emitStatus();
 
@@ -255,6 +261,7 @@ export class TorManager extends EventEmitter {
         `DataDirectory ${quoteTorPath(this.torDataDir)}`,
         'ClientOnly 1',
         'AvoidDiskWrites 1',
+        ...(normalizedUpstream ? [`Socks5Proxy ${normalizedUpstream}`] : []),
         ...(geoip ? [`GeoIPFile ${quoteTorPath(geoip)}`] : []),
         ...(geoip6 ? [`GeoIPv6File ${quoteTorPath(geoip6)}`] : []),
       ];

@@ -3,7 +3,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -321,6 +321,40 @@ export async function grepWorkspaceFiles(root, { query, isRegex = false, caseSen
   const matches = [];
   let visited = 0;
 
+  const searchSingleFile = async (fullPath, displayRel) => {
+    signal?.throwIfAborted();
+    if (matches.length >= maxMatches || visited >= 3000) return;
+    visited++;
+    let stat;
+    try { stat = await fs.stat(fullPath); } catch { return; }
+    if (!stat.isFile() || stat.size > 300000) return;
+    let text;
+    try { text = await fs.readFile(fullPath, 'utf8'); } catch { return; }
+    if (text.includes('\u0000')) return;
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (matches.length >= maxMatches) break;
+      if (regex.test(lines[i])) {
+        const item = { path: displayRel, line: i + 1, text: lines[i].slice(0, 400) };
+        if (ctx > 0) {
+          const start = Math.max(0, i - ctx);
+          const end = Math.min(lines.length - 1, i + ctx);
+          item.context = lines.slice(start, end + 1).map((l, idx) => `${start + idx + 1}: ${l.slice(0, 300)}`);
+        }
+        matches.push(item);
+      }
+    }
+  };
+
+  // Support grepping directly on a single file path as well as a directory
+  try {
+    const rootStat = await fs.stat(root);
+    if (rootStat.isFile()) {
+      await searchSingleFile(root, path.basename(root));
+      return { query, isRegex, matches, count: matches.length, visited, bounded: matches.length >= maxMatches };
+    }
+  } catch {}
+
   const walk = async directory => {
     signal?.throwIfAborted();
     if (matches.length >= maxMatches || visited >= 3000) return;
@@ -341,26 +375,7 @@ export async function grepWorkspaceFiles(root, { query, isRegex = false, caseSen
         continue;
       }
       if (fileMatcher && !fileMatcher.test(relPosix) && !(fileBaseMatcher && fileBaseMatcher.test(entry.name))) continue;
-      visited++;
-      let stat;
-      try { stat = await fs.stat(fullPath); } catch { continue; }
-      if (stat.size > 300000) continue;
-      let text;
-      try { text = await fs.readFile(fullPath, 'utf8'); } catch { continue; }
-      if (text.includes('\u0000')) continue;
-      const lines = text.split(/\r?\n/);
-      for (let i = 0; i < lines.length; i++) {
-        if (matches.length >= maxMatches) break;
-        if (regex.test(lines[i])) {
-          const item = { path: rel, line: i + 1, text: lines[i].slice(0, 400) };
-          if (ctx > 0) {
-            const start = Math.max(0, i - ctx);
-            const end = Math.min(lines.length - 1, i + ctx);
-            item.context = lines.slice(start, end + 1).map((l, idx) => `${start + idx + 1}: ${l.slice(0, 300)}`);
-          }
-          matches.push(item);
-        }
-      }
+      await searchSingleFile(fullPath, rel);
     }
   };
   await walk(root);
@@ -1279,6 +1294,7 @@ export async function inspectWebPage(urlInput, {
   extractLinks = true,
   extractForms = true,
   renderJs = false,
+  agentMode = true,
   waitMs,
   waitForSelector = '',
   actions = null,
@@ -1297,6 +1313,7 @@ export async function inspectWebPage(urlInput, {
     return browserInspect(parsed.href, {
       extractLinks,
       extractForms,
+      agentMode,
       waitMs,
       waitForSelector,
       actions,
@@ -1478,4 +1495,184 @@ export async function searchWebDuckDuckGo(query, { maxResults = 8, userAgent = '
   }
 
   return { query: q, engine, count: results.length, results };
+}
+
+// --- Per-Session Windows Administrator Elevation ---
+let _cachedElevated = null;
+export function isProcessElevated() {
+  if (_cachedElevated !== null) return _cachedElevated;
+  if (process.platform !== 'win32') {
+    _cachedElevated = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+    return _cachedElevated;
+  }
+  try {
+    const out = execFileSync('whoami', ['/groups'], { encoding: 'utf8', windowsHide: true, timeout: 4000 });
+    _cachedElevated = /S-1-16-12288|S-1-16-16384/.test(out);
+  } catch {
+    _cachedElevated = false;
+  }
+  return _cachedElevated;
+}
+
+// Executes a PowerShell command with Windows Administrator privileges.
+// If NEXUS is already elevated, runs directly with zero UAC popups; otherwise invokes Windows UAC (RunAs)
+// capturing stdout, stderr, and exitCode cleanly via a short-lived temp directory.
+export async function runElevatedCommand(commandText, { cwd = process.cwd(), signal, timeout = 120000 } = {}) {
+  if (typeof commandText !== 'string' || !commandText.trim()) throw new Error('Provide a command to execute elevated.');
+  if (process.platform !== 'win32') throw new Error('Windows elevation is only supported on Windows.');
+
+  if (isProcessElevated()) {
+    return new Promise((resolve, reject) => {
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(commandText)], { cwd, windowsHide: true });
+      let output = '';
+      let stopped = false;
+      const stop = () => { stopped = true; try { child.kill(); } catch {} };
+      const timer = timeout > 0 ? setTimeout(stop, timeout) : null;
+      signal?.addEventListener('abort', stop, { once: true });
+      const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', stop); };
+      child.stdout.on('data', d => { output = (output + d).slice(-48000); });
+      child.stderr.on('data', d => { output = (output + d).slice(-48000); });
+      child.on('error', err => { done(); reject(err); });
+      child.on('close', code => { done(); if (stopped) reject(new Error('Elevated command stopped or timed out.')); else resolve({ exitCode: code ?? 0, output, elevated: true, method: 'process-admin' }); });
+    });
+  }
+
+  const stage = path.join(os.tmpdir(), 'nexus-uac-' + crypto.randomUUID().slice(0, 8));
+  await fs.mkdir(stage, { recursive: true });
+  const scriptPath = path.join(stage, 'run.ps1');
+  const outPath = path.join(stage, 'out.txt');
+  const codePath = path.join(stage, 'code.txt');
+  const esc = s => String(s).replace(/'/g, "''");
+  const innerScript = [
+    '[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)',
+    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+    '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+    `Set-Location -LiteralPath '${esc(cwd)}'`,
+    '$ErrorActionPreference = "Continue"',
+    `$__out = & {\n${commandText}\n} *>&1 | Out-String`,
+    '$__rc = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }',
+    `[System.IO.File]::WriteAllText('${esc(outPath)}', $__out, [System.Text.UTF8Encoding]::new($false))`,
+    `[System.IO.File]::WriteAllText('${esc(codePath)}', [string]$__rc, [System.Text.UTF8Encoding]::new($false))`,
+  ].join('\r\n');
+  await fs.writeFile(scriptPath, innerScript, 'utf8');
+
+  const launcher = `$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','${esc(scriptPath)}'); exit $p.ExitCode`;
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', launcher], { cwd, windowsHide: true });
+      let errOut = '';
+      let stopped = false;
+      const stop = () => { stopped = true; try { child.kill(); } catch {} };
+      const timer = timeout > 0 ? setTimeout(stop, timeout) : null;
+      signal?.addEventListener('abort', stop, { once: true });
+      const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', stop); };
+      child.stderr.on('data', d => { errOut += d; });
+      child.on('error', err => { done(); reject(err); });
+      child.on('close', code => {
+        done();
+        if (stopped) return reject(new Error('Elevated command cancelled or timed out.'));
+        if (code !== 0 && /canceled by the user|1223/i.test(errOut)) {
+          return reject(new Error('Windows UAC elevation prompt was declined by the user.'));
+        }
+        resolve(code);
+      });
+    });
+    const output = (await fs.readFile(outPath, 'utf8').catch(() => '')).slice(-48000);
+    const codeStr = (await fs.readFile(codePath, 'utf8').catch(() => '1')).trim();
+    const exitCode = Number.isFinite(Number(codeStr)) ? Number(codeStr) : 1;
+    return { exitCode, output, elevated: true, method: 'uac-runas' };
+  } finally {
+    await fs.rm(stage, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// --- Rich Inline Chat Media & Document Classifier ---
+const MEDIA_MIME_MAP = {
+  '.png': ['image', 'image/png'],
+  '.jpg': ['image', 'image/jpeg'],
+  '.jpeg': ['image', 'image/jpeg'],
+  '.webp': ['image', 'image/webp'],
+  '.gif': ['image', 'image/gif'],
+  '.bmp': ['image', 'image/bmp'],
+  '.svg': ['image', 'image/svg+xml'],
+  '.mp4': ['video', 'video/mp4'],
+  '.webm': ['video', 'video/webm'],
+  '.mov': ['video', 'video/quicktime'],
+  '.mkv': ['video', 'video/x-matroska'],
+  '.m4v': ['video', 'video/mp4'],
+  '.ogv': ['video', 'video/ogg'],
+  '.mp3': ['audio', 'audio/mpeg'],
+  '.wav': ['audio', 'audio/wav'],
+  '.ogg': ['audio', 'audio/ogg'],
+  '.m4a': ['audio', 'audio/mp4'],
+  '.flac': ['audio', 'audio/flac'],
+  '.pdf': ['pdf', 'application/pdf'],
+  '.md': ['document', 'text/markdown'],
+  '.markdown': ['document', 'text/markdown'],
+  '.txt': ['document', 'text/plain'],
+  '.json': ['document', 'application/json'],
+  '.csv': ['document', 'text/csv'],
+  '.html': ['document', 'text/html'],
+  '.htm': ['document', 'text/html'],
+  '.xml': ['document', 'application/xml'],
+  '.yaml': ['document', 'text/yaml'],
+  '.yml': ['document', 'text/yaml'],
+  '.log': ['document', 'text/plain'],
+  '.js': ['document', 'text/javascript'],
+  '.mjs': ['document', 'text/javascript'],
+  '.ts': ['document', 'text/typescript'],
+  '.tsx': ['document', 'text/typescript'],
+  '.jsx': ['document', 'text/javascript'],
+  '.py': ['document', 'text/x-python'],
+  '.cs': ['document', 'text/plain'],
+  '.sql': ['document', 'text/plain'],
+  '.ps1': ['document', 'text/plain'],
+  '.docx': ['document', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  '.xlsx': ['document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  '.pptx': ['document', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+};
+
+export function classifyMediaFile(filePath, explicitKind = 'auto') {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  const [detectedKind, mime] = MEDIA_MIME_MAP[ext] || ['document', 'application/octet-stream'];
+  const kind = explicitKind && explicitKind !== 'auto' ? explicitKind : detectedKind;
+  return { kind, mime, ext };
+}
+
+export async function buildChatMediaItem(resolvedPath, { title = '', caption = '', kind = 'auto', maxPreviewChars = 16000, registerMedia } = {}) {
+  const stat = await fs.stat(resolvedPath);
+  if (!stat.isFile()) throw new Error(`Media target is not a file: ${resolvedPath}`);
+  const { kind: resolvedKind, mime, ext } = classifyMediaFile(resolvedPath, kind);
+  const name = path.basename(resolvedPath);
+  const mediaId = typeof registerMedia === 'function' ? registerMedia(resolvedPath, mime, name) : null;
+  let textPreview = '';
+  let truncated = false;
+  if (resolvedKind === 'document' && (mime.startsWith('text/') || mime === 'application/json' || mime === 'application/xml')) {
+    const cap = Math.max(500, Math.min(Number(maxPreviewChars) || 16000, 48000));
+    const fh = await fs.open(resolvedPath, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(stat.size, cap + 64));
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      const raw = buf.subarray(0, bytesRead).toString('utf8');
+      if (!raw.includes('\u0000')) {
+        truncated = stat.size > cap;
+        textPreview = raw.slice(0, cap);
+      }
+    } finally {
+      await fh.close();
+    }
+  }
+  return {
+    id: mediaId || crypto.randomUUID(),
+    mediaId,
+    kind: resolvedKind,
+    mime,
+    ext,
+    name,
+    title: String(title || name).slice(0, 140),
+    caption: String(caption || '').slice(0, 500),
+    path: resolvedPath,
+    bytes: stat.size,
+    ...(textPreview ? { textPreview, truncated } : {}),
+  };
 }

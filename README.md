@@ -1,6 +1,6 @@
 # NEXUS — Standalone Native Agentic Coding, Private Browser & Personal Operator Workstation
 
-**NEXUS (`v1.2.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
+**NEXUS (`v1.4.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
 
 Designed for maximum personal autonomy and hackability, NEXUS imposes **zero client-side content filters or artificial generation caps**—delegating content policy solely to the model provider you choose while granting full, auditable power over your local Windows environment, codebase, Win32 ConPTY terminal, Git repositories, integrated browser, REST APIs, dynamic JS plugins, and Model Context Protocol (MCP) servers.
 
@@ -8,7 +8,7 @@ Designed for maximum personal autonomy and hackability, NEXUS imposes **zero cli
 
 ---
 
-## Key Capabilities (`v1.2.0`)
+## Key Capabilities (`v1.4.0`)
 
 ### 1. Native Windows Architecture (Zero Electron)
 - **Standalone Native Host (`desktop/native-host/`)**: C# / .NET 10 WinForms + official Windows `Microsoft.Web.WebView2` runtime (no Electron, no bundled Chromium). Includes native Win11 dark titlebar (`DWMWA`), System Tray, global summon hotkey (`Ctrl+Shift+Space`), single-instance lock, crash watchdogs (`host.log` / `core.log`), WebView2 auto-recovery, and Core daemon auto-restart.
@@ -43,10 +43,12 @@ Switch globally or per chat across **10 built-in providers** plus **unlimited us
 - **Dedicated Memory & Profile Studio**: Organize durable memories across 6 categories (**Priorities**, **Preferences**, **Constraints**, **Workflows**, **User Profile**, **Facts**) with **Critical / High / Normal / Low** priorities, pinning, tags, Global vs. Project scopes, live **Prompt Preview**, and Markdown/JSON export & import.
 - **Priority-Ranked Context Injection**: Constraints, pinned items, active priorities, and working-style preferences are automatically grouped and injected into every matching session, while agents proactively learn and respect your style via `memory_store` (`list`, `search`, `remember`, `update`, `forget`, `profile`).
 
-### 6. Integrated Account / InPrivate Browser & App-Scoped Tor/Proxy
-- **Side-Panel & Full-View Browser (`BrowserSidePanel` / `PrivateBrowserView`)**: Embedded WebView2 browser alongside chat or in full view.
-- **Account Mode vs. InPrivate Mode**: Keep logins/cookies isolated inside NEXUS in Account mode, or switch to ephemeral zero-trace InPrivate sessions with 1-click **Wipe**.
-- **App-Scoped Privacy Networking**: NEXUS-managed portable Tor (`127.0.0.1:9055`, never touches Windows system proxy), SOCKS5/HTTP proxy support, system VPN detection, tracker domain blocking, anti-fingerprinting, **Send to AI**, and **Screenshot to Chat**.
+### 6. App-Wide Tor Encryption, Dual Agent/Visual Browser, Multi-Tier & `.onion` Search, Auto-Updater & Visual Changelog
+- **App-Wide Tor / SOCKS5h Encryption & Fail-Closed Kill-Switch**: Optionally tunnel **every** outbound NEXUS connection (LLM APIs with live SSE streaming, web search, Agent Browser, MCP HTTP calls, Skills downloads, and GitHub updates) through app-scoped Tor/SOCKS5h with remote DNS resolution (leaving Windows proxy untouched and `localhost` local), backed by a live **0–100 Anonymity & OPSEC Scorecard** and a hard fail-closed `.onion` guard.
+- **Dual-Mode Browser (`Standard Visual` ↔ `Specialized Agent Browser`)**: Switch seamlessly between the interactive Account/InPrivate WebView2 browser and a compact **Agent Browser** (`@e1..@eN` interactive accessibility refs, clean Markdown, tracker & media blocking, 80–90% fewer tokens, full `.onion`/Tor compatibility) in both full view and the chat Side Panel.
+- **Multi-Tier Zero-Track, AI & Tor `.onion` Search**: Choose from **SearXNG**, **DuckDuckGo**, **Mojeek**, **Brave Search API (ZDR)**, **Kagi**, **LangSearch**, **Tavily**, **Exa**, **Ahmia**, and **Torch (`.onion` strictly over Tor)**, plus **Strict Zero-Track Search Mode**.
+- **In-App GitHub Auto-Updater, Custom Prompt Protection & Visual Changelog**: Dedicated **Changelog & Updates** vertical timeline view with one-click GitHub Releases updates, SHA-256 verification, automatic pre-update snapshots, and permanent protection for user-customized system prompts (`globalInstructionsCustomized` + personal `customSystemPrompt` addendum).
+- **AI Project & Session Self-Management**: Core tools `manage_project` and `manage_session` let agents create/update projects, bind sessions to projects, rename sessions, set workspaces, and pin threads autonomously.
 
 ### 7. Rooted Projects, Nested Sessions, Skills Gallery & Local Automations
 - **Rooted Projects & Concurrent Nested Sessions**: Bind projects to root folders to auto-discover `NEXUS.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.nexus/.github/.claude/skills/*/SKILL.md`. Agents can orchestrate concurrent nested child sessions (`spawn_session`, `list_sessions`, `send_session_message`, `read_session`) with automatic parent handoff.

@@ -1,6 +1,22 @@
-# Status & Roadmap (`v1.2.0` Standalone Native Release)
+# Status & Roadmap (`v1.4.0` Standalone Native Release)
 
-Updated: November 26, 2026.
+Updated: November 27, 2026.
+
+## Implemented in NEXUS `v1.4.0`
+
+- **App-Scoped WireGuard VPN (`wireproxy`) & Double-Hop WireGuard → Tor (`core/wireguard-manager.mjs`, `core/tor-manager.mjs`)**: Zero-admin user-space WireGuard client (`127.0.0.1:9060`, Mullvad/IVPN/Proton/AirVPN `.conf` import encrypted in DPAPI vault) + `wireguard-tor` double-hop chaining so your ISP never sees Tor and the VPN never sees destinations.
+- **Reversible Outbound PII & Path Scrubber + Cache-Preserving 1-Click Stealth Mode (`core/pii-scrubber.mjs`)**: Redacts `C:\Users\<name>`, PC hostname, and custom sensitive strings from cloud LLM prompts (restored transparently on local tool execution), paired with 1-Click Stealth Mode that **preserves `promptCaching` and `cacheAffinity`**.
+- **Bidirectional RAM-Only ↔ Regular Sessions (`core/store.mjs`, `core/artifacts.mjs`, `manage_session`, `spawn_session`)**: Create RAM-Only zero-disk-trace sessions or nested sub-sessions, and live-migrate Regular ↔ RAM-Only anytime (purging disk traces immediately or materializing to disk on demand) either by user click or autonomously by the AI.
+- **Per-Session Windows Administrator Rights (`core/coding-engine.mjs`, `native-host/Program.cs`, `ChatView.jsx`)**: Grant elevated Windows Admin privileges per session for VPN/services/firewall tasks via UAC or process elevation + 1-click **Restart as Admin** in Settings.
+- **Inline Chat Documents, Images, Audio & Streaming Video Viewer (`present_media`, `ChatMediaCard.jsx`, `/api/media/:id`)**: Core tool and Range-streaming (`206 Partial Content`) inline cards for images (with Lightbox), HTML5 videos, audio, embedded PDFs, Markdown, CSV tables, and code documents.
+
+## Implemented in NEXUS `v1.3.0`
+
+- **App-Wide Tor / SOCKS5h Encryption, Streaming & Fail-Closed Kill-Switch (`core/privacy-proxy.mjs`)**: True `ReadableStream` SSE over Tor/SOCKS5h, unified `createNexusFetcher` for all outbound traffic (LLM APIs, search, browser, MCP, skills, updates) with remote DNS resolution, hard `.onion` clearnet block, `torStrictFailClosed` kill-switch, and live **0–100 Anonymity & OPSEC Scorecard**.
+- **Multi-Tier Private, AI & Tor `.onion` Search Suite (`core/search-engines.mjs`)**: 13 configurable modes (Auto Privacy-First, SearXNG, DuckDuckGo, Mojeek, Brave ZDR, Kagi, LangSearch, Tavily, Exa, Ahmia, Torch `.onion` strictly via Tor, Combined `.onion`, optional Bing RSS blocked under Strict Zero-Track) + DPAPI vault secret keys in Settings.
+- **Dual-Mode Specialized Agent Browser (`core/agent-browser.mjs` + `NativeBrowser.cs` + `PrivateBrowserView.jsx` + `BrowserSidePanel.jsx`)**: Fast zero-bloat `@e1..@eN` accessibility snapshot & Markdown engine (`agent-fast`) alongside live DOM-ref WebView2 JS (`agent-js` with tracker/media blocking & `press_key`) and the standard visual browser.
+- **GitHub Auto-Updater, Custom System Prompt Protection & Visual Changelog (`core/updater.mjs` + `core/changelog.mjs` + `ChangelogView.jsx`)**: Interactive vertical release timeline with filters/search, SHA-256 verified portable updates, pre-update prompt/config backups, and permanent protection for user-edited system prompts (`globalInstructionsCustomized` + always-preserved `customSystemPrompt` addendum).
+- **AI Project & Session Self-Management (`manage_project` + `manage_session`)**: Core tools enabling agents to create/update projects, assign sessions to projects, rename sessions, set workspaces, and pin threads.
 
 ## Implemented in NEXUS `v1.2.0`
 

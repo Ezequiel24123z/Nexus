@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { baseTools, executeTool, READ_ONLY_TOOL_NAMES } from './tools.mjs';
@@ -16,6 +17,10 @@ import {selectMemoriesForContext, formatMemoriesForPrompt} from './memory.mjs';
 import {openApiRequest,validateOpenApiConnector} from './openapi.mjs';
 import {modelConnection,completionRequest,allProviders,resolveCopilotAuth} from './providers.mjs';
 import {isNetworkFailure,retryableNetworkFailure,networkFailure,providerHttpFailure,extractSafeProviderDetail} from './provider-errors.mjs';
+import {isStockGlobalInstructions, globalInstructions as stockGlobalInstructions} from './store.mjs';
+import {PiiScrubber, isLocalModelEndpoint} from './pii-scrubber.mjs';
+import {buildPrivacyAudit, PRIVACY_MODE_GUIDE} from './privacy-proxy.mjs';
+import {SEARCH_PROVIDER_CATALOG} from './search-engines.mjs';
 import {setTimeout as retryDelay} from 'node:timers/promises';
 
 const externalEffects=new Set(['write_file','replace_text','multi_edit','apply_patch','delete_file','move_file','run_command','shell_session','git_operation','manage_process','invoke_mcp','invoke_connector','http_request','desktop_action','create_connector','save_capability','scaffold_mcp_server','manage_automation','create_dynamic_tool']);
@@ -78,6 +83,14 @@ export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
   if (['delete_file', 'desktop_action', 'scaffold_mcp_server', 'create_connector', 'manage_automation'].includes(name)) {
     return { risky: true, reason: `High-impact tool (${name})` };
   }
+  if (name === 'manage_project' && args?.action === 'delete') {
+    return { risky: true, reason: 'Deleting a project definition' };
+  }
+  if (name === 'manage_privacy') {
+    const act = String(args?.action || 'status').toLowerCase();
+    if (act === 'status' || act === 'explain') return { risky: false, reason: '' };
+    return { risky: true, reason: `Changing NEXUS privacy/network setting (${act})` };
+  }
   if (name === 'invoke_mcp') {
     return { risky: true, reason: `External MCP tool (${args?.server || 'server'}:${args?.tool || 'tool'})` };
   }
@@ -89,6 +102,9 @@ export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
   }
   if (['run_command', 'shell_session', 'manage_process'].includes(name)) {
     const cmd = String(args?.command || '');
+    if (args?.elevated === true || (Boolean(task?.adminMode) && name === 'run_command' && args?.elevated !== false)) {
+      return { risky: true, reason: 'Windows Administrator elevated command execution' };
+    }
     if (RISKY_COMMAND_RE.test(cmd)) {
       return { risky: true, reason: 'Potentially destructive or elevated shell command' };
     }
@@ -125,8 +141,8 @@ export const estimateTokens = (value, bytesPerToken = 3) => {
 };
 
 export class Runtime extends EventEmitter {
-  constructor(store, { getSecret, desktop, browserInspect, mcp, request = fetch } = {}) {
-    super(); this.store = store; this.getSecret = getSecret; this.desktop = desktop; this.browserInspect = browserInspect; this.request = request;
+  constructor(store, { getSecret, desktop, browserInspect, mcp, registerMedia, request = fetch } = {}) {
+    super(); this.store = store; this.getSecret = getSecret; this.desktop = desktop; this.browserInspect = browserInspect; this.registerMedia = registerMedia; this.request = request;
     this.active = new Map(); this.approvals = new Map(); this.closed = false; this.desktopOwner = null;this.mcp=mcp;
     this.compacting=new Set();
     this.compressionControllers=new Map();
@@ -134,6 +150,47 @@ export class Runtime extends EventEmitter {
     this.processes=new ProcessManager();
     this.shells=new StatefulShellManager();
     this.plugins=new PluginManager(store.directory);
+  }
+  activePiiScrubber() {
+    const s = this.store.state.settings || {};
+    return new PiiScrubber({
+      enabled: Boolean(s.privacyScrubPii),
+      customRules: s.privacyScrubCustomRules || [],
+    });
+  }
+  toggleStealthMode(enabled) {
+    const on = Boolean(enabled);
+    const s = this.store.state.settings || {};
+    if (on) {
+      // Stealth Mode hardens routing, kill-switch, InPrivate, zero-track search & PII scrubbing
+      // while EXPLICITLY PRESERVING promptCaching and cacheAffinity per user preference.
+      const preferredProxy = s.browserProxyMode && s.browserProxyMode !== 'direct'
+        ? s.browserProxyMode
+        : (this.wireguard?.isRunning?.() ? 'wireguard' : (this.tor?.isRunning?.() ? 'managed-tor' : 'managed-tor'));
+      this.settings({
+        stealthMode: true,
+        browserProxyMode: preferredProxy,
+        torRouteAllTraffic: true,
+        browserRouteAgentTraffic: true,
+        torStrictFailClosed: true,
+        browserPersistentProfile: false,
+        browserBlockTrackers: true,
+        browserAntiFingerprint: true,
+        searchStrictZeroTrack: true,
+        privacyScrubPii: true,
+      });
+    } else {
+      this.settings({
+        stealthMode: false,
+        torStrictFailClosed: false,
+      });
+    }
+    return {
+      stealthMode: Boolean(this.store.state.settings.stealthMode),
+      promptCachingPreserved: this.store.state.settings.promptCaching !== false,
+      cacheAffinityPreserved: Boolean(this.store.state.settings.cacheAffinity),
+      settings: this.store.state.settings,
+    };
   }
   changed(task=undefined, { immediate = false } = {}) {
     try {
@@ -170,14 +227,14 @@ export class Runtime extends EventEmitter {
       tasks: this.store.state.tasks.map(task => {
         if(activeTaskId!==undefined&&task.id!==activeTaskId)return {
           id:task.id,title:task.title,prompt:task.prompt,projectId:task.projectId,parentTaskId:task.parentTaskId||null,workspace:task.workspace,
-          status:task.status,model:task.model,agentMode:task.agentMode,arenaGroupId:task.arenaGroupId||null,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,
+          status:task.status,model:task.model,agentMode:task.agentMode,ephemeral:Boolean(task.ephemeral),adminMode:Boolean(task.adminMode),arenaGroupId:task.arenaGroupId||null,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,
           compacting:this.compacting.has(task.id),summaryOnly:true
         };
         const conversationStart=Math.max(0,task.conversation.length-120),eventsStart=Math.max(0,task.events.length-80);
         const contextTokens=task.contextTokens || 0;
         const effectiveWindow=task.contextWindow || this.store.state.settings.contextWindow;
         const compressionThreshold=effectiveWindow*this.store.state.settings.compressionPercent/100;
-        return {...task,messages:undefined,pendingImages:undefined,compacting:this.compacting.has(task.id),todos:task.todos||[],liveTools:task.liveTools||[],liveSubagents:task.liveSubagents||[],calls:(task.calls||[]).slice(-80),callsTotal:(task.calls||[]).length,callsStart:Math.max(0,(task.calls||[]).length-80),effects:(task.effects||[]).slice(-60),effectsTotal:(task.effects||[]).length,events:task.events.slice(eventsStart),eventsStart,eventsTotal:task.events.length,conversation:task.conversation.slice(conversationStart),conversationStart,conversationTotal:task.conversation.length,contextTokens,needsCompression:contextTokens>=compressionThreshold};
+        return {...task,messages:undefined,pendingImages:undefined,_ramArtifacts:undefined,_ramAttachments:undefined,ramCheckpoints:undefined,compacting:this.compacting.has(task.id),todos:task.todos||[],liveTools:task.liveTools||[],liveSubagents:task.liveSubagents||[],calls:(task.calls||[]).slice(-80),callsTotal:(task.calls||[]).length,callsStart:Math.max(0,(task.calls||[]).length-80),effects:(task.effects||[]).slice(-60),effectsTotal:(task.effects||[]).length,events:task.events.slice(eventsStart),eventsStart,eventsTotal:task.events.length,conversation:task.conversation.slice(conversationStart),conversationStart,conversationTotal:task.conversation.length,contextTokens,needsCompression:contextTokens>=compressionThreshold};
       }),
       approvals: [...this.approvals].filter(([,item])=>activeTaskId===undefined||item.taskId===activeTaskId).map(([id, item]) => ({ id, taskId: item.taskId, name: item.name, args: item.args, reason: item.reason || '', suggestedPattern: item.suggestedPattern || item.name })),
       hasKey: Boolean(conn.optionalKey || this.getSecret(conn.key)),
@@ -194,7 +251,7 @@ export class Runtime extends EventEmitter {
     const start=Math.max(0,before-limit);
     return {items:values.slice(start,before),start,total:values.length,hasMore:start>0};
   }
-  create({ prompt, workspace = '', model, agentMode, dependsOn = [], title, projectId, parentTaskId = null, notifyParentOnIdle = false, attachmentIds=[], arenaGroupId = null, temperature = undefined, systemPromptOverride = '' }) {
+  create({ prompt, workspace = '', model, agentMode, dependsOn = [], title, projectId, parentTaskId = null, notifyParentOnIdle = false, attachmentIds=[], arenaGroupId = null, temperature = undefined, systemPromptOverride = '', ephemeral = false, adminMode = false }) {
     const attachments=this.attachments.resolve(attachmentIds);
     if(!prompt?.trim()&&attachments.length)prompt='Analyze the attached files.';
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 100000) throw new Error('Describe a task of up to 100,000 characters.');
@@ -207,7 +264,7 @@ export class Runtime extends EventEmitter {
     const effectiveMode = agentMode || expanded.mode;
     if(effectiveMode!==undefined && !agentModes.includes(effectiveMode))throw new Error('Invalid agent mode.');
     const chosenModel = model || this.store.state.settings.model;
-    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), prompt: effectivePrompt, workspace, projectId:projectId || null, parentTaskId: parentTaskId || null, notifyParentOnIdle: Boolean(notifyParentOnIdle), engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
+    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), prompt: effectivePrompt, workspace, projectId:projectId || null, parentTaskId: parentTaskId || null, notifyParentOnIdle: Boolean(notifyParentOnIdle), ephemeral: Boolean(ephemeral), adminMode: Boolean(adminMode), engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
       ...(effectiveMode ? { agentMode: effectiveMode } : {}),
       ...(arenaGroupId ? { arenaGroupId } : {}),
       ...(typeof temperature === 'number' ? { temperature } : {}),
@@ -218,10 +275,10 @@ export class Runtime extends EventEmitter {
     this.store.state.tasks.unshift(task);
     this.store.transcript(task, attachmentMessage(effectivePrompt,attachments));
     task.conversation.push({ id:crypto.randomUUID(), role:'user', content: prompt, attachments });
-    this.store.journal(task, 'created', { prompt: effectivePrompt, workspace:task.workspace, model: task.model, dependsOn });
+    this.store.journal(task, 'created', { prompt: effectivePrompt, workspace:task.workspace, model: task.model, dependsOn, ephemeral: task.ephemeral, adminMode: task.adminMode });
     this.changed(task); this.schedule(); return task.id;
   }
-  settings(input) {
+  settings(input, { skipConfigWrite = false } = {}) {
     const s = {...this.store.state.settings};
     for (const [key,min,max] of [['compressionPercent',10,95],['concurrency',1,64],['contextWindow',8000,10000000],['maxSteps',0,1000000],['maxOutput',0,1000000],['webMaxResults',1,25],['webMaxUses',0,30]]) {
       if (input[key] !== undefined) {
@@ -248,17 +305,23 @@ export class Runtime extends EventEmitter {
         else throw new Error('Invalid JSON object for ' + key);
       }
     }
-    for (const key of ['autonomous','autoWorkspaceWrites','desktopEnabled','streaming','cacheAffinity','promptCaching','lazyToolLoading','microCompaction','silentToolSteps','minimizeToTray','browserPersistentProfile','browserBlockTrackers','browserAntiFingerprint','browserRouteAgentTraffic']) if (typeof input[key] === 'boolean') s[key] = input[key];
-    for (const ruleKey of ['semiAutoAllowRules', 'semiAutoDenyRules']) {
+    for (const key of ['autonomous','autoWorkspaceWrites','desktopEnabled','streaming','cacheAffinity','promptCaching','lazyToolLoading','microCompaction','silentToolSteps','minimizeToTray','browserPersistentProfile','browserBlockTrackers','browserAntiFingerprint','browserRouteAgentTraffic','torRouteAllTraffic','torStrictFailClosed','searchStrictZeroTrack','privacyScrubPii','stealthMode','autoCheckUpdates','globalInstructionsCustomized']) if (typeof input[key] === 'boolean') s[key] = input[key];
+    for (const ruleKey of ['semiAutoAllowRules', 'semiAutoDenyRules', 'privacyScrubCustomRules']) {
       if (input[ruleKey] !== undefined) {
         if (!Array.isArray(input[ruleKey]) || input[ruleKey].length > 200) throw new Error('Invalid ' + ruleKey);
         s[ruleKey] = [...new Set(input[ruleKey].map(x => String(x || '').trim()).filter(Boolean).slice(0, 200))];
       }
     }
-    if(input.browserProxyMode!==undefined&&['direct','managed-tor','tor','custom','socks5','http'].includes(input.browserProxyMode))s.browserProxyMode=input.browserProxyMode;
+    if(input.browserProxyMode!==undefined&&['direct','wireguard','wireguard-tor','managed-tor','tor','custom','socks5','http'].includes(input.browserProxyMode))s.browserProxyMode=input.browserProxyMode;
+    if(typeof input.wireguardActiveProfileId==='string'&&input.wireguardActiveProfileId.length<=80)s.wireguardActiveProfileId=input.wireguardActiveProfileId.trim();
+    if(typeof input.wireguardBinaryPath==='string'&&input.wireguardBinaryPath.length<=400)s.wireguardBinaryPath=input.wireguardBinaryPath.trim();
     if(typeof input.browserProxyUrl==='string'&&input.browserProxyUrl.length<=300)s.browserProxyUrl=input.browserProxyUrl.trim();
-    if(input.browserSearchEngine!==undefined&&['duckduckgo','startpage','brave','qwant','searxng'].includes(input.browserSearchEngine))s.browserSearchEngine=input.browserSearchEngine;
+    if(input.browserSearchEngine!==undefined&&['duckduckgo','startpage','brave','qwant','searxng','mojeek','kagi'].includes(input.browserSearchEngine))s.browserSearchEngine=input.browserSearchEngine;
     if(typeof input.browserSearxUrl==='string'&&input.browserSearxUrl.length<=300)s.browserSearxUrl=input.browserSearxUrl.trim();
+    if(input.browserEngineMode!==undefined&&['dual','agent-fast','agent-js','standard'].includes(input.browserEngineMode))s.browserEngineMode=input.browserEngineMode;
+    if(input.searchProvider!==undefined&&['auto','searxng','duckduckgo','mojeek','brave','kagi','langsearch','tavily','exa','ahmia','torch','onion','bing-rss'].includes(input.searchProvider))s.searchProvider=input.searchProvider;
+    if(typeof input.searchTorchOnionUrl==='string'&&input.searchTorchOnionUrl.length<=300)s.searchTorchOnionUrl=input.searchTorchOnionUrl.trim();
+    if(typeof input.updateRepo==='string'&&input.updateRepo.length<=160&&input.updateRepo.trim())s.updateRepo=input.updateRepo.trim();
     if(input.reasoningEffort!==undefined){
       if(!['auto','none','minimal','low','medium','high','xhigh','max'].includes(input.reasoningEffort))throw new Error('Invalid reasoning effort level');
       s.reasoningEffort=input.reasoningEffort;
@@ -297,7 +360,18 @@ export class Runtime extends EventEmitter {
       s.webSearchContext=input.webSearchContext;
     }
     if(typeof input.webUserAgent==='string'&&input.webUserAgent.length<=400)s.webUserAgent=input.webUserAgent.trim();
-    if(typeof input.globalInstructions === 'string')s.globalInstructions=input.globalInstructions;
+    if (input.resetGlobalInstructions === true) {
+      s.globalInstructions = stockGlobalInstructions;
+      s.globalInstructionsCustomized = false;
+    } else if (typeof input.globalInstructions === 'string') {
+      s.globalInstructions = input.globalInstructions;
+      if (input.globalInstructionsCustomized === undefined) {
+        s.globalInstructionsCustomized = !isStockGlobalInstructions(input.globalInstructions);
+      }
+    }
+    if (typeof input.customSystemPrompt === 'string' && input.customSystemPrompt.length <= 40000) {
+      s.customSystemPrompt = input.customSystemPrompt;
+    }
     if (typeof input.model === 'string' && input.model.length < 180) s.model = input.model;
     if(input.favoriteModels!==undefined){if(!Array.isArray(input.favoriteModels)||input.favoriteModels.length>100||input.favoriteModels.some(id=>typeof id!=='string'||!id.trim()||id.length>180))throw new Error('Invalid favorite models list.');s.favoriteModels=[...new Set(input.favoriteModels.map(id=>id.trim()))];}
     if(input.customProviders!==undefined){
@@ -326,7 +400,7 @@ export class Runtime extends EventEmitter {
     if(typeof input.accentColor==='string'&&input.accentColor.length<=40)s.accentColor=input.accentColor.trim();
     if(typeof input.globalHotkey==='string'&&input.globalHotkey.length<=40)s.globalHotkey=input.globalHotkey.trim();
     this.store.state.settings=s;
-    this.configFile?.writeSettings(s);
+    if (!skipConfigWrite) this.configFile?.writeSettings(s);
     this.changed(null); this.schedule();
   }
   schedule() {
@@ -403,6 +477,8 @@ export class Runtime extends EventEmitter {
     if(options.model)task.engine=modelConnection(options.model,this.store.state.settings).id;
     if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim().slice(0,120);
     if(typeof input.pinned==='boolean')task.pinned=input.pinned;
+    if(typeof input.adminMode==='boolean')task.adminMode=input.adminMode;
+    if(typeof input.ephemeral==='boolean')this.store.setTaskEphemeral(task.id, input.ephemeral, 'User toggled storage mode');
     if(input.projectId!==undefined)task.projectId=input.projectId||null;
     if(typeof input.workspace==='string')task.workspace=input.workspace;
     this.changed(task);return true;
@@ -509,6 +585,7 @@ export class Runtime extends EventEmitter {
   spawnChildSession(parentTask, args = {}) {
     const prompt = String(args.prompt || '').trim();
     if (!prompt) throw new Error('spawn_session requires a non-empty prompt.');
+    const inheritEphemeral = args.ephemeral !== undefined ? Boolean(args.ephemeral) : Boolean(parentTask.ephemeral);
     const childId = this.create({
       title: args.title ? String(args.title).slice(0, 80) : prompt.slice(0, 64),
       prompt,
@@ -518,10 +595,12 @@ export class Runtime extends EventEmitter {
       notifyParentOnIdle: args.notifyParentOnIdle !== false,
       model: args.model || parentTask.model,
       agentMode: args.agentMode || parentTask.agentMode,
+      ephemeral: inheritEphemeral,
+      adminMode: Boolean(args.adminMode),
     });
     const child = this.store.task(childId);
-    this.store.journal(parentTask, 'child_session_spawned', { childId, title: child.title, workspace: child.workspace, model: child.model });
-    return { sessionId: childId, title: child.title, status: child.status, workspace: child.workspace, model: child.model };
+    this.store.journal(parentTask, 'child_session_spawned', { childId, title: child.title, workspace: child.workspace, model: child.model, ephemeral: child.ephemeral, adminMode: child.adminMode });
+    return { sessionId: childId, title: child.title, status: child.status, workspace: child.workspace, model: child.model, ephemeral: child.ephemeral, adminMode: child.adminMode };
   }
   listSessionsFor(currentTask, { scope = 'tree' } = {}) {
     const tasks = this.store.state.tasks || [];
@@ -545,6 +624,8 @@ export class Runtime extends EventEmitter {
           status: t.status,
           model: t.model,
           workspace: t.workspace,
+          ephemeral: Boolean(t.ephemeral),
+          adminMode: Boolean(t.adminMode),
           lastOutputPreview: lastAssistant?.content ? String(lastAssistant.content).slice(0, 400) : '',
         };
       }),
@@ -585,6 +666,306 @@ export class Runtime extends EventEmitter {
         content: m.content ? String(m.content).slice(0, 2000) : '',
       })),
     };
+  }
+  manageProject(currentTask, args = {}) {
+    const action = String(args.action || 'list').toLowerCase();
+    this.store.state.projects ||= [];
+    const findProject = () => {
+      if (args.projectId || args.id) return this.store.state.projects.find(p => p.id === (args.projectId || args.id));
+      if (args.name) return this.store.state.projects.find(p => p.name.toLowerCase() === String(args.name).trim().toLowerCase());
+      return null;
+    };
+    if (action === 'list') {
+      const counts = new Map();
+      for (const t of this.store.state.tasks || []) {
+        if (t.projectId) counts.set(t.projectId, (counts.get(t.projectId) || 0) + 1);
+      }
+      return {
+        projects: this.store.state.projects.map(p => ({
+          id: p.id,
+          name: p.name,
+          workspace: p.workspace || '',
+          instructions: p.instructions || '',
+          sessionCount: counts.get(p.id) || 0,
+        })),
+      };
+    }
+    if (action === 'create') {
+      if (!args.name || !String(args.name).trim()) throw new Error('manage_project create requires a non-empty name.');
+      const existing = this.store.state.projects.find(p => p.name.toLowerCase() === String(args.name).trim().toLowerCase());
+      if (existing) throw new Error(`A project named "${existing.name}" already exists (id: ${existing.id}). Use action="update" or assign_project instead.`);
+      const id = this.store.project({
+        name: String(args.name).trim(),
+        workspace: args.workspace !== undefined ? String(args.workspace).trim() : (currentTask?.workspace || ''),
+        instructions: String(args.instructions || ''),
+      });
+      const created = this.store.state.projects.find(p => p.id === id);
+      if (args.assignCurrentSession && currentTask) {
+        currentTask.projectId = id;
+        if (created?.workspace && !currentTask.workspace) currentTask.workspace = created.workspace;
+        this.store.journal(currentTask, 'session_project_assigned', { projectId: id, projectName: created?.name });
+      }
+      this.changed(currentTask || null);
+      return { created: true, project: created, assignedToCurrentSession: Boolean(args.assignCurrentSession && currentTask) };
+    }
+    if (action === 'update') {
+      const target = findProject();
+      if (!target) throw new Error('Project not found. Pass a valid id/projectId from manage_project(action="list").');
+      const id = this.store.project({
+        id: target.id,
+        name: args.newName ? String(args.newName).trim() : (args.name ? String(args.name).trim() : target.name),
+        workspace: args.workspace !== undefined ? String(args.workspace).trim() : target.workspace,
+        instructions: args.instructions !== undefined ? String(args.instructions) : target.instructions,
+      });
+      const updated = this.store.state.projects.find(p => p.id === id);
+      this.changed(null);
+      return { updated: true, project: updated };
+    }
+    if (action === 'delete') {
+      const target = findProject();
+      if (!target) throw new Error('Project not found.');
+      this.store.state.projects = this.store.state.projects.filter(p => p.id !== target.id);
+      for (const t of this.store.state.tasks || []) {
+        if (t.projectId === target.id) t.projectId = null;
+      }
+      this.changed(null);
+      return { deleted: true, id: target.id, name: target.name };
+    }
+    throw new Error('Unsupported manage_project action: ' + action);
+  }
+  manageSession(currentTask, args = {}) {
+    const action = String(args.action || 'info').toLowerCase();
+    const target = args.sessionId ? this.store.task(args.sessionId) : currentTask;
+    if (!target) throw new Error('Target session not found.');
+    const proj = target.projectId ? this.store.state.projects.find(p => p.id === target.projectId) : null;
+
+    if (action === 'info') {
+      return {
+        sessionId: target.id,
+        title: target.title,
+        projectId: target.projectId || null,
+        projectName: proj?.name || null,
+        workspace: target.workspace || '',
+        parentTaskId: target.parentTaskId || null,
+        pinned: Boolean(target.pinned),
+        ephemeral: Boolean(target.ephemeral),
+        adminMode: Boolean(target.adminMode),
+        status: target.status,
+        model: target.model,
+        agentMode: target.agentMode || this.store.state.settings.agentMode,
+      };
+    }
+    if (action === 'rename') {
+      const nextTitle = String(args.title || '').trim().slice(0, 120);
+      if (!nextTitle) throw new Error('manage_session rename requires a non-empty title.');
+      const previous = target.title;
+      target.title = nextTitle;
+      this.store.journal(target, 'session_renamed', { previous, title: nextTitle });
+      this.changed(target);
+      return { renamed: true, sessionId: target.id, previousTitle: previous, title: nextTitle };
+    }
+    if (action === 'assign_project') {
+      if (args.projectId === null || args.projectId === '' || args.unassign === true) {
+        target.projectId = null;
+        this.store.journal(target, 'session_project_assigned', { projectId: null, projectName: null });
+        this.changed(target);
+        return { assigned: true, sessionId: target.id, projectId: null, projectName: null };
+      }
+      const match = args.projectId
+        ? this.store.state.projects.find(p => p.id === args.projectId)
+        : (args.projectName ? this.store.state.projects.find(p => p.name.toLowerCase() === String(args.projectName).trim().toLowerCase()) : null);
+      if (!match) throw new Error('Project not found. List projects with manage_project(action="list") or create one first.');
+      target.projectId = match.id;
+      if (args.adoptWorkspace !== false && match.workspace) {
+        target.workspace = match.workspace;
+      }
+      this.store.journal(target, 'session_project_assigned', { projectId: match.id, projectName: match.name, workspace: target.workspace });
+      this.changed(target);
+      return { assigned: true, sessionId: target.id, projectId: match.id, projectName: match.name, workspace: target.workspace };
+    }
+    if (action === 'set_workspace') {
+      const ws = String(args.workspace || '').trim();
+      target.workspace = ws;
+      this.store.journal(target, 'session_workspace_updated', { workspace: ws });
+      this.changed(target);
+      return { updated: true, sessionId: target.id, workspace: ws };
+    }
+    if (action === 'pin') {
+      target.pinned = args.pinned !== false;
+      this.changed(target);
+      return { updated: true, sessionId: target.id, pinned: target.pinned };
+    }
+    if (action === 'set_ephemeral') {
+      if (typeof args.ephemeral !== 'boolean') throw new Error('manage_session set_ephemeral requires boolean "ephemeral" (true = RAM-Only, false = Regular persistent).');
+      const res = this.store.setTaskEphemeral(target.id, args.ephemeral, String(args.reason || '').slice(0, 300));
+      this.changed(target, { immediate: true });
+      return { sessionId: target.id, ...res, storageMode: target.ephemeral ? 'ram-only' : 'regular' };
+    }
+    throw new Error('Unsupported manage_session action: ' + action);
+  }
+  privacyPostureLine() {
+    const s = this.store.state.settings || {};
+    const audit = buildPrivacyAudit(s, this.tor || null, this.store, this.wireguard || null);
+    const wgRunning = Boolean(this.wireguard?.isRunning?.());
+    const wgProf = this.wireguard?.status?.(s.wireguardBinaryPath)?.activeProfile?.name || '';
+    const torRunning = Boolean(this.tor?.isRunning?.());
+    const pii = this.activePiiScrubber().summary();
+    const piiDesc = pii.enabled
+      ? `ON (${pii.effectiveRuleCount} rules; outbound paths/user/host redacted to __NEXUS_USER__/__NEXUS_HOST__ and transparently restored for local tool calls)`
+      : 'OFF';
+    return `Active Privacy & Network Posture: routing=${s.browserProxyMode || 'direct'} (WireGuard=${wgRunning ? `connected:${wgProf || 'active'}` : 'stopped'}, Tor=${torRunning ? (this.tor?.upstreamSocks5 ? 'chained-over-wg' : 'running') : 'stopped'}), allAppTraffic=${s.torRouteAllTraffic ? 'ON' : 'OFF'}, killSwitch=${s.torStrictFailClosed ? 'ON' : 'OFF'}, stealthMode=${s.stealthMode ? 'ON' : 'OFF'}, piiScrubber=${piiDesc}, searchProvider=${s.searchProvider || 'auto'} (strictZeroTrack=${s.searchStrictZeroTrack ? 'ON' : 'OFF'}), browser=${s.browserPersistentProfile ? 'Account' : 'InPrivate'} (engine=${s.browserEngineMode || 'dual'}), promptCaching=${s.promptCaching !== false ? 'ON' : 'OFF'}, cacheAffinity=${s.cacheAffinity ? 'ON' : 'OFF'}, opsecScore=${audit.score}/100 (${audit.tier}).`;
+  }
+  async managePrivacy(currentTask, args = {}) {
+    const action = String(args.action || 'status').toLowerCase();
+    const s = this.store.state.settings || {};
+    const getStatusPayload = () => ({
+      posture: this.privacyPostureLine(),
+      audit: buildPrivacyAudit(s, this.tor || null, this.store, this.wireguard || null),
+      settings: {
+        browserProxyMode: s.browserProxyMode || 'direct',
+        browserProxyUrl: s.browserProxyUrl || '',
+        torRouteAllTraffic: Boolean(s.torRouteAllTraffic),
+        browserRouteAgentTraffic: Boolean(s.browserRouteAgentTraffic),
+        torStrictFailClosed: Boolean(s.torStrictFailClosed),
+        stealthMode: Boolean(s.stealthMode),
+        privacyScrubPii: Boolean(s.privacyScrubPii),
+        privacyScrubCustomRulesCount: (s.privacyScrubCustomRules || []).length,
+        searchProvider: s.searchProvider || 'auto',
+        searchStrictZeroTrack: Boolean(s.searchStrictZeroTrack),
+        browserSearxUrl: s.browserSearxUrl || '',
+        searchTorchOnionUrl: s.searchTorchOnionUrl || '',
+        browserPersistentProfile: Boolean(s.browserPersistentProfile),
+        browserBlockTrackers: s.browserBlockTrackers !== false,
+        browserAntiFingerprint: s.browserAntiFingerprint !== false,
+        browserEngineMode: s.browserEngineMode || 'dual',
+        promptCaching: s.promptCaching !== false,
+        cacheAffinity: Boolean(s.cacheAffinity),
+      },
+      tor: this.tor?.status?.() || { installed: false, running: false },
+      wireguard: this.wireguard?.status?.(s.wireguardBinaryPath) || { installed: false, running: false, profiles: [] },
+      piiScrubber: this.activePiiScrubber().summary(),
+    });
+
+    if (action === 'status') {
+      return getStatusPayload();
+    }
+    if (action === 'explain') {
+      return {
+        currentPosture: this.privacyPostureLine(),
+        routingModesRanked: PRIVACY_MODE_GUIDE,
+        searchProviders: SEARCH_PROVIDER_CATALOG,
+        additionalLayers: {
+          stealthMode: '1-click preset enabling All-App Tunnel + Fail-Closed Kill-Switch + Reversible PII Scrubber + InPrivate Browser + Tracker Shield + Strict Zero-Track Search while explicitly preserving Prompt Caching & Cache Affinity.',
+          piiScrubber: 'Replaces C:\\Users\\<you>, your hostname, and custom sensitive strings before cloud LLM calls and transparently restores them for local tools.',
+          ramOnlySessions: 'Sessions created or migrated via manage_session(action="set_ephemeral", ephemeral=true) live purely in RAM with zero disk traces.',
+          cryptoBilling: 'For true payment untraceability with Mullvad (€4.50/mo) / IVPN and a ZDR LLM provider, pay with no-KYC crypto (e.g. Monero) and register over InPrivate Tor/VPN.',
+        },
+      };
+    }
+    if (action === 'set_routing') {
+      const patch = {};
+      if (args.mode !== undefined) patch.browserProxyMode = args.mode;
+      if (args.proxyUrl !== undefined) patch.browserProxyUrl = String(args.proxyUrl || '');
+      if (typeof args.routeAllTraffic === 'boolean') {
+        patch.torRouteAllTraffic = args.routeAllTraffic;
+        if (args.routeAllTraffic) patch.browserRouteAgentTraffic = true;
+      }
+      if (typeof args.routeAgentTraffic === 'boolean') patch.browserRouteAgentTraffic = args.routeAgentTraffic;
+      if (typeof args.killSwitch === 'boolean') patch.torStrictFailClosed = args.killSwitch;
+      this.settings(patch);
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, patch });
+      return { updated: true, applied: patch, ...getStatusPayload() };
+    }
+    if (action === 'stealth') {
+      const res = this.toggleStealthMode(args.enabled !== false);
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, enabled: res.stealthMode });
+      return { updated: true, ...res, ...getStatusPayload() };
+    }
+    if (action === 'set_search') {
+      const patch = {};
+      if (args.provider !== undefined) patch.searchProvider = args.provider;
+      if (typeof args.strictZeroTrack === 'boolean') patch.searchStrictZeroTrack = args.strictZeroTrack;
+      if (typeof args.searxUrl === 'string') patch.browserSearxUrl = args.searxUrl;
+      if (typeof args.torchOnionUrl === 'string') patch.searchTorchOnionUrl = args.torchOnionUrl;
+      this.settings(patch);
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, patch });
+      return { updated: true, applied: patch, ...getStatusPayload() };
+    }
+    if (action === 'set_pii') {
+      const patch = {};
+      if (typeof args.enabled === 'boolean') patch.privacyScrubPii = args.enabled;
+      let rules = [...(s.privacyScrubCustomRules || [])];
+      if (Array.isArray(args.rules)) rules = [...args.rules];
+      if (Array.isArray(args.addRules)) rules = [...new Set([...rules, ...args.addRules])];
+      if (Array.isArray(args.removeRules)) {
+        const rm = new Set(args.removeRules.map(x => String(x).trim()));
+        rules = rules.filter(r => !rm.has(r));
+      }
+      if (args.rules !== undefined || args.addRules !== undefined || args.removeRules !== undefined) {
+        patch.privacyScrubCustomRules = rules;
+      }
+      this.settings(patch);
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, enabled: this.store.state.settings.privacyScrubPii, ruleCount: rules.length });
+      return { updated: true, ...getStatusPayload() };
+    }
+    if (action === 'set_browser') {
+      const patch = {};
+      if (typeof args.persistentProfile === 'boolean') patch.browserPersistentProfile = args.persistentProfile;
+      if (typeof args.blockTrackers === 'boolean') patch.browserBlockTrackers = args.blockTrackers;
+      if (typeof args.antiFingerprint === 'boolean') patch.browserAntiFingerprint = args.antiFingerprint;
+      if (args.engineMode !== undefined) patch.browserEngineMode = args.engineMode;
+      this.settings(patch);
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, patch });
+      return { updated: true, applied: patch, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_import') {
+      if (!this.wireguard) throw new Error('WireGuard manager is not available in this runtime.');
+      let confText = String(args.configText || '');
+      let derivedName = String(args.name || '');
+      if (!confText && args.filePath) {
+        const fp = path.resolve(currentTask?.workspace || process.cwd(), String(args.filePath));
+        if (!fsSync.existsSync(fp)) throw new Error('WireGuard .conf file not found: ' + fp);
+        confText = fsSync.readFileSync(fp, 'utf8');
+        if (!derivedName) derivedName = path.basename(fp).replace(/\.conf$/i, '');
+      }
+      const profile = this.wireguard.addProfile({ name: derivedName, configText: confText });
+      if (!s.wireguardActiveProfileId) this.settings({ wireguardActiveProfileId: profile.id });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, profileId: profile.id, name: profile.name });
+      return { imported: true, profile, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_connect') {
+      if (!this.privacyController) throw new Error('WireGuard/Tor daemon control is not attached to this runtime.');
+      const res = args.chainTor
+        ? await this.privacyController.wireguardStartChainTor({ profileId: args.profileId || '', autoInstall: args.autoInstall !== false })
+        : await this.privacyController.wireguardStart({ profileId: args.profileId || '', autoInstall: args.autoInstall !== false, activate: true });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, chainTor: Boolean(args.chainTor) });
+      return { connected: true, result: res, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_disconnect') {
+      if (!this.privacyController) throw new Error('WireGuard daemon control is not attached to this runtime.');
+      await this.privacyController.wireguardStop();
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { disconnected: true, ...getStatusPayload() };
+    }
+    if (action === 'tor_start') {
+      if (!this.privacyController) throw new Error('Tor daemon control is not attached to this runtime.');
+      const st = await this.privacyController.torStart({ autoInstall: args.autoInstall !== false, activate: true });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { started: true, tor: st, ...getStatusPayload() };
+    }
+    if (action === 'tor_stop') {
+      if (!this.privacyController) throw new Error('Tor daemon control is not attached to this runtime.');
+      const st = await this.privacyController.torStop();
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { stopped: true, tor: st, ...getStatusPayload() };
+    }
+    if (action === 'tor_new_identity') {
+      if (!this.privacyController) throw new Error('Tor daemon control is not attached to this runtime.');
+      const res = await this.privacyController.torNewIdentity();
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { rotated: true, ...res, ...getStatusPayload() };
+    }
+    throw new Error('Unsupported manage_privacy action: ' + action);
   }
   async revertFileChange(id, eventId) {
     const task = this.store.task(id);
@@ -696,7 +1077,10 @@ export class Runtime extends EventEmitter {
     const level = task?.agentMode || this.store.state.settings.agentMode || 'autopilot';
     if (level === 'unrestricted') return { required: false, reason: '' };
     const isInteractiveBrowser = name === 'browser_inspect' && ((Array.isArray(args?.actions) && args.actions.length > 0) || Boolean(args?.useAccountSession));
-    if (!isInteractiveBrowser && (READ_ONLY_TOOL_NAMES.has(name) || this.plugins?.findTool(name)?.tool?.readOnly || ['document_progress', 'todo_write', 'memory_store'].includes(name))) {
+    if (!isInteractiveBrowser && (READ_ONLY_TOOL_NAMES.has(name) || this.plugins?.findTool(name)?.tool?.readOnly || ['document_progress', 'todo_write', 'memory_store', 'manage_session'].includes(name))) {
+      return { required: false, reason: '' };
+    }
+    if (name === 'manage_project' && args?.action !== 'delete') {
       return { required: false, reason: '' };
     }
     if (level === 'interactive') {
@@ -741,7 +1125,7 @@ export class Runtime extends EventEmitter {
     const hardCap=setTimeout(()=>guard.abort(new DOMException('Maximum generation time exceeded.','TimeoutError')),streamingMode?1800000:900000);
     const idleTimer=streamingMode?setInterval(()=>{if(Date.now()-lastActivity>120000)guard.abort(new DOMException('Provider stopped sending data for 120 seconds.','TimeoutError'));},5000):null;
     const responseId=crypto.randomUUID();
-    const responseJournal=tools && !silent ? new ResponseJournal(this.store.directoryFor(task.id),responseId) : null;
+    const responseJournal=tools && !silent && !task.ephemeral ? new ResponseJournal(this.store.directoryFor(task.id),responseId) : null;
     let record=normalizeUsage(undefined,{id:crypto.randomUUID(),responseId,model:task.model,kind:tools?'generation':'compression',status:'pending',sessionAffinity:connection.id==='openrouter'&&settings.cacheAffinity===true});
     let attemptStarted=started, receivedOutput=false, succeeded=false;
     task.calls ||= [];task.calls.push(record);
@@ -760,7 +1144,11 @@ export class Runtime extends EventEmitter {
     }
     const outputLimit=maxOutput ?? settings.maxOutput;
     const selectedTools=customTools || requestTools(settings, this.plugins, task.loadedToolsets);
-    const spec=completionRequest({model:task.model,messages,settings:{...settings,...(connection.id==='copilot'&&effectiveBase!==connection.base?{copilotBaseUrl:effectiveBase}:{})},tools:tools?selectedTools:undefined,outputLimit,effort,sessionId:settings.cacheAffinity?affinitySession(task,tools):undefined,apiKey:key});
+    const scrubber = this.activePiiScrubber();
+    const outboundMessages = (scrubber.enabled && !isLocalModelEndpoint(effectiveBase))
+      ? scrubber.scrubMessages(messages)
+      : messages;
+    const spec=completionRequest({model:task.model,messages:outboundMessages,settings:{...settings,...(connection.id==='copilot'&&effectiveBase!==connection.base?{copilotBaseUrl:effectiveBase}:{})},tools:tools?selectedTools:undefined,outputLimit,effort,sessionId:settings.cacheAffinity?affinitySession(task,tools):undefined,apiKey:key});
     const send = () => this.request(spec.url, {
       method:'POST', headers:spec.headers,
       body:JSON.stringify(spec.body),
@@ -969,10 +1357,20 @@ export class Runtime extends EventEmitter {
     const silentRule = this.store.state.settings.silentToolSteps
       ? '\nExecution Style: SILENT TOOL CHAINING. Do NOT emit progress narrations, status updates, or intermediate follow-up text between tool calls. Emit tool calls directly with empty assistant content until the entire task is complete or you genuinely need to ask the user an important question.'
       : '';
+    const storageRule = task.ephemeral
+      ? '\nSession Storage: RAM-ONLY (EPHEMERAL). Zero disk traces are written for this session; child sessions inherit RAM-Only by default. You can migrate back to Regular storage via manage_session(action="set_ephemeral", ephemeral=false) if requested.'
+      : '';
+    const adminRule = task.adminMode
+      ? '\nWindows Privileges: ADMINISTRATOR RIGHTS ENABLED for this session. run_command executes elevated (services, VPN/network adapters, firewall, registry, system administration).'
+      : '';
+    const privacyLine = '\n' + this.privacyPostureLine();
     const baseInstructions = task.systemPromptOverride?.trim() || this.store.state.settings.globalInstructions;
+    const customAddendum = this.store.state.settings.customSystemPrompt?.trim()
+      ? `\n\n[User Custom System Prompt — Always Preserved]\n${this.store.state.settings.customSystemPrompt.trim()}`
+      : '';
     const unrestricted = mode === 'unrestricted' || mode === 'autopilot' || this.store.state.settings.autonomous;
     const workspaceLabel = task.workspace || (unrestricted ? `${process.cwd()} (default cwd; unrestricted access)` : '(no folder)');
-    const context = [{ role:'system', content:baseInstructions + '\nProject: ' + workspaceLabel + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule + silentRule }];
+    const context = [{ role:'system', content:baseInstructions + customAddendum + '\nProject: ' + workspaceLabel + (project?.name ? ` (${project.name})` : '') + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule + silentRule + storageRule + adminRule + privacyLine }];
     const sections=[{id:'instructions',label:'Instructions & Objective',reason:'Stable prefix: global instructions, workspace folder, project instructions, and original objective.',value:context[0],count:1}];
     if(pinned.length)sections.push({id:'pins',label:'Pinned Messages',reason:'Explicitly pinned by the user to survive compaction.',value:pinned,count:pinned.length});
     if(dependencyContext.length)sections.push({id:'dependencies',label:'Task Dependencies',reason:'Results and recent progress notes from prerequisite tasks.',value:dependencyContext,count:dependencyContext.length});
@@ -1181,7 +1579,9 @@ export class Runtime extends EventEmitter {
           signal.throwIfAborted();
           let toolResult;
           try {
-            const parsedArgs = JSON.parse(call.function.arguments || '{}');
+            let parsedArgs = JSON.parse(call.function.arguments || '{}');
+            const scrubber = this.activePiiScrubber();
+            if (scrubber.enabled) parsedArgs = scrubber.unscrubValue(parsedArgs);
             const approvalDecision = this.approvalCheck(call.function.name, parentTask, parsedArgs);
             if (approvalDecision.required && !(await this.approval(parentTask, call.function.name, parsedArgs, signal, approvalDecision.reason))) {
               toolResult = { denied: true, reason: 'The user declined this sub-agent action.' };
@@ -1195,8 +1595,21 @@ export class Runtime extends EventEmitter {
           thread.push({ role: 'tool', tool_call_id: call.id, content: serialized.slice(0, 12000) });
         }
       }
+      // Reached maxSteps while still invoking tools: run one final tool-free synthesis turn so we never return empty "\n\n"
+      signal.throwIfAborted();
+      thread.push({ role: 'user', content: 'You have reached the sub-agent step limit. Do not call any more tools. Provide your concise final synthesis report now based strictly on the evidence already gathered.' });
+      let finalReport = '';
+      try {
+        const synth = await this.completion(thread, parentTask, signal, { tools: false, silent: true, maxOutput: 3000 });
+        finalReport = String(synth?.message?.content || '').trim();
+      } catch {}
+      if (!finalReport) {
+        finalReport = String(thread.findLast(m => m.role === 'assistant' && String(m.content || '').trim())?.content || '').trim()
+          || 'Sub-agent reached step ceiling without producing a final synthesis.';
+      }
       subState.status = 'complete';
-      return { mode, stepsExecuted, report: thread.findLast(m => m.role === 'assistant' && m.content)?.content || 'Sub-agent reached step ceiling.' };
+      this.store.journal(parentTask, 'subagent_complete', { id: subId, mode, stepsExecuted, synthesizedAtCeiling: true, objective: objective.slice(0, 200) });
+      return { mode, stepsExecuted, report: finalReport };
     } catch (error) {
       subState.status = 'error';
       throw error;
@@ -1212,6 +1625,9 @@ export class Runtime extends EventEmitter {
       if (!baseTools.some(t => t.function.name === call.function.name) && !this.plugins?.findTool(call.function.name)) throw new Error('Unknown tool');
       let args = JSON.parse(call.function.arguments || '{}');
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid tool arguments');
+      // Transparently restore PII-scrubbed local paths/hostnames before local tool execution
+      const scrubber = this.activePiiScrubber();
+      if (scrubber.enabled) args = scrubber.unscrubValue(args);
       let name = call.function.name;
       if(name==='invoke_function'){
         const resolved=this.capabilities.resolve(args.id,args.input);
@@ -1256,6 +1672,26 @@ export class Runtime extends EventEmitter {
           return { callId: call.id, serialized: serializedExtra };
         }
         return { callId: call.id, serialized: JSON.stringify({captured:true,dimensions}) };
+      }
+      if (Array.isArray(result?.chatMedia) && result.chatMedia.length) {
+        task.conversation.push({
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: '',
+          media: result.chatMedia,
+          isMediaCard: true,
+        });
+        this.store.journal(task, 'media_presented', { count: result.chatMedia.length, items: result.chatMedia.map(m => ({ id: m.id, kind: m.kind, name: m.name, bytes: m.bytes })) });
+        this.changed(task);
+        const compactModelReply = {
+          presented: true,
+          count: result.chatMedia.length,
+          items: result.chatMedia.map(m => ({ id: m.id, kind: m.kind, title: m.title, name: m.name, mime: m.mime, bytes: m.bytes })),
+        };
+        const serializedMedia = JSON.stringify(compactModelReply);
+        toolRunRecord.durationMs = Date.now() - started;
+        toolRunRecord.preview = `Presented ${result.chatMedia.length} media item(s) inline in chat`;
+        return { callId: call.id, serialized: serializedMedia };
       }
       const materialized=await materializeToolResult(this.store,task,name,result);
       this.store.journal(task, 'tool_result', {name, result:materialized.journal});

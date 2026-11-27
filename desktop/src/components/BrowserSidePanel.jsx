@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft, ArrowRight, RotateCw, Lock, Search, Send, Camera, X,
-  Maximize2, Shield, UserCheck, Trash2, Globe, ExternalLink
+  Maximize2, Shield, UserCheck, Trash2, Globe, ExternalLink, Bot, Monitor
 } from 'lucide-react';
 import { cleanError } from '../lib/format.mjs';
 
@@ -35,19 +35,21 @@ export default function BrowserSidePanel({
   const persistent = Boolean(s.browserPersistentProfile);
   const proxyMode = s.browserProxyMode || 'direct';
   const proxyUrl = proxyMode === 'direct' ? ''
-    : (proxyMode === 'managed-tor' ? 'socks5://127.0.0.1:9055'
-      : (proxyMode === 'tor' ? (s.browserProxyUrl || 'socks5://127.0.0.1:9050') : (s.browserProxyUrl || '')));
+    : (proxyMode === 'wireguard' ? 'socks5://127.0.0.1:9060'
+      : ((proxyMode === 'managed-tor' || proxyMode === 'wireguard-tor') ? 'socks5://127.0.0.1:9055'
+        : (proxyMode === 'tor' ? (s.browserProxyUrl || 'socks5://127.0.0.1:9050') : (s.browserProxyUrl || ''))));
   const blockTrackers = s.browserBlockTrackers !== false;
   const antiFingerprint = s.browserAntiFingerprint !== false;
 
   const viewportRef = useRef(null);
   const [width, setWidth] = useState(520);
+  const [viewMode, setViewMode] = useState(native ? 'standard' : 'agent');
   const [address, setAddress] = useState(SEARCH_ENGINES[engineId]?.home || 'https://duckduckgo.com/');
   const [bState, setBState] = useState({ url: address, title: 'NEXUS Browser', loading: false, blockedCount: 0, canGoBack: false, canGoForward: false });
   const [readerPage, setReaderPage] = useState(null);
   const [readerBusy, setReaderBusy] = useState(false);
 
-  const shouldShowNative = native && !overlayOpen;
+  const shouldShowNative = native && viewMode === 'standard' && !overlayOpen;
 
   useEffect(() => {
     if (!native || !window.nexus?.subscribeBrowser) return;
@@ -107,11 +109,11 @@ export default function BrowserSidePanel({
   const navigateTo = async raw => {
     const url = normalizeAddress(raw, engineId, s.browserSearxUrl);
     setAddress(url);
-    if (native) {
+    if (native && viewMode === 'standard') {
       await api('browserNavigate', { url });
     } else {
       setReaderBusy(true);
-      try { setReaderPage(await api('browserFetchReader', { url })); }
+      try { setReaderPage(await api('agentBrowserSnapshot', { url, engine: 'agent-fast' })); }
       catch (err) { notify(cleanError(err), 'error'); }
       finally { setReaderBusy(false); }
     }
@@ -119,6 +121,10 @@ export default function BrowserSidePanel({
 
   const sendPage = async () => {
     try {
+      if (viewMode === 'agent' && readerPage) {
+        onSendToChat(`Context from NEXUS Agent Browser:\n\n${(readerPage.agentSnapshot || readerPage.text || '').slice(0, 10000)}`);
+        return;
+      }
       const page = native ? await api('browserExtract') : readerPage;
       if (!page) { notify('Open a webpage first.', 'info'); return; }
       onSendToChat(`Context from NEXUS Browser:\nURL: ${page.url}\nTitle: ${page.title}\n\n${page.selection ? `Selection:\n${page.selection}\n\n` : ''}Content:\n${(page.text || '').slice(0, 8000)}`);
@@ -151,6 +157,20 @@ export default function BrowserSidePanel({
           </div>
 
           <div className="row" style={{ gap: 4 }}>
+            {native && (
+              <button
+                type="button"
+                className={`filter-chip ${viewMode === 'agent' ? 'active' : ''}`}
+                title={viewMode === 'agent' ? 'Agent View (@eN refs + Markdown). Click for Standard visual browser.' : 'Standard visual browser. Click for specialized Agent View (@eN refs).'}
+                onClick={() => {
+                  const next = viewMode === 'agent' ? 'standard' : 'agent';
+                  setViewMode(next);
+                  if (next === 'agent' && address) void navigateTo(address);
+                }}
+              >
+                {viewMode === 'agent' ? <><Bot size={11} /> Agent</> : <><Monitor size={11} /> Visual</>}
+              </button>
+            )}
             <button
               type="button"
               className={`filter-chip ${persistent ? 'active' : ''}`}
@@ -181,7 +201,7 @@ export default function BrowserSidePanel({
         </form>
       </div>
 
-      {native ? (
+      {native && viewMode === 'standard' ? (
         <div ref={viewportRef} className="browser-side-viewport">
           <div className="hint row" style={{ fontSize: 12 }}>
             <Globe size={14} style={{ color: 'var(--accent)' }} />
@@ -196,10 +216,19 @@ export default function BrowserSidePanel({
                 <strong style={{ fontSize: 13 }}>{readerPage.title}</strong>
                 <button type="button" className="btn-secondary" style={{ fontSize: 11, padding: '3px 7px' }} onClick={() => api('openExternal', { url: readerPage.url })}><ExternalLink size={11} /> External</button>
               </div>
-              <pre className="pre-box" style={{ maxHeight: '72vh', whiteSpace: 'pre-wrap' }}>{readerPage.text}</pre>
+              {(readerPage.refs || []).length > 0 && (
+                <div className="row" style={{ gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+                  {readerPage.refs.slice(0, 12).map(r => (
+                    <button key={r.ref} type="button" className="tag-chip mono" style={{ cursor: r.url ? 'pointer' : 'default' }} onClick={() => r.url && void navigateTo(r.url)}>
+                      {r.ref} {(r.name || r.role).slice(0, 22)}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <pre className="pre-box" style={{ maxHeight: '66vh', whiteSpace: 'pre-wrap' }}>{readerPage.text}</pre>
             </div>
           ) : (
-            <p className="hint">Enter a URL or search query above to load a page alongside your chat (live interactive browsing is enabled inside native <code>NEXUS.exe</code>).</p>
+            <p className="hint">Enter a URL or .onion address above to inspect a page in Specialized Agent View (compact @eN refs + clean Markdown).</p>
           )}
         </div>
       )}

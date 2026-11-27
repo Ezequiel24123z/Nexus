@@ -28,11 +28,15 @@ const copyRecursive = (src, dest) => {
 // 1. Native Windows host + WebView2 runtimes
 copyRecursive(nativeDir, outDir);
 
-// 2. Built React UI + Core ESM Engine + Native PowerShell helpers
+// 2. Built React UI + Core ESM Engine + Native PowerShell helpers + Changelog
 copyRecursive(uiDir, path.join(outDir, 'ui'));
 copyRecursive(path.join(desktopDir, 'core'), path.join(outDir, 'core'));
 copyRecursive(path.join(desktopDir, 'native'), path.join(outDir, 'native'));
 fs.copyFileSync(path.join(desktopDir, 'package.json'), path.join(outDir, 'package.json'));
+const rootChangelog = path.join(desktopDir, '..', 'CHANGELOG.md');
+if (fs.existsSync(rootChangelog)) {
+  fs.copyFileSync(rootChangelog, path.join(outDir, 'CHANGELOG.md'));
+}
 
 // 3. Bundle Node 24 executable so the portable folder works even on PCs without Node installed
 const nodeOut = path.join(outDir, 'node');
