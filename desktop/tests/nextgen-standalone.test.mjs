@@ -1940,7 +1940,10 @@ test('v1.4.0 audit hardening + real E2E GitHub self-update verification (SemVer 
   await fs.writeFile(path.join(mockNewBuild, 'runtimes', 'win-x64', 'native', 'WebView2Loader.dll'), 'NEW_DLL_1_5_0', 'utf8');
 
   const releaseZip = path.join(dir, 'NEXUS-Portable-Windows.zip');
-  await execFileAsync('tar.exe', ['-a', '-cf', releaseZip, '-C', path.join(dir, 'release-build'), 'NEXUS-Portable'], { windowsHide: true });
+  await execFileAsync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory($env:NX_SRC, $env:NX_DST, [System.IO.Compression.CompressionLevel]::Fastest, $true)',
+  ], { env: { ...process.env, NX_SRC: mockNewBuild, NX_DST: releaseZip }, windowsHide: true });
   const zipBytes = await fs.readFile(releaseZip);
   const validSha = crypto.createHash('sha256').update(zipBytes).digest('hex');
 

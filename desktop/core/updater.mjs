@@ -275,10 +275,10 @@ export async function downloadAndApplyGithubUpdate({
   }
   await fsp.writeFile(zipPath, buf);
 
-  // Extract and verify integrity of the downloaded release
+  // Extract and verify integrity of the downloaded release using .NET ZipFile (handles all standard ZIP archives reliably)
   await execFileAsync('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-Command',
-    'Expand-Archive -LiteralPath $env:NX_ZIP -DestinationPath $env:NX_DST -Force',
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:NX_ZIP, $env:NX_DST)',
   ], { env: { ...process.env, NX_ZIP: zipPath, NX_DST: extractDir }, timeout: 120000, windowsHide: true });
 
   // Locate root inside extracted archive (either direct or nested NEXUS-Portable/)
