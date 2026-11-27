@@ -60,6 +60,7 @@ vault*.dpapi*
 vault.plain.json
 nexus.config.json
 desktop/tor/
+desktop/wireguard/
 workspace.json
 workspace.json.*
 storage-engine.json

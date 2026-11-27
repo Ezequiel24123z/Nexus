@@ -11,7 +11,7 @@ import {validateModelCapabilities} from '../core/chat-options.mjs';
 import {executeTool} from '../core/tools.mjs';
 import {materializeToolResult} from '../core/artifacts.mjs';
 
-async function setup(t){const directory=await fs.mkdtemp(path.join(os.tmpdir(),'nexus-chat-workspace-'));t.after(async()=>{assert.ok(path.resolve(directory).startsWith(path.resolve(os.tmpdir())+path.sep));await fs.rm(directory,{recursive:true,force:true});});const store=new Store(directory),runtime=new Runtime(store,{getSecret:()=> 'synthetic-test'});runtime.closed=true;const task=store.task(runtime.create({prompt:'Prueba',workspace:directory}));return {store,runtime,task,directory};}
+async function setup(t){const directory=await fs.mkdtemp(path.join(os.tmpdir(),'nexus-chat-workspace-'));t.after(async()=>{assert.ok(path.resolve(directory).startsWith(path.resolve(os.tmpdir())+path.sep));await fs.rm(directory,{recursive:true,force:true,maxRetries:6,retryDelay:60});});const store=new Store(directory),runtime=new Runtime(store,{getSecret:()=> 'synthetic-test'});runtime.closed=true;const task=store.task(runtime.create({prompt:'Prueba',workspace:directory}));return {store,runtime,task,directory};}
 
 test('search includes old messages, literal symbols, pagination and no reasoning payload',()=>{
  const task={conversation:Array.from({length:1000},(_,i)=>({id:String(i),role:'user',content:'Mensaje '+i+' [literal]',reasoning:'NOT_SEARCHABLE'}))};

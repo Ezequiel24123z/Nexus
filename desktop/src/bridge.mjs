@@ -20,6 +20,7 @@ const deltaListeners = new Set();
 const terminalListeners = new Set();
 const notifyListeners = new Set();
 const torListeners = new Set();
+const wireguardListeners = new Set();
 const browserListeners = new Set();
 let nativeSeq = 0;
 
@@ -101,7 +102,7 @@ function downloadBlob(filename, content, type = 'text/plain;charset=utf-8') {
 }
 
 const NATIVE_PASSTHROUGH = new Set([
-  'setTrayMode', 'openDevTools', 'notify', 'logError',
+  'setTrayMode', 'openDevTools', 'relaunchElevated', 'notify', 'logError',
   'browserShow', 'browserBounds', 'browserHide', 'browserNavigate',
   'browserBack', 'browserForward', 'browserReload', 'browserWipe',
   'browserExtract', 'browserScreenshot',
@@ -253,10 +254,16 @@ function ensureStream() {
       for (const cb of torListeners) cb(data);
     } catch {}
   });
+  eventSource.addEventListener('wireguard', event => {
+    try {
+      const data = JSON.parse(event.data);
+      for (const cb of wireguardListeners) cb(data);
+    } catch {}
+  });
 }
 
 function maybeCloseStream() {
-  if (!changeListeners.size && !deltaListeners.size && !terminalListeners.size && !notifyListeners.size && !torListeners.size && eventSource) {
+  if (!changeListeners.size && !deltaListeners.size && !terminalListeners.size && !notifyListeners.size && !torListeners.size && !wireguardListeners.size && eventSource) {
     eventSource.close();
     eventSource = null;
   }
@@ -267,7 +274,14 @@ const subscribeDelta = cb => { deltaListeners.add(cb); ensureStream(); return ()
 const subscribeTerminal = cb => { terminalListeners.add(cb); ensureStream(); return () => { terminalListeners.delete(cb); maybeCloseStream(); }; };
 const subscribeNotify = cb => { notifyListeners.add(cb); ensureStream(); return () => { notifyListeners.delete(cb); maybeCloseStream(); }; };
 const subscribeTor = cb => { torListeners.add(cb); ensureStream(); return () => { torListeners.delete(cb); maybeCloseStream(); }; };
+const subscribeWireguard = cb => { wireguardListeners.add(cb); ensureStream(); return () => { wireguardListeners.delete(cb); maybeCloseStream(); }; };
 const subscribeBrowser = cb => { browserListeners.add(cb); return () => { browserListeners.delete(cb); }; };
+
+function mediaUrl(mediaId) {
+  if (!mediaId) return '';
+  const qs = conn.token ? `?token=${encodeURIComponent(conn.token)}` : '';
+  return `${conn.serverUrl}/api/media/${encodeURIComponent(mediaId)}${qs}`;
+}
 
 function beforeClose(callback) {
   const handler = () => { void Promise.resolve().then(callback).catch(() => {}); };
@@ -284,7 +298,9 @@ export function installNexusBridge() {
       subscribeTerminal,
       subscribeNotify,
       subscribeTor,
+      subscribeWireguard,
       subscribeBrowser,
+      mediaUrl,
       beforeClose,
       nativeHost: conn.nativeHost,
       serverUrl: conn.serverUrl,
@@ -293,4 +309,4 @@ export function installNexusBridge() {
   return window.nexus;
 }
 
-export { invoke, subscribe, subscribeDelta, subscribeTerminal, subscribeNotify, subscribeTor, subscribeBrowser, beforeClose, conn as bridgeConnection };
+export { invoke, subscribe, subscribeDelta, subscribeTerminal, subscribeNotify, subscribeTor, subscribeWireguard, subscribeBrowser, mediaUrl, beforeClose, conn as bridgeConnection };

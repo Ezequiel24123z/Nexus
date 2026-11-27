@@ -28,9 +28,88 @@ export const SEARCH_ENGINES = {
   searxng: { name: 'SearXNG (Custom)', url: (q, base) => `${String(base || 'https://searx.be').replace(/\/+$/, '')}/search?q=${encodeURIComponent(q)}`, home: 'https://searx.be/' },
 };
 
-export function resolveEffectiveProxyUrl(settings = {}, torManager = null) {
+export const PRIVACY_MODE_GUIDE = [
+  {
+    id: 'wireguard-tor',
+    rank: 1,
+    label: 'Double-Hop: WireGuard → Tor',
+    protectionLevel: 'Maximum Untraceability',
+    whatIspSees: 'Only encrypted WireGuard UDP packets to your VPN server — your ISP NEVER sees that you are using Tor.',
+    whatTargetSees: 'Only a rotating Tor exit node IP (or .onion rendezvous) — neither the VPN nor your ISP sees what sites or APIs you access.',
+    tradeoffs: 'Higher latency (Tor 3-hop) and occasional CAPTCHAs on clearnet; full .onion / Torch access; zero impact on Windows.',
+    requires: 'Imported WireGuard .conf (e.g. Mullvad / IVPN) + NEXUS Managed Tor.',
+  },
+  {
+    id: 'wireguard',
+    rank: 2,
+    label: 'App-Scoped WireGuard VPN',
+    protectionLevel: 'High · Fast Daily Driver',
+    whatIspSees: 'Only encrypted WireGuard UDP traffic to your no-logs VPN server (zero DNS leaks).',
+    whatTargetSees: 'Only the shared no-logs VPN server IP — hides your home/work IP with ~10ms latency and almost zero CAPTCHAs.',
+    tradeoffs: 'Does not open .onion hidden services (switch to WireGuard → Tor or Managed Tor for .onion). Trusts the no-logs VPN provider.',
+    requires: 'Imported WireGuard .conf (Mullvad €4.50/mo Monero, IVPN, Proton VPN, AirVPN).',
+  },
+  {
+    id: 'managed-tor',
+    rank: 3,
+    label: 'NEXUS Managed Tor (App-Scoped)',
+    protectionLevel: 'High · Free & .onion Ready',
+    whatIspSees: 'Sees that you connect to a Tor guard node (encrypted content, unknown destinations).',
+    whatTargetSees: 'Only a rotating Tor exit node IP; supports .onion hidden services (Torch, Ahmia) natively.',
+    tradeoffs: 'Free and requires no VPN account, but slower than WireGuard and your ISP can tell Tor is in use.',
+    requires: 'NEXUS Managed Tor started (127.0.0.1:9055).',
+  },
+  {
+    id: 'tor',
+    rank: 4,
+    label: 'External Tor SOCKS5',
+    protectionLevel: 'High · External Tor Daemon',
+    whatIspSees: 'Tor guard node connection via your external Tor Browser / Tor service.',
+    whatTargetSees: 'Tor exit node IP; supports .onion hidden services.',
+    tradeoffs: 'Requires running Tor Browser or system Tor daemon externally on 127.0.0.1:9050 or 9150.',
+    requires: 'External Tor SOCKS5 proxy running.',
+  },
+  {
+    id: 'socks5',
+    rank: 5,
+    label: 'Custom SOCKS5 Proxy',
+    protectionLevel: 'Custom Tunnel',
+    whatIspSees: 'Traffic to your custom SOCKS5 server (e.g. SSH -D tunnel or VPN SOCKS5 endpoint).',
+    whatTargetSees: 'IP of your SOCKS5 exit host.',
+    tradeoffs: 'Privacy depends completely on the SOCKS5 server you point to.',
+    requires: 'Valid socks5://host:port URL.',
+  },
+  {
+    id: 'http',
+    rank: 6,
+    label: 'Custom HTTP / HTTPS Proxy',
+    protectionLevel: 'Custom Proxy',
+    whatIspSees: 'Connection to your configured HTTP proxy.',
+    whatTargetSees: 'Exit IP of your HTTP proxy.',
+    tradeoffs: 'Useful for corporate/approved proxies; does not resolve .onion.',
+    requires: 'Valid http://host:port URL.',
+  },
+  {
+    id: 'direct',
+    rank: 7,
+    label: 'Direct / System VPN',
+    protectionLevel: 'Baseline (Uses OS Network)',
+    whatIspSees: 'Normal traffic unless you have a system-wide VPN active on Windows.',
+    whatTargetSees: 'Your real IP (or your system-wide Windows VPN IP if active).',
+    tradeoffs: 'Fastest and zero setup, but relies on a Windows-wide VPN for IP privacy.',
+    requires: 'None.',
+  },
+];
+
+export function resolveEffectiveProxyUrl(settings = {}, torManager = null, wgManager = null) {
   const mode = settings?.browserProxyMode || 'direct';
   if (mode === 'direct') return '';
+  if (mode === 'wireguard') {
+    return wgManager?.isRunning?.() ? wgManager.getSocksUrl() : 'socks5://127.0.0.1:9060';
+  }
+  if (mode === 'wireguard-tor') {
+    return torManager?.isRunning?.() ? torManager.getSocksUrl() : 'socks5://127.0.0.1:9055';
+  }
   if (mode === 'managed-tor') {
     return torManager?.isRunning?.() ? torManager.getSocksUrl() : 'socks5://127.0.0.1:9055';
   }
@@ -61,6 +140,7 @@ export function probeTcpPort(host, port, timeoutMs = 280) {
 
 export async function probeLocalProxies() {
   const candidates = [
+    { id: 'nexus-wireguard', label: 'NEXUS App-Scoped WireGuard (SOCKS5)', url: 'socks5://127.0.0.1:9060', host: '127.0.0.1', port: 9060 },
     { id: 'nexus-tor', label: 'NEXUS Managed Tor (SOCKS5)', url: 'socks5://127.0.0.1:9055', host: '127.0.0.1', port: 9055 },
     { id: 'tor-daemon', label: 'Tor Daemon (SOCKS5)', url: 'socks5://127.0.0.1:9050', host: '127.0.0.1', port: 9050 },
     { id: 'tor-browser', label: 'Tor Browser (SOCKS5)', url: 'socks5://127.0.0.1:9150', host: '127.0.0.1', port: 9150 },
@@ -236,19 +316,35 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
       method,
       headers,
     }, res => {
-      const chunks = [];
-      res.on('error', doneReject);
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        const respHeaders = new Headers();
-        for (const [k, v] of Object.entries(res.headers)) {
-          if (Array.isArray(v)) for (const item of v) respHeaders.append(k, item);
-          else if (v !== undefined) respHeaders.set(k, String(v));
-        }
-        const status = res.statusCode || 200;
-        const nullBody = status === 204 || status === 205 || status === 304;
-        doneResolve(new Response(nullBody ? null : Buffer.concat(chunks), { status, headers: respHeaders }));
+      const respHeaders = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (Array.isArray(v)) for (const item of v) respHeaders.append(k, item);
+        else if (v !== undefined) respHeaders.set(k, String(v));
+      }
+      const status = res.statusCode || 200;
+      const nullBody = status === 204 || status === 205 || status === 304;
+      if (nullBody) {
+        res.resume();
+        return doneResolve(new Response(null, { status, headers: respHeaders }));
+      }
+      const bodyStream = new ReadableStream({
+        start(controller) {
+          res.on('data', chunk => {
+            try { controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)); } catch {}
+          });
+          res.on('end', () => {
+            try { controller.close(); } catch {}
+          });
+          res.on('error', err => {
+            try { controller.error(err); } catch {}
+          });
+        },
+        cancel() {
+          try { res.destroy(); } catch {}
+          try { req.destroy(); } catch {}
+        },
       });
+      doneResolve(new Response(bodyStream, { status, headers: respHeaders }));
     });
     req.on('error', doneReject);
     if (options.signal) {
@@ -260,8 +356,216 @@ export async function proxiedFetch(urlInput, options = {}, proxyUrl = '') {
   });
 }
 
-export async function checkPrivacyStatus(settings = {}, torManager = null) {
-  const proxyUrl = resolveEffectiveProxyUrl(settings, torManager);
+export function isLoopbackHost(hostname = '') {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.endsWith('.localhost');
+}
+
+export function isOnionHost(hostname = '') {
+  return String(hostname || '').toLowerCase().endsWith('.onion');
+}
+
+// App-wide outbound fetcher enforcing:
+// 1. Strict Tor-only routing for .onion URLs (never leaks .onion to clearnet DNS)
+// 2. Optional All-Traffic Tor/Proxy encryption (torRouteAllTraffic) for LLMs, web tools, connectors, gallery & updates
+// 3. Optional Fail-Closed Kill-Switch (torStrictFailClosed) refusing direct clearnet fallback when Tor/Proxy is down
+export function createNexusFetcher(getSettings, torManager = null, { baseFetch = fetch, scope = 'all', wgManager = null } = {}) {
+  return async (urlInput, options = {}) => {
+    const settings = typeof getSettings === 'function' ? (getSettings() || {}) : (getSettings || {});
+    let parsed;
+    try { parsed = new URL(String(urlInput)); } catch { return baseFetch(urlInput, options); }
+    if (!['http:', 'https:'].includes(parsed.protocol)) return baseFetch(urlInput, options);
+    if (isLoopbackHost(parsed.hostname)) return baseFetch(urlInput, options);
+
+    const onion = isOnionHost(parsed.hostname);
+    const proxyUrl = resolveEffectiveProxyUrl(settings, torManager, wgManager);
+    const mode = settings.browserProxyMode || 'direct';
+    const routeAll = Boolean(settings.torRouteAllTraffic);
+    const routeAgent = Boolean(settings.browserRouteAgentTraffic);
+    const strictKillSwitch = Boolean(settings.torStrictFailClosed);
+
+    if (onion) {
+      const torProxy = (mode === 'managed-tor' || mode === 'wireguard-tor' || mode === 'tor') && proxyUrl && /^socks5h?:/i.test(proxyUrl)
+        ? proxyUrl
+        : (torManager?.isRunning?.() ? torManager.getSocksUrl() : '');
+      if (!torProxy) {
+        throw new Error('NEXUS Tor Shield blocked .onion request: an active Tor SOCKS5 proxy (or WireGuard -> Tor mode) is required to resolve .onion hidden services without DNS leaks.');
+      }
+      return proxiedFetch(parsed.href, options, torProxy);
+    }
+
+    const shouldProxy = routeAll || (scope === 'agent' && routeAgent);
+    if (!shouldProxy) {
+      return baseFetch(urlInput, options);
+    }
+
+    if (!proxyUrl) {
+      if (strictKillSwitch) {
+        throw new Error('NEXUS Kill-Switch blocked direct outbound connection: All-Traffic VPN/Tor routing is enabled, but no tunnel is configured.');
+      }
+      return baseFetch(urlInput, options);
+    }
+
+    if (mode === 'wireguard' && wgManager && !wgManager.isRunning()) {
+      if (strictKillSwitch) {
+        throw new Error('NEXUS Kill-Switch blocked direct outbound connection: App-Scoped WireGuard VPN is stopped. Start WireGuard or disable Strict Kill-Switch.');
+      }
+      return baseFetch(urlInput, options);
+    }
+
+    if ((mode === 'managed-tor' || mode === 'wireguard-tor') && torManager && !torManager.isRunning()) {
+      if (strictKillSwitch) {
+        throw new Error('NEXUS Kill-Switch blocked direct outbound connection: Managed Tor is stopped. Start Tor or disable Strict Kill-Switch.');
+      }
+      return baseFetch(urlInput, options);
+    }
+
+    if (mode === 'wireguard-tor' && wgManager && !wgManager.isRunning()) {
+      if (strictKillSwitch) {
+        throw new Error('NEXUS Kill-Switch blocked direct outbound connection: WireGuard -> Tor chain requires WireGuard to be running.');
+      }
+      return baseFetch(urlInput, options);
+    }
+
+    try {
+      return await proxiedFetch(parsed.href, options, proxyUrl);
+    } catch (err) {
+      if (strictKillSwitch) {
+        throw new Error(`NEXUS Kill-Switch blocked direct fallback after proxy failure (${err?.message || err}).`);
+      }
+      throw err;
+    }
+  };
+}
+
+export function buildPrivacyAudit(settings = {}, torManager = null, store = null, wgManager = null) {
+  const proxyMode = settings.browserProxyMode || 'direct';
+  const proxyUrl = resolveEffectiveProxyUrl(settings, torManager, wgManager);
+  const torRunning = Boolean(torManager?.isRunning?.());
+  const wgRunning = Boolean(wgManager?.isRunning?.());
+  const routeAll = Boolean(settings.torRouteAllTraffic);
+  const killSwitch = Boolean(settings.torStrictFailClosed);
+  const strictSearch = Boolean(settings.searchStrictZeroTrack);
+  const scrubPii = Boolean(settings.privacyScrubPii);
+  const zeroLogSearch = ['searxng', 'duckduckgo', 'mojeek', 'startpage', 'brave', 'kagi', 'ahmia', 'torch', 'onion'].includes(settings.searchProvider || 'auto');
+  const localModel = /^(custom|local)\//i.test(settings.model || '') || (settings.customProviders || []).some(p => /^https?:\/\/(127\.0\.0\.1|localhost)/i.test(p.baseUrl) && String(settings.model || '').startsWith(p.id + '/'));
+  const tunnelLive = (proxyMode === 'wireguard-tor' && wgRunning && torRunning)
+    || (proxyMode === 'wireguard' && wgRunning)
+    || (proxyMode === 'managed-tor' && torRunning)
+    || (['tor', 'socks5', 'http'].includes(proxyMode) && Boolean(proxyUrl));
+
+  const checks = [
+    {
+      id: 'inbound-loopback',
+      category: 'Inbound',
+      label: 'Loopback-Only Local Core Server + Constant-Time Auth',
+      status: 'pass',
+      weight: 12,
+      detail: 'Core HTTP/SSE API binds strictly to 127.0.0.1 with 192-bit timing-safe token and loopback-only CORS (zero LAN/WAN exposure).',
+    },
+    {
+      id: 'dpapi-vault',
+      category: 'Storage',
+      label: 'Encrypted Local Secret Vault (Windows DPAPI)',
+      status: 'pass',
+      weight: 8,
+      detail: 'API keys & WireGuard private keys are encrypted per-user with Windows DPAPI and never exposed to renderer or prompts.',
+    },
+    {
+      id: 'outbound-tor',
+      category: 'Outbound',
+      label: proxyMode === 'wireguard-tor'
+        ? 'Double-Hop WireGuard -> Tor App-Scoped Tunnel'
+        : proxyMode === 'wireguard'
+          ? 'App-Scoped WireGuard VPN Tunnel (Zero System Impact)'
+          : 'All-Traffic VPN / Tor Encrypted Tunneling',
+      status: routeAll && proxyUrl ? (tunnelLive ? 'pass' : 'warn') : (proxyUrl ? 'warn' : 'fail'),
+      weight: 25,
+      detail: routeAll && proxyUrl
+        ? (proxyMode === 'wireguard-tor'
+          ? 'Maximum transport untraceability: ALL NEXUS traffic tunnels through Tor inside app-scoped WireGuard (ISP never sees Tor; VPN never sees destinations).'
+          : `ALL outbound NEXUS traffic (LLMs, search, web tools, connectors, updates, browser) routes over ${proxyUrl} with remote DNS resolution.`)
+        : proxyUrl
+          ? `Tunnel (${proxyUrl}) applies to Browser only. Enable "Encrypt ALL App Traffic" or 1-Click Stealth Mode.`
+          : 'Direct clearnet connections active. Import a WireGuard .conf (Mullvad/IVPN/Proton) or start Managed Tor.',
+    },
+    {
+      id: 'kill-switch',
+      category: 'Outbound',
+      label: 'Fail-Closed Kill-Switch (No Clearnet Leak)',
+      status: killSwitch && routeAll ? 'pass' : 'warn',
+      weight: 15,
+      detail: killSwitch
+        ? 'Active: NEXUS refuses to fall back to direct clearnet if WireGuard/Tor disconnects; .onion requests are always fail-closed.'
+        : 'Disabled: Enable Fail-Closed Kill-Switch so NEXUS never leaks clearnet traffic if your tunnel stops.',
+    },
+    {
+      id: 'pii-scrubber',
+      category: 'Context',
+      label: 'Reversible Outbound PII & Local Path Scrubber',
+      status: scrubPii ? 'pass' : 'warn',
+      weight: 15,
+      detail: scrubPii
+        ? 'Active: Your Windows username, home directory, hostname, and custom rules are redacted from cloud LLM prompts and transparently restored for local tools.'
+        : 'Disabled: Enable Outbound PII Scrubber so C:\\Users\\<name> and your PC hostname never leak into cloud prompts.',
+    },
+    {
+      id: 'browser-shield',
+      category: 'Browser',
+      label: 'InPrivate Isolation, Tracker Blocker & WebRTC/DNS Shield',
+      status: !settings.browserPersistentProfile && settings.browserBlockTrackers !== false && settings.browserAntiFingerprint !== false ? 'pass' : 'warn',
+      weight: 10,
+      detail: settings.browserPersistentProfile
+        ? 'Account Mode active (cookies persist for logins). Switch to InPrivate + Wipe for untraceable research sessions.'
+        : 'InPrivate ephemeral profile + network tracker blocker + WebRTC non-proxied UDP block + anti-fingerprinting enabled.',
+    },
+    {
+      id: 'search-privacy',
+      category: 'Search',
+      label: 'Zero-Track Private Search Policy',
+      status: strictSearch || zeroLogSearch ? 'pass' : 'warn',
+      weight: 10,
+      detail: strictSearch
+        ? `Strict Zero-Track enabled (provider: ${settings.searchProvider || 'auto'}). Regular commercial fallbacks are disabled.`
+        : `Active search provider: ${settings.searchProvider || 'auto'}. Enable Strict Zero-Track or configure SearXNG / Brave ZDR / Tor Onion search.`,
+    },
+    {
+      id: 'inference-sovereignty',
+      category: 'OPSEC',
+      label: 'Model Inference & Prompt Caching Status',
+      status: localModel ? 'pass' : 'info',
+      weight: 5,
+      detail: localModel
+        ? `Using local inference (${settings.model}) — prompts never leave your machine.`
+        : `Cloud model (${settings.model || 'default'}) · Prompt Caching ${settings.promptCaching !== false ? 'ON (preserved)' : 'OFF'} · Cache Affinity ${settings.cacheAffinity ? 'ON (preserved)' : 'OFF'}. Pay ZDR & VPN with no-KYC crypto (e.g. Monero) to break billing correlation.`,
+    },
+  ];
+
+  const earned = checks.reduce((sum, c) => sum + (c.status === 'pass' ? c.weight : c.status === 'warn' || c.status === 'info' ? Math.round(c.weight * 0.45) : 0), 0);
+  const recommendations = [
+    !routeAll && 'Activate 1-Click Stealth Mode (or "Encrypt ALL App Traffic" + "Fail-Closed Kill-Switch") so LLM calls, searches, and updates route through your encrypted tunnel (preserving Prompt Caching & Cache Affinity).',
+    !scrubPii && 'Enable "Reversible Outbound PII & Path Scrubber" so your Windows username (C:\\Users\\...) and PC hostname are never sent to cloud ZDR providers.',
+    proxyMode === 'direct' && 'Import a WireGuard .conf from Mullvad (€4.50/mo with Monero, zero email) or IVPN for app-scoped VPN — or chain WireGuard -> Tor so your ISP never even sees Tor traffic.',
+    !strictSearch && 'Enable "Strict Zero-Track Search" with SearXNG, DuckDuckGo, Mojeek, Brave ZDR, Kagi, or Torch/Ahmia (.onion).',
+    'Use RAM-Only sessions for sensitive or high-risk topics (zero disk writes, convertible RAM-Only <-> Regular anytime by you or the AI).',
+    'For true payment untraceability with a ZDR provider + Mullvad/IVPN: pay strictly with no-KYC crypto (e.g. Monero) and register over the InPrivate Tor/VPN browser.',
+  ].filter(Boolean);
+
+  return {
+    score: Math.min(100, earned),
+    tier: earned >= 85 ? 'Hardened' : earned >= 60 ? 'Protected' : 'Standard',
+    checks,
+    recommendations,
+    stealthActive: Boolean(routeAll && killSwitch && scrubPii && strictSearch && !settings.browserPersistentProfile),
+    cachingPreserved: Boolean(settings.promptCaching !== false || settings.cacheAffinity),
+    customPromptProtected: Boolean(settings.globalInstructionsCustomized || settings.customSystemPrompt?.trim()),
+    projectsCount: store?.state?.projects?.length || 0,
+    modeGuide: PRIVACY_MODE_GUIDE,
+  };
+}
+
+export async function checkPrivacyStatus(settings = {}, torManager = null, wgManager = null) {
+  const proxyUrl = resolveEffectiveProxyUrl(settings, torManager, wgManager);
   const [vpn, localProxies] = await Promise.all([detectSystemVpn(), probeLocalProxies()]);
   let ipInfo = null;
   let ipError = null;
@@ -282,7 +586,7 @@ export async function checkPrivacyStatus(settings = {}, torManager = null) {
   } catch (err) {
     ipError = err?.message || 'Could not reach IP check endpoint';
   }
-  if (proxyUrl && (settings?.browserProxyMode === 'managed-tor' || settings?.browserProxyMode === 'tor')) {
+  if (proxyUrl && (settings?.browserProxyMode === 'managed-tor' || settings?.browserProxyMode === 'wireguard-tor' || settings?.browserProxyMode === 'tor')) {
     try {
       const torRes = await proxiedFetch('https://check.torproject.org/api/ip', { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(14000) }, proxyUrl);
       if (torRes.ok) {

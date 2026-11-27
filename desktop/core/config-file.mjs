@@ -26,7 +26,12 @@ const CONFIG_KEYS = [
   'webMaxResults',
   'webMaxUses',
   'webUserAgent',
+  'searchProvider',
+  'searchStrictZeroTrack',
+  'searchTorchOnionUrl',
   'globalInstructions',
+  'globalInstructionsCustomized',
+  'customSystemPrompt',
   'contextWindow',
   'compressionPercent',
   'concurrency',
@@ -58,6 +63,16 @@ const CONFIG_KEYS = [
   'browserSearchEngine',
   'browserSearxUrl',
   'browserRouteAgentTraffic',
+  'browserEngineMode',
+  'torRouteAllTraffic',
+  'torStrictFailClosed',
+  'privacyScrubPii',
+  'privacyScrubCustomRules',
+  'stealthMode',
+  'wireguardActiveProfileId',
+  'wireguardBinaryPath',
+  'autoCheckUpdates',
+  'updateRepo',
 ];
 
 export class ConfigFileManager {
@@ -86,7 +101,15 @@ export class ConfigFileManager {
   }
 
   writeSettings(settings) {
-    const payload = JSON.stringify(this.extractFromSettings(settings), null, 2) + '\n';
+    let existing = {};
+    try {
+      if (fs.existsSync(this.filename)) {
+        const parsed = JSON.parse(fs.readFileSync(this.filename, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) existing = parsed;
+      }
+    } catch {}
+    const merged = { ...existing, ...this.extractFromSettings(settings) };
+    const payload = JSON.stringify(merged, null, 2) + '\n';
     if (payload === this.lastWritten && fs.existsSync(this.filename)) return;
     this.lastWritten = payload;
     const tmp = this.filename + '.' + process.pid + '.tmp';
@@ -127,7 +150,7 @@ export class ConfigFileManager {
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         const subset = {};
         for (const key of CONFIG_KEYS) if (Object.hasOwn(parsed, key)) subset[key] = parsed[key];
-        if (Object.keys(subset).length) this.runtime.settings(subset);
+        if (Object.keys(subset).length) this.runtime.settings(subset, { skipConfigWrite: true });
       }
     } catch (err) {
       console.error('NEXUS: could not parse nexus.config.json on startup:', err.message);
@@ -151,7 +174,8 @@ export class ConfigFileManager {
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
               const subset = {};
               for (const key of CONFIG_KEYS) if (Object.hasOwn(parsed, key)) subset[key] = parsed[key];
-              if (Object.keys(subset).length) this.runtime.settings(subset);
+              // Never echo-write back to disk from fs.watch (prevents ping-pong overwrites)
+              if (Object.keys(subset).length) this.runtime.settings(subset, { skipConfigWrite: true });
             }
           } catch {}
         }, 250);

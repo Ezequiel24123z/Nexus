@@ -2,9 +2,10 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import {
   ArrowUp, ArrowDown, Square, Pause, Play, Pin, Search, Activity,
   Settings2, Download, FolderOpen, Plus, GitFork, Pencil, RefreshCw, CheckCircle2,
-  Circle, Clock, AlertCircle, Cpu, Sparkles, PanelRight, Loader2, Check, X, Layers, ChevronRight, Globe
+  Circle, Clock, AlertCircle, Cpu, Sparkles, PanelRight, Loader2, Check, X, Layers, ChevronRight, Globe, Ghost, ShieldAlert
 } from 'lucide-react';
 import { MarkdownRenderer, StreamingMarkdown, CopyButton } from './MarkdownRenderer.jsx';
+import ChatMediaCard from './ChatMediaCard.jsx';
 import ToolTimeline, { describeToolAction } from './ToolTimeline.jsx';
 import useSmoothStream from '../useSmoothStream.jsx';
 import ComposerControls from './ModelPickerPopover.jsx';
@@ -138,6 +139,7 @@ function buildTurnSegments(batch = [], silentToolSteps = false) {
     const showProse = Boolean(
       (step.content?.trim() && (!silentToolSteps || !hasTools || isLast)) ||
       step.attachments?.length ||
+      step.media?.length ||
       step.sources?.length
     );
     if (showProse) {
@@ -147,6 +149,7 @@ function buildTurnSegments(batch = [], silentToolSteps = false) {
         id: step.id,
         content: step.content || '',
         attachments: step.attachments || [],
+        media: step.media || [],
         sources: step.sources || [],
       });
     }
@@ -230,6 +233,7 @@ const AssistantTurnBody = React.memo(function AssistantTurnBody({ batch, taskId,
         return (
           <div key={seg.key} id={'message-' + seg.id} tabIndex={-1} className="turn-prose">
             {seg.content && <MarkdownRenderer text={seg.content} />}
+            {seg.media?.length > 0 && <ChatMediaCard items={seg.media} />}
             {seg.attachments?.length > 0 && <Attachments items={seg.attachments} />}
             {seg.sources?.length > 0 && (
               <details className="sources-box">
@@ -276,6 +280,8 @@ export default function ChatView({
   const [showAllTurns, setShowAllTurns] = useState(false);
   const [spawnModal, setSpawnModal] = useState(null);
   const [msgModal, setMsgModal] = useState(null);
+  const [newEphemeral, setNewEphemeral] = useState(false);
+  const [newAdminMode, setNewAdminMode] = useState(false);
 
   const scrollRef = useRef(null);
   const contentRef = useRef(null);
@@ -477,7 +483,9 @@ export default function ChatView({
       if (task) {
         await api('resume', { id: task.id, instruction: prompt, attachmentIds });
       } else {
-        const id = await api('createTask', { prompt, attachmentIds, workspace: activeWorkspace, projectId: projectId || null });
+        const id = await api('createTask', { prompt, attachmentIds, workspace: activeWorkspace, projectId: projectId || null, ephemeral: newEphemeral, adminMode: newAdminMode });
+        if (newEphemeral) setNewEphemeral(false);
+        if (newAdminMode) setNewAdminMode(false);
         openTask(id);
       }
       await draftManager.clear(draftKey, rev).catch(() => {});
@@ -567,7 +575,42 @@ export default function ChatView({
             >
               <Globe size={15} style={browserOpen ? { color: 'var(--accent)' } : undefined} />
             </button>
-            {task && <button type="button" className="btn-icon" title="Spawn nested child session" onClick={() => setSpawnModal({ title: '', prompt: '', notifyParentOnIdle: true })}><Layers size={15} /></button>}
+            {task && (
+              <button
+                type="button"
+                className={`filter-chip ${task.ephemeral ? 'ram-chip-active' : ''}`}
+                style={{ padding: '3px 8px', fontSize: 11 }}
+                title={task.ephemeral
+                  ? 'RAM-Only Session (zero disk traces). Click to migrate & persist as Regular session.'
+                  : 'Regular Persistent Session. Click to live-migrate to RAM-Only and immediately purge disk traces.'}
+                onClick={async () => {
+                  const next = !task.ephemeral;
+                  const res = await act('setSessionEphemeral', { id: task.id, ephemeral: next });
+                  if (res) notify(next ? 'Migrated session to RAM-Only and purged disk traces.' : 'Migrated session to Regular persistent storage.', 'ok');
+                }}
+              >
+                <Ghost size={11} /> {task.ephemeral ? 'RAM-Only' : 'Regular'}
+              </button>
+            )}
+            {task && (
+              <button
+                type="button"
+                className={`filter-chip ${task.adminMode ? 'admin-chip-active' : ''}`}
+                style={{ padding: '3px 8px', fontSize: 11 }}
+                title={task.adminMode
+                  ? 'Windows Administrator Rights ENABLED for this session (elevated commands for VPN, services, firewall). Click to revoke.'
+                  : 'Standard user privileges. Click to grant Windows Administrator rights to this session.'}
+                onClick={async () => {
+                  const next = !task.adminMode;
+                  if (await act('updateChat', { id: task.id, adminMode: next })) {
+                    notify(next ? 'Admin Rights enabled for this session (commands run elevated).' : 'Revoked Admin Rights for this session.', 'info');
+                  }
+                }}
+              >
+                <ShieldAlert size={11} /> {task.adminMode ? 'Admin ON' : 'Admin'}
+              </button>
+            )}
+            {task && <button type="button" className="btn-icon" title="Spawn nested child session" onClick={() => setSpawnModal({ title: '', prompt: '', notifyParentOnIdle: true, ephemeral: Boolean(task.ephemeral), adminMode: false })}><Layers size={15} /></button>}
             {task && <button type="button" className="btn-icon" title="Search in chat · Ctrl+F" aria-label="Search in chat" aria-pressed={drawer === 'search'} onClick={() => { setBrowserOpen(false); setDrawer(d => d === 'search' ? null : 'search'); }}><Search size={15} /></button>}
             <button type="button" className="btn-icon" aria-label="Workspace drawer" aria-pressed={drawer === 'files' || drawer === 'shell' || drawer === 'results'} title="Split Files / Results / Shell" onClick={() => { setBrowserOpen(false); setDrawer(d => d ? null : 'files'); }}><PanelRight size={15} /></button>
             {task && <button type="button" className="btn-icon" title={task.pinned ? 'Unpin chat' : 'Pin chat'} onClick={() => act('updateChat', { id: task.id, pinned: !task.pinned })}><Pin size={15} fill={task.pinned ? 'currentColor' : 'none'} /></button>}
@@ -688,7 +731,23 @@ export default function ChatView({
                             {m.pinned && <span className="pill ok"><Pin size={10} /> Pinned</span>}
                           </div>
                           {m.content && <MarkdownRenderer text={m.content} />}
-                          {m.attachments?.length > 0 && <Attachments items={m.attachments} />}
+                          {m.attachments?.length > 0 && (() => {
+                            const richItems = m.attachments
+                              .filter(a => a.kind === 'image' || /\.(mp4|webm|mov|mkv|mp3|wav|ogg|pdf)$/i.test(a.name || ''))
+                              .map(a => {
+                                const ext = (a.name || '').match(/\.[^.]+$/)?.[0]?.toLowerCase() || '';
+                                const kind = a.kind === 'image' ? 'image'
+                                  : /\.(mp4|webm|mov|mkv)$/i.test(ext) ? 'video'
+                                  : /\.(mp3|wav|ogg)$/i.test(ext) ? 'audio' : 'pdf';
+                                return { id: a.id, mediaId: 'att-' + a.id, kind, mime: a.mime, ext, name: a.name, title: a.name, bytes: a.bytes };
+                              });
+                            return (
+                              <>
+                                {richItems.length > 0 && <ChatMediaCard items={richItems} />}
+                                <Attachments items={m.attachments} />
+                              </>
+                            );
+                          })()}
                           <div className="message-actions">
                             {m.content && <CopyButton text={m.content} label="Copy" compact />}
                             <button type="button" onClick={() => act('pinMessage', { id: task.id, messageId: m.id, pinned: !m.pinned })}><Pin size={12} /> {m.pinned ? 'Unpin' : 'Pin'}</button>
@@ -934,6 +993,28 @@ export default function ChatView({
                   <FolderOpen size={14} style={{ color: activeWorkspace ? 'var(--accent)' : 'var(--ink-faint)', flexShrink: 0 }} />
                   <span>{activeWorkspace || 'Select workspace folder'}</span>
                 </button>
+                {!task && (
+                  <>
+                    <button
+                      type="button"
+                      className={`filter-chip ${newEphemeral ? 'ram-chip-active' : ''}`}
+                      style={{ padding: '4px 8px', fontSize: 11.5 }}
+                      title={newEphemeral ? 'New session will run RAM-Only (zero disk writes, vanishes on close)' : 'New session will save normally. Click for RAM-Only zero-trace mode.'}
+                      onClick={() => setNewEphemeral(v => !v)}
+                    >
+                      <Ghost size={12} /> {newEphemeral ? 'RAM-Only' : 'Regular'}
+                    </button>
+                    <button
+                      type="button"
+                      className={`filter-chip ${newAdminMode ? 'admin-chip-active' : ''}`}
+                      style={{ padding: '4px 8px', fontSize: 11.5 }}
+                      title={newAdminMode ? 'New session will have Windows Administrator rights (VPN, services, firewall)' : 'Grant Windows Administrator privileges to this new session'}
+                      onClick={() => setNewAdminMode(v => !v)}
+                    >
+                      <ShieldAlert size={12} /> {newAdminMode ? 'Admin ON' : 'Admin'}
+                    </button>
+                  </>
+                )}
                 {uploading && <span className="hint">Uploading…</span>}
               </div>
 
@@ -1020,6 +1101,8 @@ export default function ChatView({
               title: spawnModal.title.trim() || undefined,
               prompt: spawnModal.prompt.trim(),
               notifyParentOnIdle: spawnModal.notifyParentOnIdle,
+              ephemeral: Boolean(spawnModal.ephemeral),
+              adminMode: Boolean(spawnModal.adminMode),
             });
             if (res?.sessionId) {
               setSpawnModal(null);
@@ -1028,6 +1111,14 @@ export default function ChatView({
           }}>
             <label className="field"><span>Title (optional)</span><input value={spawnModal.title} onChange={e => setSpawnModal({ ...spawnModal, title: e.target.value })} placeholder="e.g. Security Audit Worker" /></label>
             <label className="field"><span>Child Objective / Kickoff Prompt</span><textarea rows={4} required value={spawnModal.prompt} onChange={e => setSpawnModal({ ...spawnModal, prompt: e.target.value })} placeholder="Inspect auth middleware and report any edge cases…" /></label>
+            <label className="switch-row">
+              <div><strong>RAM-Only Ephemeral Child Session</strong><p>Runs strictly in RAM with zero disk traces (recommended for sensitive or high-risk subtasks).</p></div>
+              <input type="checkbox" className="switch-input" checked={Boolean(spawnModal.ephemeral)} onChange={e => setSpawnModal({ ...spawnModal, ephemeral: e.target.checked })} />
+            </label>
+            <label className="switch-row">
+              <div><strong>Grant Windows Administrator Rights</strong><p>Allows this child session to execute elevated commands (services, VPN adapters, firewall).</p></div>
+              <input type="checkbox" className="switch-input" checked={Boolean(spawnModal.adminMode)} onChange={e => setSpawnModal({ ...spawnModal, adminMode: e.target.checked })} />
+            </label>
             <label className="switch-row">
               <div><strong>Auto-Handoff on Completion</strong><p>Automatically send the child's final report back into this parent session when finished.</p></div>
               <input type="checkbox" className="switch-input" checked={spawnModal.notifyParentOnIdle} onChange={e => setSpawnModal({ ...spawnModal, notifyParentOnIdle: e.target.checked })} />

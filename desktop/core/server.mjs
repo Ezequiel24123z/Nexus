@@ -15,11 +15,16 @@ import { SecretVault } from './vault.mjs';
 import { ConfigFileManager } from './config-file.mjs';
 import { AutomationsManager } from './automations.mjs';
 import { InteractiveTerminalManager } from './pty-shell.mjs';
-import { checkPrivacyStatus, probeLocalProxies, detectSystemVpn, proxiedFetch, resolveEffectiveProxyUrl } from './privacy-proxy.mjs';
+import { checkPrivacyStatus, probeLocalProxies, detectSystemVpn, proxiedFetch, resolveEffectiveProxyUrl, createNexusFetcher, buildPrivacyAudit } from './privacy-proxy.mjs';
 import { TorManager } from './tor-manager.mjs';
+import { WireGuardManager } from './wireguard-manager.mjs';
+import { SEARCH_PROVIDER_CATALOG, SEARCH_SECRET_KEYS, executeWebSearch } from './search-engines.mjs';
+import { runFastAgentBrowser, formatAgentSnapshotText } from './agent-browser.mjs';
+import { loadChangelog } from './changelog.mjs';
+import { checkGithubUpdate, downloadAndApplyGithubUpdate, backupUserCustomizations, DEFAULT_UPDATE_REPO } from './updater.mjs';
 import { CURATED_SKILLS, CURATED_NATIVE_PLUGINS, CURATED_MCP_PLUGINS, CLOUD_SKILL_SOURCES } from './gallery.mjs';
 import { discoverWorkspaceSkills, searchGithubSkills } from './plugins.mjs';
-import { inspectWebPage } from './coding-engine.mjs';
+import { inspectWebPage, isProcessElevated, buildChatMediaItem } from './coding-engine.mjs';
 import { readBalance } from './telemetry.mjs';
 import { command, workspacePath, baseTools, READ_ONLY_TOOL_NAMES } from './tools.mjs';
 import { recoveryJob } from './recovery-jobs.mjs';
@@ -39,8 +44,8 @@ const { resolveDataDirectory } = require('./datadir.cjs');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(__dirname, '..');
 const APP_VERSION = (() => {
-  try { return JSON.parse(fs.readFileSync(path.join(desktopRoot, 'package.json'), 'utf8')).version || '1.1.0'; }
-  catch { return '1.1.0'; }
+  try { return JSON.parse(fs.readFileSync(path.join(desktopRoot, 'package.json'), 'utf8')).version || '1.4.0'; }
+  catch { return '1.4.0'; }
 })();
 
 const MIME_TYPES = {
@@ -100,10 +105,33 @@ function safeTokenEqual(provided, expected) {
 async function readJsonBody(req, maxBytes = 25 * 1024 * 1024) {
   const chunks = [];
   let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > maxBytes) throw new Error('Request payload exceeds limit.');
-    chunks.push(chunk);
+  let tooLarge = false;
+  // Answering while the client is still uploading makes it reset the connection,
+  // so the caller never observes the 413. Stop collecting at the limit but keep
+  // consuming (and discarding) the rest of the body so the response lands cleanly.
+  // Bounded: if the client keeps pushing far past the limit, drop the socket.
+  const drainCap = maxBytes * 4;
+
+  await new Promise((resolve, reject) => {
+    const onData = chunk => {
+      total += chunk.length;
+      if (total > maxBytes) tooLarge = true;
+      if (tooLarge) {
+        if (total > drainCap) { req.destroy(); }
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on('data', onData);
+    req.once('end', () => { req.removeListener('data', onData); resolve(); });
+    req.once('aborted', () => { req.removeListener('data', onData); resolve(); });
+    req.once('error', err => { req.removeListener('data', onData); reject(err); });
+  });
+
+  if (tooLarge) {
+    const err = new Error('Request payload exceeds limit.');
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
   }
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : {};
@@ -223,33 +251,64 @@ export async function createNexusServer({
     return command('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Payload', encoded], { signal, timeout: 15000 });
   };
 
-  let tor;
+  const tor = new TorManager(dataDir, { bundledDir: desktopRoot });
+  const wireguard = new WireGuardManager(dataDir, { vault, bundledDir: desktopRoot });
+  const appFetch = createNexusFetcher(() => store.state.settings, tor, { baseFetch: fetch, scope: 'all', wgManager: wireguard });
+  const agentFetch = createNexusFetcher(() => store.state.settings, tor, { baseFetch: fetch, scope: 'agent', wgManager: wireguard });
+
+  // Scoped local media registry for secure Range-capable inline chat rendering (images, videos, audio, PDFs, documents)
+  const mediaRegistry = new Map();
+  const registerMedia = (filePath, mime, name, explicitId = null) => {
+    const resolved = path.resolve(String(filePath));
+    for (const [existingId, entry] of mediaRegistry.entries()) {
+      if (entry.path === resolved) return existingId;
+    }
+    const id = explicitId || ('m-' + crypto.randomUUID().slice(0, 12));
+    mediaRegistry.set(id, { path: resolved, mime: mime || 'application/octet-stream', name: name || path.basename(resolved) });
+    if (mediaRegistry.size > 400) {
+      const firstKey = mediaRegistry.keys().next().value;
+      if (firstKey) mediaRegistry.delete(firstKey);
+    }
+    return id;
+  };
+  // Re-register any persisted chat media cards on startup so videos/images/PDFs continue working after restart
+  for (const t of store.state.tasks || []) {
+    for (const m of t.conversation || []) {
+      for (const item of m.media || []) {
+        if (item?.path && item?.mediaId && fs.existsSync(item.path)) {
+          registerMedia(item.path, item.mime, item.name, item.mediaId);
+        }
+      }
+    }
+  }
+
   const defaultBrowserInspect = async (url, opts = {}) => {
     if (typeof browserInspectHandler === 'function') return browserInspectHandler(url, opts);
     const hostExe = process.platform === 'win32' ? resolveNativeHostExe() : null;
     if (!hostExe) {
-      // Transparently fall back to static HTTP fetch with realistic browser headers when NEXUS.exe is absent
-      const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, tor) : '';
-      const fetcher = (u, o) => (proxyUrl ? proxiedFetch(u, o, proxyUrl) : fetch(u, o));
-      return inspectWebPage(url, {
-        extractLinks: opts.extractLinks !== false,
-        extractForms: opts.extractForms !== false,
-        renderJs: false,
+      return runFastAgentBrowser(url, {
         userAgent: opts.userAgent || store.state.settings.webUserAgent || DEFAULT_BROWSER_USER_AGENT,
-        request: fetcher,
+        request: agentFetch,
         signal: opts.signal,
       }).then(res => ({
         ...res,
-        renderJsNote: 'Native WebView2 host (NEXUS.exe) is not built or unavailable here; fell back to static HTTP fetch (JavaScript did not execute).',
+        renderJsNote: 'Native WebView2 host (NEXUS.exe) is not built or unavailable here; returned fast Agent Browser @eN snapshot (JavaScript did not execute).',
       }));
     }
     const tempShot = opts.captureScreenshot ? path.join(os.tmpdir(), 'nexus-browser-' + crypto.randomUUID() + '.png') : '';
-    const proxyUrl = store.state.settings.browserRouteAgentTraffic ? resolveEffectiveProxyUrl(store.state.settings, tor) : '';
+    const routeProxy = Boolean(store.state.settings.torRouteAllTraffic || store.state.settings.browserRouteAgentTraffic);
+    const proxyUrl = routeProxy ? resolveEffectiveProxyUrl(store.state.settings, tor, wireguard) : '';
+    if (store.state.settings.torStrictFailClosed && routeProxy && !proxyUrl) {
+      throw new Error('NEXUS Kill-Switch blocked WebView2 browser_inspect: Tor/Proxy routing is active, but no proxy endpoint is configured.');
+    }
     const payload = {
       url,
       waitMs: opts.waitMs ?? 1200,
       waitForSelector: opts.waitForSelector || '',
       actions: Array.isArray(opts.actions) ? opts.actions : undefined,
+      agentMode: opts.agentMode !== false,
+      blockTrackers: store.state.settings.browserBlockTrackers !== false,
+      blockMedia: opts.agentMode !== false && !opts.captureScreenshot,
       useAccountSession: Boolean(opts.useAccountSession),
       dataDir,
       proxyUrl,
@@ -282,6 +341,8 @@ export async function createNexusServer({
     getSecret: name => vault.get(name),
     desktop: defaultDesktop,
     browserInspect: defaultBrowserInspect,
+    registerMedia,
+    request: appFetch,
   });
   void runtime.capabilities;
 
@@ -290,8 +351,16 @@ export async function createNexusServer({
   automations.start(30000);
 
   const terminals = new InteractiveTerminalManager();
-  tor = new TorManager(dataDir, { bundledDir: desktopRoot });
   runtime.tor = tor;
+  runtime.wireguard = wireguard;
+  runtime.privacyController = {
+    wireguardStart: a => invoke('wireguardStart', a),
+    wireguardStartChainTor: a => invoke('wireguardStartChainTor', a),
+    wireguardStop: () => invoke('wireguardStop'),
+    torStart: a => invoke('torStart', a),
+    torStop: () => invoke('torStop'),
+    torNewIdentity: () => invoke('torNewIdentity'),
+  };
 
   const configFile = new ConfigFileManager(dataDir, runtime);
   runtime.configFile = configFile;
@@ -346,6 +415,7 @@ export async function createNexusServer({
   terminals.on('data', evt => pushSse('terminal', evt));
   terminals.on('exit', evt => pushSse('terminal_exit', evt));
   tor.on('status', st => pushSse('tor', st));
+  wireguard.on('status', st => pushSse('wireguard', st));
   mcp.on('change', () => runtime.emit('change'));
 
   async function invoke(method, args = {}) {
@@ -354,6 +424,7 @@ export async function createNexusServer({
         return {
           standalone: true,
           nativeHost,
+          isElevated: isProcessElevated(),
           engine: 'node',
           nodeVersion: process.version,
           platform: process.platform,
@@ -384,8 +455,137 @@ export async function createNexusServer({
       case 'termGet': return terminals.get(args.id);
       case 'termList': return terminals.list();
       case 'termClose': return terminals.close(args.id);
-      case 'privacyStatus': return checkPrivacyStatus(store.state.settings, tor);
-      case 'privacyProbes': return { vpn: await detectSystemVpn(), localProxies: await probeLocalProxies(), tor: tor.status() };
+      case 'privacyStatus': return checkPrivacyStatus(store.state.settings, tor, wireguard);
+      case 'privacyAudit': return buildPrivacyAudit(store.state.settings, tor, store, wireguard);
+      case 'privacyProbes': return { vpn: await detectSystemVpn(), localProxies: await probeLocalProxies(), tor: tor.status(), wireguard: wireguard.status(store.state.settings.wireguardBinaryPath) };
+      case 'piiScrubberSummary': return runtime.activePiiScrubber().summary();
+      case 'toggleStealthMode': {
+        const res = runtime.toggleStealthMode(args.enabled !== false);
+        return { ...res, audit: buildPrivacyAudit(store.state.settings, tor, store, wireguard) };
+      }
+      case 'setSessionEphemeral': {
+        const res = store.setTaskEphemeral(args.id, Boolean(args.ephemeral), args.reason || 'User toggled RAM-Only mode');
+        runtime.changed(store.task(args.id), { immediate: true });
+        return res;
+      }
+      case 'presentFileInChat': {
+        const task = store.task(args.id);
+        const resolved = path.resolve(task.workspace || process.cwd(), String(args.path || ''));
+        const item = await buildChatMediaItem(resolved, { title: args.title || '', caption: args.caption || '', kind: args.kind || 'auto', registerMedia });
+        task.conversation.push({ id: crypto.randomUUID(), role: 'assistant', content: '', media: [item], isMediaCard: true });
+        runtime.changed(task);
+        return item;
+      }
+      case 'openLocalFile': {
+        const targetPath = String(args.path || '').trim();
+        if (!targetPath || !fs.existsSync(targetPath)) throw new Error('File does not exist.');
+        return openWithShell(path.resolve(targetPath));
+      }
+      case 'wireguardStatus': return wireguard.status(store.state.settings.wireguardBinaryPath);
+      case 'wireguardAddProfile': {
+        const prof = wireguard.addProfile({ name: args.name, configText: args.configText });
+        if (!store.state.settings.wireguardActiveProfileId) {
+          runtime.settings({ wireguardActiveProfileId: prof.id });
+        }
+        return wireguard.status(store.state.settings.wireguardBinaryPath);
+      }
+      case 'wireguardRemoveProfile': {
+        await wireguard.removeProfile(args.id);
+        if (store.state.settings.wireguardActiveProfileId === args.id) {
+          runtime.settings({ wireguardActiveProfileId: '' });
+        }
+        return wireguard.status(store.state.settings.wireguardBinaryPath);
+      }
+      case 'wireguardInstall': return wireguard.install({ force: Boolean(args.force), request: fetch });
+      case 'wireguardStart': {
+        const profileId = args.profileId || store.state.settings.wireguardActiveProfileId || '';
+        const st = await wireguard.start({ profileId, autoInstall: args.autoInstall !== false, customBinaryPath: store.state.settings.wireguardBinaryPath });
+        if (st.activeProfileId) runtime.settings({ wireguardActiveProfileId: st.activeProfileId });
+        if (args.activate !== false) {
+          runtime.settings({ browserProxyMode: args.chainTor ? 'wireguard-tor' : 'wireguard', browserProxyUrl: wireguard.getSocksUrl() });
+        }
+        return st;
+      }
+      case 'wireguardStartChainTor': {
+        const profileId = args.profileId || store.state.settings.wireguardActiveProfileId || '';
+        const wgSt = await wireguard.start({ profileId, autoInstall: args.autoInstall !== false, customBinaryPath: store.state.settings.wireguardBinaryPath });
+        const torSt = await tor.start({ autoInstall: args.autoInstall !== false, waitForBootstrap: args.waitForBootstrap !== false, timeoutMs: args.timeoutMs || 60000, upstreamSocks5: `127.0.0.1:${wireguard.socksPort}` });
+        runtime.settings({
+          wireguardActiveProfileId: wgSt.activeProfileId || '',
+          browserProxyMode: 'wireguard-tor',
+          browserProxyUrl: tor.getSocksUrl(),
+          torRouteAllTraffic: true,
+          browserRouteAgentTraffic: true,
+        });
+        return { wireguard: wgSt, tor: torSt };
+      }
+      case 'wireguardStop': {
+        if (tor.isRunning() && tor.upstreamSocks5) await tor.stop();
+        const st = await wireguard.stop();
+        if (['wireguard', 'wireguard-tor'].includes(store.state.settings.browserProxyMode)) {
+          runtime.settings({ browserProxyMode: 'direct' });
+        }
+        return st;
+      }
+      case 'searchCatalog':
+        return {
+          providers: SEARCH_PROVIDER_CATALOG.map(p => ({
+            ...p,
+            hasKey: p.secretKey ? Boolean(vault.get(p.secretKey)) : true,
+          })),
+          activeProvider: store.state.settings.searchProvider || 'auto',
+          strictZeroTrack: Boolean(store.state.settings.searchStrictZeroTrack),
+          torRunning: tor.isRunning(),
+        };
+      case 'webSearchDirect':
+        return executeWebSearch(args.query, {
+          provider: args.provider || '',
+          maxResults: args.maxResults || 10,
+          settings: store.state.settings,
+          getSecret: k => vault.get(k),
+          torRunning: tor.isRunning(),
+          request: agentFetch,
+        });
+      case 'agentBrowserSnapshot': {
+        const engine = args.engine || 'agent-fast';
+        if (engine === 'agent-js' || args.renderJs || (Array.isArray(args.actions) && args.actions.length)) {
+          const page = await defaultBrowserInspect(args.url, {
+            agentMode: true,
+            waitMs: args.waitMs ?? 1000,
+            waitForSelector: args.waitForSelector || '',
+            actions: args.actions || null,
+            useAccountSession: Boolean(args.useAccountSession),
+            captureScreenshot: Boolean(args.captureScreenshot),
+          });
+          return { ...page, agentSnapshot: formatAgentSnapshotText(page) };
+        }
+        return runFastAgentBrowser(args.url, {
+          request: agentFetch,
+          userAgent: store.state.settings.webUserAgent || DEFAULT_BROWSER_USER_AGENT,
+        });
+      }
+      case 'changelog': {
+        const parsed = loadChangelog(desktopRoot);
+        return { currentVersion: APP_VERSION, ...parsed };
+      }
+      case 'checkUpdate':
+        return checkGithubUpdate({
+          currentVersion: APP_VERSION,
+          repo: args.repo || store.state.settings.updateRepo || DEFAULT_UPDATE_REPO,
+          desktopRoot,
+          request: appFetch,
+        });
+      case 'applyUpdate':
+        return downloadAndApplyGithubUpdate({
+          currentVersion: APP_VERSION,
+          repo: args.repo || store.state.settings.updateRepo || DEFAULT_UPDATE_REPO,
+          desktopRoot,
+          dataDir,
+          request: appFetch,
+          dryRun: Boolean(args.dryRun),
+        });
+      case 'backupCustomPrompts':
+        return backupUserCustomizations(dataDir, 'manual');
       case 'torStatus': return tor.status();
       case 'torInstall': return tor.install({ force: Boolean(args.force) });
       case 'torStart': {
@@ -404,9 +604,10 @@ export async function createNexusServer({
       }
       case 'torNewIdentity': return tor.newIdentity();
       case 'browserFetchReader': {
-        const proxyUrl = resolveEffectiveProxyUrl(store.state.settings, tor);
-        const fetcher = (url, opts) => (proxyUrl ? proxiedFetch(url, opts, proxyUrl) : fetch(url, opts));
-        return inspectWebPage(args.url, { extractLinks: true, extractForms: true, request: fetcher });
+        return runFastAgentBrowser(args.url, {
+          request: agentFetch,
+          userAgent: store.state.settings.webUserAgent || DEFAULT_BROWSER_USER_AGENT,
+        });
       }
       case 'galleryCatalog': {
         await runtime.plugins.ready;
@@ -449,12 +650,12 @@ export async function createNexusServer({
         return { installedCount: count };
       }
       case 'galleryImportSkillUrl': {
-        const res = await runtime.plugins.importSkillFromUrl(args.url, runtime.capabilities);
+        const res = await runtime.plugins.importSkillFromUrl(args.url, runtime.capabilities, { request: appFetch });
         runtime.emit('change');
         return res;
       }
       case 'gallerySearchGithubSkills': {
-        const items = await searchGithubSkills(args.query || '');
+        const items = await searchGithubSkills(args.query || '', { request: appFetch });
         return { query: args.query || '', items };
       }
       case 'galleryTestConnectMcp': {
@@ -755,13 +956,13 @@ export async function createNexusServer({
       case 'settings': runtime.settings(args); return runtime.snapshot(activeUiTask);
       case 'balance': {
         const providerId = modelConnection(store.state.settings.model, store.state.settings).id;
-        return providerId === 'openrouter' ? readBalance(name => vault.get(name)) : { subscription: true, provider: providerId, remaining: null, keyRemaining: null };
+        return providerId === 'openrouter' ? readBalance(name => vault.get(name), appFetch) : { subscription: true, provider: providerId, remaining: null, keyRemaining: null };
       }
-      case 'checkArli': return checkArliConnection(vault.get('ARLIAI_API_KEY'));
+      case 'checkArli': return checkArliConnection(vault.get('ARLIAI_API_KEY'), { request: appFetch });
       case 'checkProvider': {
         const providerId = args.provider || modelConnection(store.state.settings.model, store.state.settings).id;
         const provider = allProviders(store.state.settings).find(p => p.id === providerId) || allProviders(store.state.settings)[0];
-        return checkProviderConnection(provider.id, vault.get(provider.key), { settings: store.state.settings });
+        return checkProviderConnection(provider.id, vault.get(provider.key), { settings: store.state.settings, request: appFetch });
       }
       case 'importCopilotToken': {
         const detected = await detectLocalCopilotToken();
@@ -771,8 +972,8 @@ export async function createNexusServer({
       }
       case 'saveKey': {
         const name = String(args.name || 'OPENROUTER_API_KEY').trim().toUpperCase();
-        if (!SECRET_KEYS.includes(name) && !/^(CONNECTOR|PROVIDER)_[A-Z0-9_]+$/.test(name)) {
-          throw new Error('Secret name must be a provider key or start with CONNECTOR_ or PROVIDER_.');
+        if (!SECRET_KEYS.includes(name) && !SEARCH_SECRET_KEYS.includes(name) && !/^(CONNECTOR|PROVIDER|SEARCH)_[A-Z0-9_]+$/.test(name)) {
+          throw new Error('Secret name must be a provider key or start with CONNECTOR_, PROVIDER_, or SEARCH_.');
         }
         if (typeof args.value !== 'string' || args.value.length > 10000) throw new Error('Invalid key value.');
         vault.set(name, args.value);
@@ -783,7 +984,7 @@ export async function createNexusServer({
         const sorts = new Set(['pricing-low-to-high', 'context-high-to-low', 'throughput-high-to-low', 'latency-low-to-high', 'most-popular', 'newest', 'intelligence-high-to-low', 'design-arena-elo-high-to-low']);
         const providerIds = allProviders(store.state.settings).map(p => p.id);
         const results = await Promise.allSettled(providerIds.map(provider =>
-          providerCatalog(provider, { sort: sorts.has(args.sort) ? args.sort : '', settings: store.state.settings, getSecret: name => vault.get(name) })
+          providerCatalog(provider, { sort: sorts.has(args.sort) ? args.sort : '', settings: store.state.settings, getSecret: name => vault.get(name), request: appFetch })
         ));
         const entries = results.flatMap(result => result.status === 'fulfilled' ? result.value : []);
         if (!entries.length) throw new Error('Model catalogs unavailable. You can type any model ID manually and retry.');
@@ -1040,9 +1241,76 @@ export async function createNexusServer({
           res.writeHead(200, { 'Content-Type': 'application/json', ...corsHeaders });
           res.end(JSON.stringify({ ok: true, result }));
         } catch (error) {
+          const tooLarge = error?.code === 'PAYLOAD_TOO_LARGE';
+          if (tooLarge) {
+            // Drain the remaining upload instead of destroying the socket mid-write
+            // (destroying made the client observe ECONNRESET instead of the 413).
+            // Connection: close guarantees this socket is never reused for keep-alive.
+            req.resume();
+            res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close', ...corsHeaders });
+            res.end(JSON.stringify({ ok: false, error: 'Request payload exceeds limit.' }));
+            return;
+          }
           res.writeHead(400, { 'Content-Type': 'application/json', ...corsHeaders });
           res.end(JSON.stringify({ ok: false, error: error?.message || String(error) }));
         }
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/media/') && req.method === 'GET') {
+        if (!checkAuth(req, url)) { res.writeHead(401); res.end('Unauthorized'); return; }
+        const mediaId = decodeURIComponent(url.pathname.slice('/api/media/'.length));
+        let entry = mediaRegistry.get(mediaId);
+        // Also support streaming user-uploaded attachments directly via /api/media/att-<id>
+        if (!entry && mediaId.startsWith('att-')) {
+          const attId = mediaId.slice(4);
+          try {
+            const fp = runtime.attachments.filename(attId);
+            if (fs.existsSync(fp)) {
+              const rec = (store.state.tasks || []).flatMap(t => t.attachments || []).find(a => a.id === attId);
+              entry = { path: fp, mime: rec?.mime || 'application/octet-stream', name: rec?.name || 'attachment' };
+            }
+          } catch {}
+        }
+        if (!entry || !fs.existsSync(entry.path)) {
+          res.writeHead(404, { 'Content-Type': 'text/plain', ...corsHeaders });
+          res.end('Media not found.');
+          return;
+        }
+        const stat = fs.statSync(entry.path);
+        const total = stat.size;
+        const baseHeaders = {
+          'Content-Type': entry.mime,
+          'Accept-Ranges': 'bytes',
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'private, max-age=300',
+          ...corsHeaders,
+        };
+        const range = req.headers.range;
+        if (range && /^bytes=\d*-\d*$/i.test(range)) {
+          const [startStr, endStr] = range.replace(/bytes=/i, '').split('-');
+          // RFC 7233: a suffix range ("bytes=-N") means the LAST N bytes, so `end`
+          // must be total-1, not the requested length. Computing end from endStr
+          // here produced start > end and a spurious 416 that broke <video> seeking.
+          const isSuffix = !startStr && Boolean(endStr);
+          const suffixLen = isSuffix ? Number(endStr) : 0;
+          const start = isSuffix ? Math.max(0, total - suffixLen) : Number(startStr);
+          const end = isSuffix ? total - 1 : (endStr ? Math.min(total - 1, Number(endStr)) : total - 1);
+          if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || start >= total) {
+            res.writeHead(416, { 'Content-Range': `bytes */${total}`, ...corsHeaders });
+            res.end();
+            return;
+          }
+          res.writeHead(206, {
+            ...baseHeaders,
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Content-Length': (end - start) + 1,
+          });
+          fs.createReadStream(entry.path, { start, end }).pipe(res);
+          return;
+        }
+        res.writeHead(200, { ...baseHeaders, 'Content-Length': total });
+        fs.createReadStream(entry.path).pipe(res);
         return;
       }
 
@@ -1099,6 +1367,7 @@ export async function createNexusServer({
     automations.stop();
     terminals.closeAll();
     await tor.stop().catch(() => {});
+    await wireguard.stop().catch(() => {});
     configFile.close();
     runtime.shutdown();
     await mcp.close().catch(() => {});
@@ -1106,7 +1375,7 @@ export async function createNexusServer({
     await new Promise(resolve => server.close(() => resolve()));
   };
 
-  return { server, port: actualPort, url: baseUrl, token, dataDir, runtime, store, mcp, vault, configFile, automations, terminals, tor, invoke, close };
+  return { server, port: actualPort, url: baseUrl, token, dataDir, runtime, store, mcp, vault, configFile, automations, terminals, tor, wireguard, registerMedia, invoke, close };
 }
 
 // Direct CLI execution entrypoint (used by native NEXUS.exe host or standalone headless mode)
@@ -1134,11 +1403,22 @@ if (isMain) {
   };
   const port = Number(flagValue('--port') ?? process.env.NEXUS_PORT ?? (args.includes('--standalone') ? 4789 : 0));
   const nativeHost = args.includes('--native-host');
+  const parentPid = Number(flagValue('--parent-pid') || 0);
   const openBrowser = args.includes('--open');
   const noAuth = args.includes('--no-auth');
   const token = flagValue('--token') || process.env.NEXUS_TOKEN || (noAuth ? '' : crypto.randomBytes(24).toString('hex'));
 
   createNexusServer({ port, token, requireToken: !noAuth, nativeHost }).then(instance => {
+    if (nativeHost && parentPid > 0) {
+      const parentWatch = setInterval(() => {
+        try { process.kill(parentPid, 0); }
+        catch {
+          clearInterval(parentWatch);
+          void instance.close().finally(() => process.exit(0));
+        }
+      }, 4000);
+      parentWatch.unref?.();
+    }
     const readyPayload = {
       port: instance.port,
       url: instance.url,

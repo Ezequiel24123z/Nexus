@@ -17,6 +17,15 @@ internal static class NativeBrowser
     private const string DefaultUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0";
 
+    private static readonly string[] TrackerDomains =
+    [
+        "doubleclick.net", "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+        "googleadservices.com", "adservice.google.com", "connect.facebook.net", "pixel.facebook.com",
+        "analytics.tiktok.com", "ads-twitter.com", "bat.bing.com", "clarity.ms", "hotjar.com",
+        "mixpanel.com", "segment.io", "amplitude.com", "taboola.com", "outbrain.com", "criteo.com",
+        "adnxs.com", "amazon-adsystem.com", "newrelic.com"
+    ];
+
     private static string ValidateProxyUrl(string? proxyUrl)
     {
         string trimmed = (proxyUrl ?? "").Trim();
@@ -67,6 +76,9 @@ internal static class NativeBrowser
                 : "";
             bool extractLinks = !root.TryGetProperty("extractLinks", out var elEl) || elEl.ValueKind != JsonValueKind.False;
             bool extractForms = !root.TryGetProperty("extractForms", out var efEl) || efEl.ValueKind != JsonValueKind.False;
+            bool agentMode = !root.TryGetProperty("agentMode", out var amEl) || amEl.ValueKind != JsonValueKind.False;
+            bool blockTrackers = !root.TryGetProperty("blockTrackers", out var btEl) || btEl.ValueKind != JsonValueKind.False;
+            bool blockMedia = root.TryGetProperty("blockMedia", out var bmEl) && bmEl.ValueKind == JsonValueKind.True;
             string screenshotPath = root.TryGetProperty("screenshotPath", out var spEl) && spEl.ValueKind == JsonValueKind.String
                 ? (spEl.GetString() ?? "").Trim()
                 : "";
@@ -138,8 +150,51 @@ internal static class NativeBrowser
                     core.Settings.AreDefaultScriptDialogsEnabled = false;
 
                     await core.AddScriptToExecuteOnDocumentCreatedAsync(
-                        "try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}"
+                        """
+                        (() => {
+                          try {
+                            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                            Object.defineProperty(navigator, 'doNotTrack', { get: () => '1' });
+                            Object.defineProperty(navigator, 'globalPrivacyControl', { get: () => true });
+                            if (navigator.sendBeacon) navigator.sendBeacon = () => false;
+                            if (navigator.getBattery) navigator.getBattery = undefined;
+                          } catch {}
+                        })();
+                        """
                     );
+
+                    int blockedResources = 0;
+                    if (blockTrackers || blockMedia)
+                    {
+                        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+                        core.WebResourceRequested += (_, reqArgs) =>
+                        {
+                            try
+                            {
+                                if (blockMedia && reqArgs.ResourceContext is CoreWebView2WebResourceContext.Image or CoreWebView2WebResourceContext.Media or CoreWebView2WebResourceContext.Font)
+                                {
+                                    reqArgs.Response = env.CreateWebResourceResponse(null, 204, "Blocked by NEXUS Agent Browser", "");
+                                    blockedResources++;
+                                    return;
+                                }
+                                if (blockTrackers)
+                                {
+                                    var reqUri = new Uri(reqArgs.Request.Uri);
+                                    string host = reqUri.Host.ToLowerInvariant();
+                                    foreach (var tracker in TrackerDomains)
+                                    {
+                                        if (host == tracker || host.EndsWith("." + tracker, StringComparison.Ordinal))
+                                        {
+                                            reqArgs.Response = env.CreateWebResourceResponse(null, 403, "Blocked by NEXUS Privacy Shield", "");
+                                            blockedResources++;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
+                        };
+                    }
 
                     var navTcs = new TaskCompletionSource<CoreWebView2NavigationCompletedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
                     core.NavigationCompleted += (_, navArgs) => navTcs.TrySetResult(navArgs);
@@ -158,6 +213,22 @@ internal static class NativeBrowser
                         await WaitForSelectorAsync(core, waitForSelector, Math.Min(12000, timeoutMs / 2));
                     }
 
+                    // Tag interactive DOM nodes with stable @e1..@eN refs before executing actions
+                    const string assignRefsScript = """
+                        (() => {
+                          let idx = 0;
+                          const nodes = document.querySelectorAll('a[href],button,input:not([type="hidden"]),textarea,select,[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="tab"],[contenteditable="true"]');
+                          for (const el of nodes) {
+                            if (idx >= 120) break;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width === 0 && rect.height === 0) continue;
+                            el.setAttribute('data-nexus-ref', 'e' + (++idx));
+                          }
+                          return idx;
+                        })()
+                        """;
+                    if (agentMode) await core.ExecuteScriptAsync(assignRefsScript);
+
                     var actionsLog = new List<object>();
                     JsonElement? lastEvalResult = null;
                     if (actionsEl.ValueKind == JsonValueKind.Array)
@@ -165,7 +236,12 @@ internal static class NativeBrowser
                         foreach (var act in actionsEl.EnumerateArray())
                         {
                             string actType = act.TryGetProperty("type", out var tEl) ? (tEl.GetString() ?? "").Trim().ToLowerInvariant() : "";
+                            string refId = act.TryGetProperty("ref", out var rEl) ? (rEl.GetString() ?? "").Trim().TrimStart('@') : "";
                             string selector = act.TryGetProperty("selector", out var sEl) ? (sEl.GetString() ?? "").Trim() : "";
+                            if (string.IsNullOrWhiteSpace(selector) && !string.IsNullOrWhiteSpace(refId))
+                            {
+                                selector = $"[data-nexus-ref=\"{refId}\"]";
+                            }
                             string textVal = act.TryGetProperty("text", out var txEl) ? (txEl.GetString() ?? "") : "";
                             string valStr = act.TryGetProperty("value", out var vEl) ? (vEl.GetString() ?? "") : textVal;
 
@@ -233,6 +309,23 @@ internal static class NativeBrowser
                                 actionsLog.Add(new { type = "select", selector, result = JsonSerializer.Deserialize<JsonElement>(res) });
                                 await Task.Delay(200);
                             }
+                            else if (actType == "press_key")
+                            {
+                                string keyName = string.IsNullOrWhiteSpace(textVal) ? "Enter" : textVal;
+                                string script = $$"""
+                                    (() => {
+                                      const el = {{(string.IsNullOrWhiteSpace(selector) ? "document.activeElement || document.body" : $"document.querySelector({JsonSerializer.Serialize(selector)}) || document.activeElement || document.body")}};
+                                      const init = { key: {{JsonSerializer.Serialize(keyName)}}, bubbles: true, cancelable: true };
+                                      el.dispatchEvent(new KeyboardEvent('keydown', init));
+                                      el.dispatchEvent(new KeyboardEvent('keyup', init));
+                                      if ({{JsonSerializer.Serialize(keyName)}} === 'Enter' && el.form) { try { el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit(); } catch {} }
+                                      return { ok: true, key: {{JsonSerializer.Serialize(keyName)}} };
+                                    })()
+                                    """;
+                                string res = await core.ExecuteScriptAsync(script);
+                                actionsLog.Add(new { type = "press_key", key = keyName, result = JsonSerializer.Deserialize<JsonElement>(res) });
+                                await Task.Delay(350);
+                            }
                             else if (actType == "scroll")
                             {
                                 int dy = act.TryGetProperty("y", out var yEl) && yEl.ValueKind == JsonValueKind.Number ? yEl.GetInt32() : 700;
@@ -254,6 +347,8 @@ internal static class NativeBrowser
                         }
                     }
 
+                    if (agentMode) await core.ExecuteScriptAsync(assignRefsScript);
+
                     string extractScript = $$"""
                         (() => {
                           const cssPath = el => {
@@ -272,6 +367,7 @@ internal static class NativeBrowser
                           })).filter(h => h.text);
                           const links = {{(extractLinks ? "true" : "false")}}
                             ? [...document.querySelectorAll('a[href]')].slice(0, 60).map(a => ({
+                                ref: a.getAttribute('data-nexus-ref') ? '@' + a.getAttribute('data-nexus-ref') : undefined,
                                 text: (a.innerText || a.getAttribute('aria-label') || a.href).replace(/\s+/g, ' ').trim().slice(0, 120),
                                 url: a.href,
                                 selector: cssPath(a)
@@ -282,6 +378,7 @@ internal static class NativeBrowser
                                 action: f.getAttribute('action') || location.pathname,
                                 method: (f.getAttribute('method') || 'GET').toUpperCase(),
                                 fields: [...f.querySelectorAll('input,textarea,select,button')].slice(0, 30).map(i => ({
+                                  ref: i.getAttribute('data-nexus-ref') ? '@' + i.getAttribute('data-nexus-ref') : undefined,
                                   tag: i.tagName.toLowerCase(),
                                   type: i.getAttribute('type') || '',
                                   name: i.getAttribute('name') || '',
@@ -290,24 +387,30 @@ internal static class NativeBrowser
                                 }))
                               }))
                             : [];
-                          const interactiveElements = [...document.querySelectorAll('button,input,textarea,select,[role="button"],a[href]')].slice(0, 60).map(el => ({
+                          const refs = [...document.querySelectorAll('[data-nexus-ref]')].slice(0, 80).map(el => ({
+                            ref: '@' + el.getAttribute('data-nexus-ref'),
                             tag: el.tagName.toLowerCase(),
-                            role: el.getAttribute('role') || el.getAttribute('type') || '',
-                            text: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 100),
+                            role: el.getAttribute('role') || (el.tagName === 'INPUT' ? ('input:' + (el.getAttribute('type') || 'text')) : el.tagName.toLowerCase()),
+                            name: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 110),
+                            ...(el.href ? { url: el.href } : {}),
+                            ...(el.disabled ? { disabled: true } : {}),
+                            ...(el.checked ? { checked: true } : {}),
                             selector: cssPath(el)
-                          })).filter(x => x.selector);
+                          }));
                           const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
                           return {
                             url: location.href,
                             title: document.title || location.hostname,
                             status: {{navResult.HttpStatusCode}},
                             renderedJs: true,
-                            engine: 'webview2',
+                            engine: {{(agentMode ? "'agent-js'" : "'webview2'")}},
+                            blockedResources: {{blockedResources}},
                             text,
                             headings,
                             links,
                             forms,
-                            interactiveElements
+                            refs,
+                            interactiveElements: refs
                           };
                         })()
                         """;

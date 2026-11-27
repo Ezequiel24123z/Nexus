@@ -28,11 +28,15 @@ const copyRecursive = (src, dest) => {
 // 1. Native Windows host + WebView2 runtimes
 copyRecursive(nativeDir, outDir);
 
-// 2. Built React UI + Core ESM Engine + Native PowerShell helpers
+// 2. Built React UI + Core ESM Engine + Native PowerShell helpers + Changelog
 copyRecursive(uiDir, path.join(outDir, 'ui'));
 copyRecursive(path.join(desktopDir, 'core'), path.join(outDir, 'core'));
 copyRecursive(path.join(desktopDir, 'native'), path.join(outDir, 'native'));
 fs.copyFileSync(path.join(desktopDir, 'package.json'), path.join(outDir, 'package.json'));
+const rootChangelog = path.join(desktopDir, '..', 'CHANGELOG.md');
+if (fs.existsSync(rootChangelog)) {
+  fs.copyFileSync(rootChangelog, path.join(outDir, 'CHANGELOG.md'));
+}
 
 // 3. Bundle Node 24 executable so the portable folder works even on PCs without Node installed
 const nodeOut = path.join(outDir, 'node');
@@ -74,20 +78,17 @@ if (torSrc) {
 }
 
 // 6. Package portable archive (NEXUS-Portable-Windows.zip) for CI artifacts & GitHub Releases
+// Always use .NET ZipFile (never bare tar.exe, which resolves to GNU tar on CI runners and ignores .zip format).
 fs.rmSync(zipOut, { force: true });
 if (process.platform === 'win32') {
-  try {
-    execFileSync('tar.exe', ['-a', '-cf', zipOut, '-C', releaseDir, 'NEXUS-Portable'], { stdio: 'inherit', windowsHide: true });
-  } catch {
-    execFileSync('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-Command',
-      'Compress-Archive -Path $env:NEXUS_ZIP_SRC -DestinationPath $env:NEXUS_ZIP_DST -Force',
-    ], {
-      env: { ...process.env, NEXUS_ZIP_SRC: outDir, NEXUS_ZIP_DST: zipOut },
-      stdio: 'inherit',
-      windowsHide: true,
-    });
-  }
+  execFileSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory($env:NEXUS_ZIP_SRC, $env:NEXUS_ZIP_DST, [System.IO.Compression.CompressionLevel]::Optimal, $true)',
+  ], {
+    env: { ...process.env, NEXUS_ZIP_SRC: outDir, NEXUS_ZIP_DST: zipOut },
+    stdio: 'inherit',
+    windowsHide: true,
+  });
 }
 
 console.log(`NEXUS v${pkg.version} Portable bundle created at: ${outDir}`);

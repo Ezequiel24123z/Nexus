@@ -89,7 +89,7 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
-            HostLog.Write("host", "Launching NEXUS native host v1.2.0");
+            HostLog.Write("host", "Launching NEXUS native host v1.4.0");
             using var server = CoreProcess.Start(args);
             using var form = new NexusWindow(server, args);
             Application.Run(form);
@@ -135,6 +135,81 @@ internal static class Program
 
 internal sealed class CoreProcess : IDisposable
 {
+    private const uint JobObjectExtendedLimitInformation = 9;
+    private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public nuint MinimumWorkingSetSize;
+        public nuint MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public nint Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public nuint ProcessMemoryLimit;
+        public nuint JobMemoryLimit;
+        public nuint PeakProcessMemoryUsed;
+        public nuint PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint CreateJobObjectW(nint lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(nint hJob, uint infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(nint hJob, nint hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(nint hObject);
+
+    private static nint AttachKillOnCloseJob(Process proc)
+    {
+        try
+        {
+            nint job = CreateJobObjectW(0, null);
+            if (job == 0) return 0;
+            var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            {
+                BasicLimitInformation = new JOBOBJECT_BASIC_LIMIT_INFORMATION
+                {
+                    LimitFlags = JobObjectLimitKillOnJobClose,
+                },
+            };
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref info, (uint)Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                || !AssignProcessToJobObject(job, proc.Handle))
+            {
+                CloseHandle(job);
+                return 0;
+            }
+            return job;
+        }
+        catch { return 0; }
+    }
+
     public Process Process { get; }
     public string Url { get; }
     public string Token { get; }
@@ -142,14 +217,16 @@ internal sealed class CoreProcess : IDisposable
     public string DataDir { get; }
     public event Action<int>? UnexpectedExit;
     private bool _disposing;
+    private nint _jobHandle;
 
-    private CoreProcess(Process process, string url, string token, int port, string dataDir)
+    private CoreProcess(Process process, string url, string token, int port, string dataDir, nint jobHandle)
     {
         Process = process;
         Url = url;
         Token = token;
         Port = port;
         DataDir = dataDir;
+        _jobHandle = jobHandle;
         Process.Exited += (_, _) =>
         {
             if (!_disposing)
@@ -213,12 +290,15 @@ internal sealed class CoreProcess : IDisposable
         }
         startInfo.ArgumentList.Add(serverScript);
         startInfo.ArgumentList.Add("--native-host");
+        startInfo.ArgumentList.Add("--parent-pid");
+        startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
         startInfo.ArgumentList.Add("--port");
         startInfo.ArgumentList.Add("0");
         foreach (var arg in cliArgs) startInfo.ArgumentList.Add(arg);
 
         var proc = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to launch NEXUS core daemon.");
+        nint jobHandle = AttachKillOnCloseJob(proc);
 
         const string marker = "NEXUS_SERVER_READY:";
         var readyTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -278,7 +358,8 @@ internal sealed class CoreProcess : IDisposable
             root.GetProperty("url").GetString()!,
             root.GetProperty("token").GetString()!,
             root.GetProperty("port").GetInt32(),
-            root.GetProperty("dataDir").GetString()!
+            root.GetProperty("dataDir").GetString()!,
+            jobHandle
         );
     }
 
@@ -329,6 +410,11 @@ internal sealed class CoreProcess : IDisposable
             if (!Process.HasExited) Process.Kill(entireProcessTree: true);
         }
         catch { }
+        if (_jobHandle != 0)
+        {
+            try { CloseHandle(_jobHandle); } catch { }
+            _jobHandle = 0;
+        }
         Process.Dispose();
     }
 }
@@ -746,6 +832,21 @@ internal sealed class NexusWindow : Form
             case "openDevTools":
                 _webView.CoreWebView2?.OpenDevToolsWindow();
                 return true;
+            case "relaunchElevated":
+            {
+                string? exe = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(exe)) throw new InvalidOperationException("Unable to locate NEXUS executable path.");
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    UseShellExecute = true,
+                    Verb = "runas",
+                };
+                Process.Start(psi);
+                _forceExit = true;
+                BeginInvoke(() => Close());
+                return true;
+            }
             case "logError":
                 HostLog.Write("renderer", $"[{GetStr("source", "ui")}] {GetStr("message", "")}");
                 return true;
