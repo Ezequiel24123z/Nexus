@@ -3,6 +3,7 @@ import { Swords, Play, Plus, Trash2, ArrowUpRight, FolderOpen, Pause, Loader2 } 
 import { MarkdownRenderer, StreamingMarkdown } from './MarkdownRenderer.jsx';
 import { MODES } from './ModelPickerPopover.jsx';
 import { formatCount, formatMoney, STATUS_LABELS, cleanError } from '../lib/format.mjs';
+import { filterModelsForConfiguredProviders } from '../lib/model-catalog.mjs';
 
 const api = (method, args) => window.nexus.invoke(method, args);
 
@@ -119,7 +120,7 @@ export default function ArenaView({ state, models, workspace, setWorkspace, proj
             ))}
           </div>
           <datalist id="arena-model-list">
-            {models.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+            {filterModelsForConfiguredProviders(models, state.settings, state.providerKeys).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
           </datalist>
 
           <textarea

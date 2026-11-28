@@ -1,4 +1,4 @@
-# NEXUS Architecture (`v1.4.0` Native Standalone — Zero Electron)
+# NEXUS Architecture (`v1.5.0` Native Standalone — Zero Electron)
 
 Desktop (`desktop/`) is the primary application and runs as a **standalone native Windows executable (`NEXUS.exe`)** powered by **.NET 10 + Microsoft WebView2** paired with a local **Node 24 ESM Core Engine** (`core/server.mjs`). No Electron or bundled Chromium is used.
 

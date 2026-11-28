@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client';
 import {
   Plus, Search, Settings2, Folder, FolderOpen, MessageSquare, BookOpen, ListTodo,
   Network, Plug, Swords, PanelLeft, Sun, Moon, Pin, Trash2, GitFork, RefreshCw, X,
-  ChevronRight, Globe, Clock, Sparkles, Brain, Pencil, History, Ghost, ShieldAlert
+  ChevronRight, Globe, Clock, Sparkles, Brain, Pencil, History, Ghost, ShieldAlert,
+  Loader2, CheckCircle2, PauseCircle, AlertCircle
 } from 'lucide-react';
 import { installNexusBridge } from './bridge.mjs';
 import './styles/tokens.css';
@@ -82,6 +83,7 @@ function App() {
   const [projectId, setProjectId] = useState('');
   const [workspace, setWorkspace] = useState('');
   const [query, setQuery] = useState('');
+  const [sessionFilter, setSessionFilter] = useState('all');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [models, setModels] = useState([]);
   const [balance, setBalance] = useState(null);
@@ -235,10 +237,18 @@ function App() {
   const currentProject = state.projects.find(p => p.id === projectId) || null;
   const activeWorkspace = task?.workspace || currentProject?.workspace || workspace;
   const activeProvider = detectProviderId(task?.model || s.model, s.customProviders);
-  const activeCount = state.tasks.filter(t => ['running', 'approval', 'queued'].includes(t.status)).length;
-  const visibleTasks = state.tasks
+  const isTaskActive = t => Boolean(t?.compacting || ['running', 'approval', 'queued'].includes(t?.status));
+  const activeCount = state.tasks.filter(isTaskActive).length;
+  const scopedTasks = state.tasks
     .filter(t => (!projectId || t.projectId === projectId) && (t.title + ' ' + t.prompt).toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
+  const scopedActiveCount = scopedTasks.filter(isTaskActive).length;
+  const scopedDoneCount = scopedTasks.filter(t => t.status === 'complete').length;
+  const visibleTasks = scopedTasks.filter(t => {
+    if (sessionFilter === 'active') return isTaskActive(t);
+    if (sessionFilter === 'done') return !isTaskActive(t);
+    return true;
+  });
 
   const openTask = id => { setSelected(id); setView('chat'); };
   const newChat = () => { setSelected(null); setView('chat'); };
@@ -334,8 +344,35 @@ function App() {
 
           <div className="side-section-head">
             <span>{currentProject?.name || 'Sessions'}</span>
-            <span className="tabular">{visibleTasks.length}</span>
+            <div className="row" style={{ gap: 5 }}>
+              {scopedActiveCount > 0 && (
+                <span className="session-live-counter tabular" title={`${scopedActiveCount} active session(s)`}>
+                  <i className="status-dot running" /> {scopedActiveCount} live
+                </span>
+              )}
+              <span className="tabular">{scopedTasks.length}</span>
+            </div>
           </div>
+          {scopedTasks.length > 0 && (
+            <div className="sidebar-status-filter" role="tablist" aria-label="Filter sessions by status">
+              {[
+                ['all', `All (${scopedTasks.length})`],
+                ['active', `Active (${scopedActiveCount})`],
+                ['done', `Done (${scopedDoneCount})`],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={sessionFilter === id}
+                  className={`sidebar-filter-btn ${sessionFilter === id ? 'active' : ''}`}
+                  onClick={() => setSessionFilter(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           {(() => {
             const byId = new Map(visibleTasks.map(t => [t.id, t]));
             const childrenOf = new Map();
@@ -348,15 +385,26 @@ function App() {
                 roots.push(t);
               }
             }
+            const statusMetaFor = t => {
+              if (t.compacting) return { state: 'running', label: 'Compact', Icon: Loader2, spin: true, tip: 'Compacting context…' };
+              if (t.status === 'running') return { state: 'running', label: 'Live', Icon: Loader2, spin: true, tip: t.liveActivity || 'Running…' };
+              if (t.status === 'approval') return { state: 'approval', label: 'Approve', Icon: ShieldAlert, spin: false, tip: 'Waiting for your approval' };
+              if (t.status === 'queued') return { state: 'queued', label: 'Queued', Icon: Clock, spin: false, tip: 'Queued to start' };
+              if (t.status === 'failed') return { state: 'failed', label: 'Error', Icon: AlertCircle, spin: false, tip: 'Stopped with an error' };
+              if (t.status === 'paused') return { state: 'paused', label: 'Paused', Icon: PauseCircle, spin: false, tip: 'Paused' };
+              return { state: 'complete', label: 'Done', Icon: CheckCircle2, spin: false, tip: 'Completed' };
+            };
             const renderTaskRow = (t, depth = 0) => {
               const kids = childrenOf.get(t.id) || [];
               const isRenamingHere = renaming?.id === t.id && renaming?.location === 'sidebar';
+              const meta = statusMetaFor(t);
+              const StatusIcon = meta.Icon;
               return (
                 <React.Fragment key={t.id}>
-                  <div className={`chat-item ${selected === t.id && view === 'chat' ? 'selected' : ''} ${depth > 0 ? 'nested-item' : ''}`} style={depth > 0 ? { marginLeft: Math.min(depth * 14, 28) } : undefined}>
+                  <div className={`chat-item state-${meta.state} ${selected === t.id && view === 'chat' ? 'selected' : ''} ${depth > 0 ? 'nested-item' : ''}`} style={depth > 0 ? { marginLeft: Math.min(depth * 14, 28) } : undefined}>
                     {isRenamingHere ? (
                       <div className="chat-item-main" style={{ paddingRight: 6 }}>
-                        <i className={`status-dot ${t.status}`} />
+                        <StatusIcon size={13} className={`session-status-icon ${meta.state} ${meta.spin ? 'spin' : ''}`} />
                         <input
                           aria-label="Rename session"
                           autoFocus
@@ -374,13 +422,20 @@ function App() {
                       </div>
                     ) : (
                       <>
-                        <button type="button" className="chat-item-main" onClick={() => openTask(t.id)} onDoubleClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }} title="Click to open · Double-click to rename">
-                          <i className={`status-dot ${t.status}`} />
-                          <span>{t.title}</span>
+                        <button
+                          type="button"
+                          className="chat-item-main"
+                          onClick={() => openTask(t.id)}
+                          onDoubleClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }}
+                          title={`${meta.tip} · Click to open · Double-click to rename`}
+                        >
+                          <StatusIcon size={13} className={`session-status-icon ${meta.state} ${meta.spin ? 'spin' : ''}`} />
+                          <span className="chat-item-title">{t.title}</span>
                           {t.ephemeral && <small className="tag-chip ram-tag" title="RAM-Only Ephemeral Session (zero disk traces)">RAM</small>}
                           {t.adminMode && <small className="tag-chip admin-tag" title="Windows Administrator Rights enabled">ADM</small>}
                           {kids.length > 0 && <small className="tag-chip tabular" style={{ fontSize: 9.5, padding: '0 5px' }}>{kids.length}</small>}
                           {t.pinned && <Pin size={11} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
+                          <small className={`session-state-pill ${meta.state}`}>{meta.label}</small>
                         </button>
                         <div className="chat-item-actions">
                           <button type="button" title="Rename session" aria-label="Rename session" onClick={e => { e.stopPropagation(); startRename(t, 'sidebar'); }}><Pencil size={11} /></button>
@@ -402,7 +457,11 @@ function App() {
             };
             return roots.map(r => renderTaskRow(r, 0));
           })()}
-          {!visibleTasks.length && <p className="hint" style={{ padding: '6px 10px' }}>Start a new chat or create a Project rooted in a folder.</p>}
+          {!visibleTasks.length && (
+            <p className="hint" style={{ padding: '6px 10px' }}>
+              {scopedTasks.length > 0 ? `No ${sessionFilter} sessions.` : 'Start a new chat or create a Project rooted in a folder.'}
+            </p>
+          )}
         </div>
 
         <div className="sidebar-footer">
@@ -418,7 +477,7 @@ function App() {
             <span>Changelog & Updates</span>
             {updateStatus?.updateAvailable
               ? <span className="nav-badge" style={{ background: 'var(--ok-bg)', color: 'var(--ok-fg)' }}>v{updateStatus.latestVersion}</span>
-              : <span className="nav-badge mono" style={{ opacity: 0.75 }}>v{updateStatus?.currentVersion || '1.4.0'}</span>}
+              : <span className="nav-badge mono" style={{ opacity: 0.75 }}>v{updateStatus?.currentVersion || '1.5.0'}</span>}
           </button>
           <button type="button" className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
             <Settings2 size={15} /><span>Settings & Config</span>

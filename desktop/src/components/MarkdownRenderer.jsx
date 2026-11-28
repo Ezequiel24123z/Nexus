@@ -173,9 +173,20 @@ function CodeBlock({ children }) {
   return <SyntaxCodeBlock rawCode={rawCode} rawLang={rawLang} />;
 }
 
+const SAFE_RASTER_DATA_IMAGE_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=\s]+$/i;
+
+export function safeMarkdownUrlTransform(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (SAFE_RASTER_DATA_IMAGE_RE.test(raw)) return raw;
+  if (/^(https?:|mailto:|tel:|#|\/)/i.test(raw)) return raw;
+  return '';
+}
+
 const plugins = [remarkGfm];
 const components = {
   a: ({ href, children }) => <ExternalLink href={href}>{children}</ExternalLink>,
+  img: ({ src, alt }) => src ? <img src={src} alt={alt || 'Image'} style={{ maxWidth: '100%', borderRadius: 8 }} loading="lazy" /> : null,
   p: ({ children }) => <p>{transformChildrenMath(children)}</p>,
   li: ({ children }) => <li>{transformChildrenMath(children)}</li>,
   table: ({ children }) => <div className="table-wrap" tabIndex={0} role="region" aria-label="Scrollable table"><table>{children}</table></div>,
@@ -187,7 +198,7 @@ const MarkdownBlock = React.memo(function MarkdownBlock({ text }) {
   if (trimmed.startsWith('$$') && trimmed.endsWith('$$') && trimmed.length > 4) {
     return <MathSpan expr={trimmed.slice(2, -2)} display />;
   }
-  return <ReactMarkdown remarkPlugins={plugins} components={components}>{String(text ?? '')}</ReactMarkdown>;
+  return <ReactMarkdown remarkPlugins={plugins} urlTransform={safeMarkdownUrlTransform} components={components}>{String(text ?? '')}</ReactMarkdown>;
 });
 
 export function splitMarkdownBlocks(markdown = '') {

@@ -9,6 +9,7 @@ export const STATUS_LABELS = {
 
 export const PROVIDER_META = {
   openrouter: { name: 'OpenRouter', key: 'OPENROUTER_API_KEY', defaultModel: 'deepseek/deepseek-v4.1-flash', effort: 'none', hint: 'Unified router across 300+ models with prompt caching, routing priority, and web search.' },
+  yeta: { name: 'Yeta Labs', key: 'YETA_API_KEY', defaultModel: 'yeta/deepseek-v4.1-flash-uncensored', effort: 'none', hint: 'Zero-data-retention DeepSeek V4.1 Flash (Uncensored & standard, 1M ctx, vision), GLM 5.3, Kimi K3.1, and image generation models.' },
   arliai: { name: 'Arli.ai', key: 'ARLIAI_API_KEY', defaultModel: 'arliai/DeepSeek-V4.1-Flash-1017', effort: 'max', hint: 'Dedicated uncensored/derestricted and high-context coding models.' },
   openai: { name: 'OpenAI', key: 'OPENAI_API_KEY', defaultModel: 'openai/gpt-5', effort: 'medium', hint: 'Direct OpenAI API for GPT-5, GPT-4.1, o3, and o4-mini.' },
   copilot: { name: 'GitHub Copilot', key: 'GITHUB_COPILOT_TOKEN', defaultModel: 'copilot/claude-sonnet-4.5', effort: 'medium', hint: 'GitHub Copilot with automatic OAuth token exchange via gh auth token.' },
@@ -25,6 +26,7 @@ export function detectProviderId(model = '', customProviders = []) {
   for (const cp of customProviders || []) {
     if (cp?.id && m.startsWith(cp.id + '/')) return cp.id;
   }
+  if (m.startsWith('yeta/')) return 'yeta';
   if (m.startsWith('arliai/')) return 'arliai';
   if (m.startsWith('openai/')) return 'openai';
   if (m.startsWith('copilot/')) return 'copilot';

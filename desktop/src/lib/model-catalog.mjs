@@ -101,3 +101,38 @@ export function classifyModel(model, customProviders = []) {
     quality,
   };
 }
+
+// Strict per-provider & per-enabled-models filter shared across Model Picker, Settings, Automations, and Arena.
+// Never mixes models from other providers (e.g. OpenRouter) into the active provider's menu.
+export function filterModelsForProvider(models = [], settings = {}, providerId = '', { activeModelId = '', includeAllOfProvider = false } = {}) {
+  const customProviders = settings?.customProviders || [];
+  const targetProvider = providerId || detectProviderId(activeModelId || settings?.model || '', customProviders);
+  const enabledList = Array.isArray(settings?.enabledModels?.[targetProvider]) ? settings.enabledModels[targetProvider] : [];
+  const enabledSet = new Set(enabledList);
+  const activeProv = activeModelId ? detectProviderId(activeModelId, customProviders) : '';
+
+  const providerModels = (models || []).filter(m => detectProviderId(m?.id, customProviders) === targetProvider);
+  if (includeAllOfProvider || enabledSet.size === 0) {
+    return providerModels;
+  }
+  return providerModels.filter(m => enabledSet.has(m.id) || (activeProv === targetProvider && m.id === activeModelId));
+}
+
+export function filterModelsForConfiguredProviders(models = [], settings = {}, providerKeys = {}) {
+  const customProviders = settings?.customProviders || [];
+  const activeProvider = detectProviderId(settings?.model || '', customProviders);
+  const configured = new Set([activeProvider]);
+  for (const [pid, ok] of Object.entries(providerKeys || {})) {
+    if (ok) configured.add(pid);
+  }
+  const out = [];
+  for (const pid of configured) {
+    out.push(...filterModelsForProvider(models, settings, pid, { activeModelId: settings?.model || '' }));
+  }
+  const seen = new Set();
+  return out.filter(m => {
+    if (!m?.id || seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+}

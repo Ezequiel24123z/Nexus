@@ -1,9 +1,23 @@
-# Status & Roadmap (`v1.4.0` Standalone Native Release)
+# Status & Roadmap (`v1.5.0` Standalone Native Release)
 
-Updated: November 27, 2026.
+Updated: November 28, 2026.
+
+## Implemented in NEXUS `v1.5.0`
+
+- **NEXUS App Self-Edit Protection, Full Self-Control (`nexus_control`) & Single-UAC Persistent Admin Worker (`core/nexus-control.mjs`, `core/runtime.mjs`, `core/coding-engine.mjs`)**:
+  - Hard runtime guardrail (`detectNexusSelfModification`) requiring explicit one-time user confirmation before modifying NEXUS installation/source files, internal state (`workspace.json`, `nexus.config.json`, `vault.*`), or stopping/restarting `NEXUS.exe` — enforced **even in Unrestricted mode** and immune to "Always Allow" / session auto-approve.
+  - Default cwd for workspace-less chats safely falls back away from the NEXUS install directory.
+  - New `nexus_control` core tool gives AI complete live feature documentation (`guide`), secret-safe full config/state introspection (`inspect`), and live control over settings, session modes, custom providers, per-provider enabled models, and tools without inspecting NEXUS source code.
+  - Persistent single-UAC `ElevatedAdminBroker` (authenticated `127.0.0.1` loopback worker spawning elevated child processes with cancel support) eliminates repeated Windows UAC prompts across commands in Admin-enabled sessions.
+- **Native Yeta Labs Provider, Strict Active-Provider / Enabled-Models Picker, Proactive Session Renaming, Clearer Sidebar Status, Copilot-Style Activity Feed & Core Efficiency**:
+  - Native first-class **Yeta Labs** provider (`yeta/`, live `/v1/models`, vision metadata, per-model `reasoning_effort` normalization) + safe raster `data:image/*` rendering in `MarkdownRenderer`.
+  - Model Picker (`ModelPickerPopover.jsx`), Settings, Automations, and Arena strictly scope models to the currently selected provider and its per-provider `enabledModels` list (preventing OpenRouter catalog bleed-through) with inline **Enabled** model curation.
+  - Proactive session renaming directives at Turn 1 and on topic/objective shifts (even when `globalInstructions` is customized) with parallel turn-1 rename execution.
+  - Upgraded left sidebar with distinct live/finished icons (`Loader2` spinner, `CheckCircle2`, `ShieldAlert`, `Clock`, `PauseCircle`, `AlertCircle`), status pills (`Live`/`Done`/`Approve`/`Paused`/`Error`), left accent rails, live count badge, and `All / Active / Done` filter strip.
+  - GitHub Copilot-style flat chronological activity feed (`ToolTimeline.jsx`, `ChatView.jsx`): borderless clickable rows (`Thought for 18s`, `View file`, `Edit file +N -N`, `>_ Run command` with inline preview, clean formatted output/diff drawers), real `reasoningDurationMs` tracking, and core efficiency optimizations (compact `workspace.json` events/effects keeping `journal.jsonl` lossless, 5s TTL workspace metadata cache, single-pass context estimation, and consecutive-failure thrashing nudge).
+  - Expanded `manage_privacy` with `verify` (live IP/VPN/proxy check), `apply_preset` (1-step privacy setup), `wireguard_select`/`remove`/`install`, `tor_install`, `wipe_browser`, and misconfiguration warnings; PII Scrubber restores local display paths for the user while keeping all outbound cloud payloads redacted.
 
 ## Implemented in NEXUS `v1.4.0`
-
 - **App-Scoped WireGuard VPN (`wireproxy`) & Double-Hop WireGuard → Tor (`core/wireguard-manager.mjs`, `core/tor-manager.mjs`)**: Zero-admin user-space WireGuard client (`127.0.0.1:9060`, Mullvad/IVPN/Proton/AirVPN `.conf` import encrypted in DPAPI vault) + `wireguard-tor` double-hop chaining so your ISP never sees Tor and the VPN never sees destinations.
 - **Reversible Outbound PII & Path Scrubber + Cache-Preserving 1-Click Stealth Mode (`core/pii-scrubber.mjs`)**: Redacts `C:\Users\<name>`, PC hostname, and custom sensitive strings from cloud LLM prompts (restored transparently on local tool execution), paired with 1-Click Stealth Mode that **preserves `promptCaching` and `cacheAffinity`**.
 - **Bidirectional RAM-Only ↔ Regular Sessions (`core/store.mjs`, `core/artifacts.mjs`, `manage_session`, `spawn_session`)**: Create RAM-Only zero-disk-trace sessions or nested sub-sessions, and live-migrate Regular ↔ RAM-Only anytime (purging disk traces immediately or materializing to disk on demand) either by user click or autonomously by the AI.

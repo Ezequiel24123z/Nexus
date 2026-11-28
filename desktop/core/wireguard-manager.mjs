@@ -286,7 +286,7 @@ export class WireGuardManager extends EventEmitter {
       try {
         await fsp.mkdir(this.installDir, { recursive: true });
         const metaRes = await request(WIREPROXY_RELEASE_API, {
-          headers: { 'User-Agent': 'NEXUS/1.4.0', Accept: 'application/vnd.github+json' },
+          headers: { 'User-Agent': 'NEXUS/1.5.0', Accept: 'application/vnd.github+json' },
           signal: AbortSignal.timeout(15000),
         });
         if (!metaRes.ok) throw new Error(`GitHub wireproxy release lookup failed (HTTP ${metaRes.status}).`);
@@ -301,7 +301,7 @@ export class WireGuardManager extends EventEmitter {
         this.emitStatus();
 
         const dl = await request(asset.browser_download_url, {
-          headers: { 'User-Agent': 'NEXUS/1.4.0' },
+          headers: { 'User-Agent': 'NEXUS/1.5.0' },
           signal: AbortSignal.timeout(90000),
         });
         if (!dl.ok) throw new Error(`wireproxy download failed (HTTP ${dl.status}).`);

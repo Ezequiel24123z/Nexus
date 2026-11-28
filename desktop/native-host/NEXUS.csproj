@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>NEXUS</AssemblyName>
     <Product>NEXUS Agent IDE</Product>
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <NoWarn>MSB3277</NoWarn>

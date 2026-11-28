@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { Store } from '../core/store.mjs';
-import { Runtime, assessActionRisk, reasoningToText } from '../core/runtime.mjs';
-import { completionRequest, resolveCopilotAuth, clearCopilotTokenCache } from '../core/providers.mjs';
+import { Store, compactEventDetail } from '../core/store.mjs';
+import { Runtime, assessActionRisk, reasoningToText, detectNexusSelfModification, NEXUS_APP_ROOT } from '../core/runtime.mjs';
+import { completionRequest, resolveCopilotAuth, clearCopilotTokenCache, modelConnection, allProviders } from '../core/providers.mjs';
 import { readCompletionStream, readAnthropicStream } from '../core/stream.mjs';
 import { executeTool } from '../core/tools.mjs';
 import { ConfigFileManager } from '../core/config-file.mjs';
@@ -25,11 +25,11 @@ import crypto from 'node:crypto';
 const execFileAsync = promisify(execFile);
 import { parseWireGuardConfig, buildWireproxyConfig, WireGuardManager } from '../core/wireguard-manager.mjs';
 import { PiiScrubber, isLocalModelEndpoint } from '../core/pii-scrubber.mjs';
-import { isProcessElevated, classifyMediaFile } from '../core/coding-engine.mjs';
+import { isProcessElevated, classifyMediaFile, ElevatedAdminBroker } from '../core/coding-engine.mjs';
 import { TorManager } from '../core/tor-manager.mjs';
 import net from 'node:net';
 import http from 'node:http';
-import { classifyModel } from '../src/lib/model-catalog.mjs';
+import { classifyModel, filterModelsForProvider, filterModelsForConfiguredProviders } from '../src/lib/model-catalog.mjs';
 import { parseSkillMarkdown, normalizeGithubRawUrl, discoverWorkspaceSkills, searchGithubSkills } from '../core/plugins.mjs';
 import { CURATED_NATIVE_PLUGINS } from '../core/gallery.mjs';
 import { requestTools } from '../core/model-request.mjs';
@@ -2013,6 +2013,379 @@ test('v1.4.0 audit hardening + real E2E GitHub self-update verification (SemVer 
   assert.equal(preservedCfg.globalInstructions, 'USER CUSTOM BASE PROMPT — DO NOT TOUCH');
   assert.equal(preservedCfg.customSystemPrompt, 'Always keep my custom persona.');
 });
+
+test('NEXUS self-edit protection blocks app/source/process mutations even in unrestricted mode, and approve cannot permanently bypass it', async t => {
+  const { dir, store, runtime, workspace } = await setup(t);
+  const taskId = runtime.create({ prompt: 'Do work', workspace, agentMode: 'unrestricted' });
+  const task = store.task(taskId);
+  task.sessionAutoApprove = true;
+
+  // Normal workspace write is allowed without approval in unrestricted mode
+  const okCheck = runtime.approvalCheck('write_file', task, { path: path.join(workspace, 'normal.txt') });
+  assert.equal(okCheck.required, false);
+
+  // Modifying NEXUS app files or internal state files ALWAYS requires criticalSelfEdit approval even in unrestricted + sessionAutoApprove!
+  const appFileCheck = runtime.approvalCheck('write_file', task, { path: path.join(NEXUS_APP_ROOT, 'core', 'providers.mjs') });
+  assert.equal(appFileCheck.required, true);
+  assert.equal(appFileCheck.criticalSelfEdit, true);
+
+  const dataFileCheck = runtime.approvalCheck('replace_text', task, { path: path.join(store.directory, 'workspace.json') });
+  assert.equal(dataFileCheck.required, true);
+  assert.equal(dataFileCheck.criticalSelfEdit, true);
+
+  // Killing or restarting NEXUS via shell is also blocked even in unrestricted mode
+  const killCheck = runtime.approvalCheck('run_command', task, { command: 'Stop-Process -Name NEXUS -Force' });
+  assert.equal(killCheck.required, true);
+  assert.equal(killCheck.criticalSelfEdit, true);
+
+  // Shell write referencing NEXUS install root is blocked, while read-only inspection is allowed
+  const shellWriteCheck = runtime.approvalCheck('run_command', task, { command: `Set-Content "${path.join(NEXUS_APP_ROOT, 'core', 'store.mjs')}" "hack"` });
+  assert.equal(shellWriteCheck.required, true);
+  assert.equal(shellWriteCheck.criticalSelfEdit, true);
+  const readCheck = runtime.approvalCheck('read_file', task, { path: path.join(NEXUS_APP_ROOT, 'package.json') });
+  assert.equal(readCheck.required, false);
+
+  // Attempting to pass allowSession / alwaysAllowPattern when approving a criticalSelfEdit MUST NOT grant persistent bypass
+  task.sessionAutoApprove = false;
+  const ctrl = new AbortController();
+  const pendingApproval = runtime.approval(task, 'write_file', { path: path.join(NEXUS_APP_ROOT, 'core', 'store.mjs') }, ctrl.signal, appFileCheck.reason, { criticalSelfEdit: true });
+  const snapApproval = runtime.snapshot().approvals[0];
+  assert.equal(snapApproval.criticalSelfEdit, true);
+  assert.equal(snapApproval.suggestedPattern, '');
+  runtime.approve(snapApproval.id, true, { allowSession: true, alwaysAllowPattern: 'write_file' });
+  assert.equal(await pendingApproval, true);
+  assert.equal(Boolean(task.sessionAutoApprove), false);
+  assert.deepEqual(store.state.settings.semiAutoAllowRules, []);
+  assert.equal(detectNexusSelfModification('manage_privacy', { action: 'stealth', enabled: true }, task).blocked, false);
+});
+
+test('proactive session renaming policy applies even with customized globalInstructions, and nexus_control provides full guide/inspect/config without reading source or leaking secrets', async t => {
+  const { store, runtime, workspace } = await setup(t);
+  const signal = new AbortController().signal;
+  runtime.getSecret = name => (name === 'YETA_API_KEY' ? 'yeta-super-secret-value-999' : null);
+  runtime.settings({
+    globalInstructions: 'My completely custom user system prompt.',
+    model: 'yeta/deepseek-v4.1-flash-uncensored',
+    lazyToolLoading: true,
+  });
+
+  // 1. Both nexus_control and manage_privacy are core tools even with lazyToolLoading
+  const lazyTools = requestTools(store.state.settings);
+  assert.ok(lazyTools.some(tl => tl.function?.name === 'nexus_control'));
+  assert.ok(lazyTools.some(tl => tl.function?.name === 'manage_privacy'));
+
+  // 2. Turn 1 auto-generated title gets strong proactive rename instruction even with custom globalInstructions
+  const id = runtime.create({ prompt: 'Investigate firewall rules and configure ssh keys', workspace, agentMode: 'semi-autopilot' });
+  const task = store.task(id);
+  assert.equal(task.titleCustomized, false);
+  const ctxBefore = runtime.buildContext(task, { hydrate: false })[0].content;
+  assert.match(ctxBefore, /Session Naming \(PROACTIVE — REQUIRED AT START\)/);
+  assert.match(ctxBefore, /App Integrity & Self-Knowledge Policy/);
+  assert.match(ctxBefore, /nexus_control\(action="guide"\)/);
+
+  // After renaming via manage_session, titleCustomized flips true and topic-shift rule activates
+  await executeTool(runtime, task, 'manage_session', { action: 'rename', title: 'SSH firewall setup' }, signal);
+  assert.equal(task.title, 'SSH firewall setup');
+  assert.equal(task.titleCustomized, true);
+  const ctxAfter = runtime.buildContext(task, { hydrate: false })[0].content;
+  assert.match(ctxAfter, /Current session title is "SSH firewall setup"/);
+  assert.match(ctxAfter, /meaningfully shifts/);
+
+  // 3. nexus_control guide & inspect work read-only (no approval required in semi-autopilot) and NEVER leak secrets
+  assert.equal(runtime.approvalCheck('nexus_control', task, { action: 'guide', topic: 'privacy' }).required, false);
+  assert.equal(runtime.approvalCheck('nexus_control', task, { action: 'inspect', section: 'all' }).required, false);
+  assert.equal(runtime.approvalCheck('nexus_control', task, { action: 'update_settings', settings: { silentToolSteps: true } }).required, true);
+
+  const guide = await executeTool(runtime, task, 'nexus_control', { action: 'guide', topic: 'providers' }, signal);
+  assert.ok(guide.guide.builtinProviders.some(p => p.id === 'yeta'));
+
+  const inspected = await executeTool(runtime, task, 'nexus_control', { action: 'inspect', section: 'all' }, signal);
+  assert.ok(!JSON.stringify(inspected).includes('yeta-super-secret-value-999'), 'Raw vault secrets must NEVER leak through nexus_control');
+  assert.equal(inspected.providers.find(p => p.id === 'yeta')?.keyConfigured, true);
+  assert.equal(inspected.activeProvider, 'yeta');
+
+  // 4. nexus_control live mutations: settings, session, custom providers, enabled models, and tools
+  await assert.rejects(
+    executeTool(runtime, task, 'nexus_control', { action: 'update_settings', settings: { globalInstructions: 'Overwrite attempt' } }, signal),
+    /Do not overwrite globalInstructions/
+  );
+  await executeTool(runtime, task, 'nexus_control', { action: 'update_settings', settings: { silentToolSteps: true, accentColor: '#38bdf8' } }, signal);
+  assert.equal(store.state.settings.silentToolSteps, true);
+  assert.equal(store.state.settings.accentColor, '#38bdf8');
+
+  await executeTool(runtime, task, 'nexus_control', { action: 'update_session', session: { adminMode: true, agentMode: 'autopilot', title: 'Updated via control' } }, signal);
+  assert.equal(task.adminMode, true);
+  assert.equal(task.agentMode, 'autopilot');
+  assert.equal(task.title, 'Updated via control');
+
+  await executeTool(runtime, task, 'nexus_control', {
+    action: 'manage_provider',
+    providerAction: 'set_enabled_models',
+    providerId: 'yeta',
+    models: ['yeta/deepseek-v4.1-flash-uncensored', 'yeta/glm-5.3-flash'],
+  }, signal);
+  assert.deepEqual(store.state.settings.enabledModels.yeta, ['yeta/deepseek-v4.1-flash-uncensored', 'yeta/glm-5.3-flash']);
+});
+
+test('expanded manage_privacy supports warnings, apply_preset, wireguard_select/remove, verify, and wipe_browser via mocks (no real VPN/Tor binaries)', async t => {
+  const { dir, store, runtime, workspace } = await setup(t);
+  const signal = new AbortController().signal;
+  const vault = new SecretVault(dir);
+  runtime.wireguard = new WireGuardManager(dir, { vault });
+  runtime.tor = new TorManager(dir);
+
+  let torStarted = false;
+  let wipedCount = 0;
+  runtime.privacyController = {
+    torStart: async () => { torStarted = true; return { running: true, bootstrapped: true }; },
+    torStop: async () => { torStarted = false; return { running: false }; },
+    wireguardStart: async () => ({ running: true }),
+    wireguardStartChainTor: async () => { torStarted = true; return { wireguard: { running: true }, tor: { running: true } }; },
+    wireguardStop: async () => ({ running: false }),
+    privacyStatus: async () => ({ ip: '198.51.100.42', isTor: torStarted, routing: store.state.settings.browserProxyMode }),
+    privacyProbes: async () => ({ vpn: { detected: false }, localProxies: [] }),
+    wipeBrowser: async () => ({ wiped: true, count: ++wipedCount }),
+  };
+
+  const task = store.task(runtime.create({ prompt: 'Configure full privacy', workspace, agentMode: 'autopilot' }));
+
+  // Misconfigured wireguard-tor surfaces clear warnings
+  runtime.settings({ browserProxyMode: 'wireguard-tor', wireguardActiveProfileId: '' });
+  const stWarn = await executeTool(runtime, task, 'manage_privacy', { action: 'status' }, signal);
+  assert.ok(stWarn.warnings.some(w => /no WireGuard \.conf profile/i.test(w)));
+
+  // apply_preset('maximum') activates stealth, PII, kill-switch, Managed Tor (since no WG profile), and RAM-Only
+  const presetRes = await executeTool(runtime, task, 'manage_privacy', { action: 'apply_preset', preset: 'maximum', sessionEphemeral: true }, signal);
+  assert.equal(presetRes.applied, true);
+  assert.equal(torStarted, true);
+  assert.equal(store.state.settings.stealthMode, true);
+  assert.equal(store.state.settings.torStrictFailClosed, true);
+  assert.equal(store.state.settings.privacyScrubPii, true);
+  assert.equal(task.ephemeral, true);
+
+  // verify is read-only and returns live mocked network check
+  assert.equal(runtime.approvalCheck('manage_privacy', task, { action: 'verify' }).required, false);
+  const verRes = await executeTool(runtime, task, 'manage_privacy', { action: 'verify' }, signal);
+  assert.equal(verRes.verified, true);
+  assert.equal(verRes.liveNetwork.ip, '198.51.100.42');
+
+  // Import, select, and remove WireGuard profiles + wipe_browser
+  const imp = await executeTool(runtime, task, 'manage_privacy', {
+    action: 'wireguard_import',
+    name: 'Test WG',
+    configText: '[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nAddress = 10.64.1.2/32\n[Peer]\nPublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\nEndpoint = 203.0.113.20:51820',
+  }, signal);
+  const sel = await executeTool(runtime, task, 'manage_privacy', { action: 'wireguard_select', name: 'Test WG' }, signal);
+  assert.equal(sel.selected, true);
+  assert.equal(store.state.settings.wireguardActiveProfileId, imp.profile.id);
+  const rm = await executeTool(runtime, task, 'manage_privacy', { action: 'wireguard_remove', profileId: imp.profile.id }, signal);
+  assert.equal(rm.removed, true);
+  assert.equal(store.state.settings.wireguardActiveProfileId, '');
+
+  const wipeRes = await executeTool(runtime, task, 'manage_privacy', { action: 'wipe_browser' }, signal);
+  assert.equal(wipeRes.wiped, true);
+  assert.equal(wipedCount, 1);
+
+  // apply_preset('off') cleanly restores direct routing and stops daemons
+  const offRes = await executeTool(runtime, task, 'manage_privacy', { action: 'apply_preset', preset: 'off', disablePii: true }, signal);
+  assert.equal(offRes.applied, true);
+  assert.equal(torStarted, false);
+  assert.equal(store.state.settings.browserProxyMode, 'direct');
+  assert.equal(store.state.settings.stealthMode, false);
+  assert.equal(store.state.settings.privacyScrubPii, false);
+});
+
+test('Yeta Labs native provider, model menu active-provider + enabledModels filtering, and PII local display restoration', async t => {
+  // 1. Yeta Labs provider resolution, effort mapping, and deduplication
+  assert.equal(modelConnection('yeta/deepseek-v4.1-flash-uncensored').id, 'yeta');
+  const yetaDs = completionRequest({
+    model: 'yeta/deepseek-v4.1-flash-uncensored',
+    messages: [{ role: 'user', content: 'Hi' }],
+    settings: { streaming: true, reasoningEffort: 'medium' },
+    apiKey: 'yeta-test',
+  });
+  assert.equal(yetaDs.body.reasoning_effort, 'high', 'DeepSeek on Yeta maps unsupported medium -> high');
+  assert.deepEqual(yetaDs.body.stream_options, { include_usage: true });
+  const yetaKimi = completionRequest({
+    model: 'yeta/kimi-k3.1-pro',
+    messages: [{ role: 'user', content: 'Hi' }],
+    settings: { streaming: true, reasoningEffort: 'none' },
+    apiKey: 'yeta-test',
+  });
+  assert.equal(yetaKimi.body.reasoning_effort, 'low', 'Kimi on Yeta maps none -> low');
+  const yetaImg = completionRequest({
+    model: 'yeta/gpt-image-2',
+    messages: [{ role: 'user', content: 'Draw' }],
+    settings: { streaming: false, reasoningEffort: 'high' },
+    apiKey: 'yeta-test',
+  });
+  assert.equal(yetaImg.body.reasoning_effort, undefined, 'Image models omit reasoning_effort');
+  const deduped = allProviders({ customProviders: [{ id: 'yeta', name: 'Dup Yeta', baseUrl: 'https://platform.yeta.ai/v1' }] });
+  assert.equal(deduped.filter(p => p.id === 'yeta').length, 1);
+
+  // 2. Model menu strictly filters to the selected provider and its enabled models (no OpenRouter bleed-through!)
+  const mixedCatalog = [
+    { id: 'deepseek/deepseek-v4.1-flash', name: 'OpenRouter · DeepSeek' },
+    { id: 'anthropic/claude-sonnet-4-5', name: 'Anthropic · Claude' },
+    { id: 'yeta/deepseek-v4.1-flash-uncensored', name: 'Yeta · DeepSeek Uncensored' },
+    { id: 'yeta/glm-5.3-flash', name: 'Yeta · GLM 5.3' },
+    { id: 'yeta/kimi-k3.1-pro', name: 'Yeta · Kimi K3.1' },
+  ];
+  const yetaOnlyAll = filterModelsForProvider(mixedCatalog, { model: 'yeta/deepseek-v4.1-flash-uncensored', enabledModels: {} }, 'yeta');
+  assert.deepEqual(yetaOnlyAll.map(m => m.id), ['yeta/deepseek-v4.1-flash-uncensored', 'yeta/glm-5.3-flash', 'yeta/kimi-k3.1-pro']);
+
+  const yetaOnlyEnabled = filterModelsForProvider(
+    mixedCatalog,
+    { model: 'yeta/deepseek-v4.1-flash-uncensored', enabledModels: { yeta: ['yeta/glm-5.3-flash'] } },
+    'yeta',
+    { activeModelId: 'yeta/deepseek-v4.1-flash-uncensored' }
+  );
+  assert.deepEqual(yetaOnlyEnabled.map(m => m.id), ['yeta/deepseek-v4.1-flash-uncensored', 'yeta/glm-5.3-flash']);
+
+  const configuredOnly = filterModelsForConfiguredProviders(
+    mixedCatalog,
+    { model: 'yeta/deepseek-v4.1-flash-uncensored', enabledModels: { yeta: ['yeta/deepseek-v4.1-flash-uncensored'] } },
+    { yeta: true, openrouter: false, anthropic: false }
+  );
+  assert.deepEqual(configuredOnly.map(m => m.id), ['yeta/deepseek-v4.1-flash-uncensored']);
+
+  // 3. PII Scrubber keeps outbound requests redacted while restoring tokens for local chat display
+  const { store, runtime, workspace } = await setup(t);
+  runtime.settings({ privacyScrubPii: true, privacyScrubCustomRules: ['RealClientName => [CLIENT]'] });
+  let outbound = '';
+  runtime.request = async (_url, opts) => {
+    outbound = String(opts.body || '');
+    return Response.json({
+      choices: [{ message: { role: 'assistant', content: 'Saved report for [CLIENT] in C:\\Users\\__NEXUS_USER__\\ok.txt' } }],
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+    });
+  };
+  const tid = runtime.create({ prompt: 'Prepare report for RealClientName', workspace, agentMode: 'autopilot' });
+  const tsk = store.task(tid);
+  await runtime.run(tsk, new AbortController().signal);
+  assert.ok(!outbound.includes('RealClientName'), 'Cloud request must never include PII');
+  assert.ok(tsk.conversation.at(-1).content.includes('RealClientName'), 'Local UI message restores user-readable value');
+  assert.ok(!tsk.conversation.at(-1).content.includes('__NEXUS_USER__'), 'Local UI message restores local home path');
+});
+
+test('ElevatedAdminBroker spawns elevated worker ONCE over loopback TCP, validates auth token, and reuses it across multiple commands', async t => {
+  let spawnCount = 0;
+  let badClientClosed = false;
+  const clients = [];
+
+  const broker = new ElevatedAdminBroker({
+    connectTimeoutMs: 5000,
+    spawnWorker: async ({ port, token }) => {
+      spawnCount++;
+      // First verify an unauthenticated rogue connection is immediately rejected
+      const rogue = net.connect({ host: '127.0.0.1', port });
+      clients.push(rogue);
+      rogue.on('connect', () => rogue.write(JSON.stringify({ type: 'hello', token: 'wrong-token', pid: 999 }) + '\n'));
+      rogue.on('close', () => { badClientClosed = true; });
+      await new Promise(r => setTimeout(r, 40));
+
+      // Now connect the real authenticated mock worker
+      const sock = net.connect({ host: '127.0.0.1', port });
+      clients.push(sock);
+      let buf = '';
+      sock.on('connect', () => {
+        sock.write(JSON.stringify({ type: 'hello', token, pid: process.pid, elevated: true }) + '\n');
+      });
+      sock.on('data', chunk => {
+        buf += chunk.toString('utf8');
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          if (msg.type === 'shutdown') { sock.end(); return; }
+          if (msg.type === 'exec') {
+            sock.write(JSON.stringify({ type: 'result', id: msg.id, exitCode: 0, output: `ELEVATED:${msg.cmd}` }) + '\n');
+          }
+        }
+      });
+    },
+  });
+  t.after(() => {
+    broker.stop();
+    for (const c of clients) try { c.destroy(); } catch {}
+  });
+
+  const r1 = await broker.exec('Get-Service sshd');
+  const r2 = await broker.exec('Get-NetFirewallRule');
+  const r3 = await broker.exec('whoami /groups');
+
+  assert.equal(spawnCount, 1, 'Worker must be spawned ONLY ONCE across multiple elevated commands');
+  assert.equal(badClientClosed, true, 'Unauthenticated loopback connections must be rejected');
+  assert.equal(r1.method, 'uac-session-broker');
+  assert.equal(r1.output, 'ELEVATED:Get-Service sshd');
+  assert.equal(r2.output, 'ELEVATED:Get-NetFirewallRule');
+  assert.equal(r3.output, 'ELEVATED:whoami /groups');
+  assert.equal(broker.isConnected(), true);
+  broker.stop();
+  assert.equal(broker.isConnected(), false);
+});
+
+test('runtime efficiency: workspace event compaction keeps journal.jsonl lossless, tracks reasoningDurationMs & command exitCode/preview, and warns on consecutive tool thrashing', async t => {
+  const { store, runtime, workspace } = await setup(t);
+
+  // 1. compactEventDetail shrinks large file writes in workspace.json while journal.jsonl preserves the full payload
+  const hugeContent = 'X'.repeat(4000);
+  const compacted = compactEventDetail('tool_intent', { name: 'write_file', args: { path: 'big.txt', content: hugeContent, reason: 'test' } });
+  assert.ok(compacted.args.content.length < 400);
+  assert.match(compacted.args.content, /full detail in journal\.jsonl/);
+  // invoke_connector args stay untouched so idempotent retries remain intact
+  const connKept = compactEventDetail('effect_intended', { tool: 'invoke_connector', args: { name: 'api', input: { body: hugeContent } } });
+  assert.equal(connKept.args.input.body.length, 4000);
+
+  // 2. Streaming reasoning records reasoningDurationMs and run_command records clean exitCode + output preview
+  let step = 0;
+  runtime.request = async () => {
+    step++;
+    if (step === 1) {
+      const sse = [
+        'data: ' + JSON.stringify({ choices: [{ delta: { reasoning: 'Checking files carefully.' } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'cmd-1', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'Write-Output "HELLO_CLEAN_OUT"', reason: 'Verify output' }) } }] }, finish_reason: 'tool_calls' }] }) + '\n\n',
+        'data: [DONE]\n\n',
+      ].join('');
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } });
+    }
+    return Response.json({
+      choices: [{ message: { role: 'assistant', content: 'Verified cleanly.' } }],
+      usage: { prompt_tokens: 40, completion_tokens: 10, total_tokens: 50 },
+    });
+  };
+  const tid = runtime.create({ prompt: 'Run quick check', workspace, agentMode: 'autopilot' });
+  const task = store.task(tid);
+  await runtime.run(task, new AbortController().signal);
+  assert.equal(task.status, 'complete');
+  const firstAssistant = task.conversation.find(m => m.role === 'assistant');
+  assert.equal(typeof firstAssistant.reasoningDurationMs, 'number');
+  assert.equal(firstAssistant.toolRuns[0].exitCode, 0);
+  assert.equal(firstAssistant.toolRuns[0].preview, 'HELLO_CLEAN_OUT');
+
+  // 3. Consecutive failing tool calls with varying arguments trigger thrashing loopWarning at 4 errors
+  let errStep = 0;
+  let lastToolMsg = '';
+  runtime.request = async (_url, opts) => {
+    errStep++;
+    const body = JSON.parse(opts.body);
+    const lastTool = [...body.messages].reverse().find(m => m.role === 'tool');
+    if (lastTool) lastToolMsg = String(lastTool.content || '');
+    if (errStep <= 4) {
+      return Response.json({
+        choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: `e-${errStep}`, type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path: `missing-${errStep}.txt` }) } }] } }],
+      });
+    }
+    return Response.json({ choices: [{ message: { role: 'assistant', content: 'Stopped after warning.' } }] });
+  };
+  const tid2 = runtime.create({ prompt: 'Read nonexistent files', workspace, agentMode: 'autopilot' });
+  await runtime.run(store.task(tid2), new AbortController().signal);
+  assert.match(lastToolMsg, /4 consecutive tool calls have failed/);
+});
+
+
 
 
 

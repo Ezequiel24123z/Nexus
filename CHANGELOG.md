@@ -2,6 +2,30 @@
 
 All notable changes to **NEXUS** are documented in this file.
 
+## [1.5.0] - 2026-11-28
+
+### Added
+- **NEXUS App Self-Edit Protection (`detectNexusSelfModification`, `runtime.mjs`, `ChatView.jsx`)**:
+  - Hard runtime guardrail blocking unauthorized edits, deletions, mutating Git operations, temporary scripts, or process kill/restart commands targeting the NEXUS installation folder, NEXUS source code, or protected internal state files (`workspace.json`, `nexus.config.json`, `vault.*`) — enforced **even in Unrestricted mode** and immune to `sessionAutoApprove` or "Always Allow" rules.
+  - Renders a distinct red **`NEXUS Self-Edit Protection`** approval card with one-time **Approve Once / Decline** confirmation only, while default workspace-less `cwd` safely falls back to the user home directory instead of the NEXUS install folder.
+- **Full App Introspection & Live Control Core Tool (`nexus_control`, `core/nexus-control.mjs`)**:
+  - Promoted into `CORE_TOOL_NAMES` so the AI can read a structured feature manual (`guide`), inspect redacted live configuration/providers/models/sessions/projects/privacy/tools/MCP/plugins/automations (`inspect`), and live-configure settings, session modes, custom providers, enabled models, tools, and custom slash commands without inspecting NEXUS source code or exposing vault secrets.
+- **Single-UAC Persistent Windows Admin Broker (`ElevatedAdminBroker`, `core/coding-engine.mjs`)**:
+  - Replaces repeated per-command Windows UAC (`RunAs`) dialogs in Admin-enabled sessions with a persistent authenticated `127.0.0.1` loopback elevated worker (256-bit constant-time token auth, parent-PID watchdog, clean per-command cancellation) shared by both `run_command` and `shell_session`.
+- **GitHub Copilot-Style Chronological Activity Feed (`ToolTimeline.jsx`, `ChatView.jsx`, `app.css`)**:
+  - Redesigned reasoning, tool calls, file reads/edits, and shell commands into a clean, borderless clickable vertical timeline (`Thought for 18s` with real tracked `reasoningDurationMs`, `View file`, `Edit file +N -N` with inline **Revert** and colored diff drawer, `>_ Command` with `$ cmd`, exit badge, and formatted terminal output).
+- **Native First-Class Yeta Labs Provider & Strict Active-Provider / Enabled-Models Picker (`core/providers.mjs`, `ModelPickerPopover.jsx`, `SettingsView.jsx`)**:
+  - Built-in **Yeta Labs** provider (`yeta/`, live `/v1/models`, vision metadata, per-model `reasoning_effort` normalization) + safe raster `data:image/(png|jpeg|webp|gif);base64,...` rendering in `MarkdownRenderer`.
+  - Model Picker, Settings, Automations, and Arena strictly filter to the currently selected provider and its configured `enabledModels` list (preventing OpenRouter catalog bleed-through), with inline **Enabled** curation in both the popover and Settings.
+- **Expanded AI Privacy Control & Proactive Session Renaming (`manage_privacy`, `manage_session`, `main.jsx`)**:
+  - Extended `manage_privacy` with `verify` (live IP/VPN/proxy check), 1-step `apply_preset` (`maximum`, `wireguard-tor`, `wireguard`, `tor`, `balanced`, `off`), `wireguard_select`/`remove`/`install`, `tor_install`, `set_wireguard_binary`, `wipe_browser`, and live misconfiguration warnings.
+  - Added strong Turn-1 and topic-shift session renaming directives (enforced even with customized `globalInstructions`) with parallel step-1 rename execution.
+  - Upgraded the left sidebar with unmistakable session status icons (`Loader2` spinner, `CheckCircle2`, `ShieldAlert`, `Clock`, `PauseCircle`, `AlertCircle`), status pills (`Live`/`Done`/`Approve`/`Paused`/`Error`), left accent rails, live count badge, and `All / Active / Done` filter tabs.
+
+### Improved & Fixed
+- **Core Runtime & Storage Efficiency (`core/store.mjs`, `core/runtime.mjs`)**: Compacted bulky `events`/`effects` payloads in `workspace.json` (preserving 100% lossless full payloads in `journal.jsonl`), added a 5 s TTL cache for workspace instructions/skills discovery, eliminated duplicate context estimation passes per step, and added a non-blocking consecutive-error thrashing nudge.
+- **Local PII Display Restoration**: When Outbound PII Scrubbing is active, outbound cloud requests remain 100% redacted while local streaming and saved chat messages transparently restore user-readable paths/hostnames instead of showing `__NEXUS_USER__` / `__NEXUS_HOST__`.
+
 ## [1.4.0] - 2026-11-27
 
 ### Added

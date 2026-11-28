@@ -89,7 +89,7 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         try
         {
-            HostLog.Write("host", "Launching NEXUS native host v1.4.0");
+            HostLog.Write("host", "Launching NEXUS native host v1.5.0");
             using var server = CoreProcess.Start(args);
             using var form = new NexusWindow(server, args);
             Application.Run(form);

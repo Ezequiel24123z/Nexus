@@ -4,7 +4,8 @@ import {
   Palette, Cpu, Sliders, FileJson, ShieldOff, Database, Globe, ShieldCheck, Archive, History
 } from 'lucide-react';
 import StoragePanel from '../StoragePanel.jsx';
-import { PROVIDER_META, AUTONOMY_LEVELS, normalizeAutonomyId, detectProviderId, formatMoney, cleanError } from '../lib/format.mjs';
+import { PROVIDER_META, AUTONOMY_LEVELS, normalizeAutonomyId, detectProviderId, providerLabel, formatMoney, cleanError } from '../lib/format.mjs';
+import { filterModelsForProvider } from '../lib/model-catalog.mjs';
 
 const api = (method, args) => window.nexus.invoke(method, args);
 
@@ -63,6 +64,7 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
   const [availableTools, setAvailableTools] = useState([]);
   const [newAllowRule, setNewAllowRule] = useState('');
   const [newDenyRule, setNewDenyRule] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
 
   useEffect(() => { setGlobalInstr(s.globalInstructions || ''); }, [s.globalInstructions]);
   useEffect(() => { setCustomAddendum(s.customSystemPrompt || ''); }, [s.customSystemPrompt]);
@@ -202,10 +204,76 @@ export default function SettingsView({ state, appearance, models, reloadModels, 
               {checkMsg && <p className="hint" style={{ color: 'var(--ok-fg)', marginTop: 8 }}><CheckCircle2 size={13} style={{ verticalAlign: 'middle', marginRight: 5 }} />{checkMsg}</p>}
 
               <label className="field" style={{ marginTop: 16 }}>
-                <span>Default Model ID</span>
+                <span>Default Model ID ({providerLabel(activeProvider, customProviders)})</span>
                 <input list="settings-models" value={s.model || ''} onChange={e => setSetting('model', e.target.value)} />
-                <datalist id="settings-models">{models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</datalist>
+                <datalist id="settings-models">
+                  {filterModelsForProvider(models, s, activeProvider, { activeModelId: s.model }).map(m => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </datalist>
               </label>
+
+              {(() => {
+                const providerAllModels = filterModelsForProvider(models, s, activeProvider, { includeAllOfProvider: true });
+                const enabledMap = s.enabledModels || {};
+                const enabledList = Array.isArray(enabledMap[activeProvider]) ? enabledMap[activeProvider] : [];
+                const q = modelSearch.trim().toLowerCase();
+                const visibleList = providerAllModels
+                  .filter(m => !q || (m.id + ' ' + (m.name || '')).toLowerCase().includes(q))
+                  .slice(0, 60);
+                const toggleModel = id => {
+                  const cur = enabledList.length ? new Set(enabledList) : new Set(providerAllModels.map(m => m.id));
+                  if (cur.has(id)) cur.delete(id);
+                  else cur.add(id);
+                  const nextMap = { ...enabledMap };
+                  if (cur.size === 0 || cur.size >= providerAllModels.length) delete nextMap[activeProvider];
+                  else nextMap[activeProvider] = [...cur];
+                  void setSetting('enabledModels', nextMap);
+                };
+                return (
+                  <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--border-subtle)' }}>
+                    <div className="row-between" style={{ marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                      <strong style={{ fontSize: 12.5 }}>
+                        Enabled Models in Picker · {providerLabel(activeProvider, customProviders)}{' '}
+                        <span className="hint tabular">({enabledList.length ? `${enabledList.length}/${providerAllModels.length}` : `All ${providerAllModels.length}`})</span>
+                      </strong>
+                      <div className="row" style={{ gap: 4 }}>
+                        <button type="button" className="btn-secondary" style={{ fontSize: 11, padding: '3px 7px' }} onClick={() => reloadModels()}>
+                          <RefreshCw size={11} /> Reload
+                        </button>
+                        {enabledList.length > 0 && (
+                          <button type="button" className="btn-secondary" style={{ fontSize: 11, padding: '3px 7px' }} onClick={() => {
+                            const nextMap = { ...enabledMap };
+                            delete nextMap[activeProvider];
+                            void setSetting('enabledModels', nextMap);
+                          }}>Enable All</button>
+                        )}
+                      </div>
+                    </div>
+                    <p className="hint" style={{ marginBottom: 8 }}>The composer model menu shows ONLY enabled models for the currently selected provider.</p>
+                    {providerAllModels.length > 8 && (
+                      <input
+                        placeholder={`Filter ${providerLabel(activeProvider, customProviders)} models…`}
+                        value={modelSearch}
+                        onChange={e => setModelSearch(e.target.value)}
+                        style={{ marginBottom: 8, padding: '5px 9px', fontSize: 12 }}
+                      />
+                    )}
+                    <div className="tool-toggle-grid" style={{ maxHeight: 220, overflowY: 'auto' }}>
+                      {visibleList.map(m => {
+                        const checked = enabledList.length === 0 || enabledList.includes(m.id);
+                        return (
+                          <label key={m.id} className={`tool-toggle-chip ${checked ? '' : 'disabled'}`} title={m.id}>
+                            <input type="checkbox" checked={checked} onChange={() => toggleModel(m.id)} />
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name || m.id}</span>
+                          </label>
+                        );
+                      })}
+                      {!visibleList.length && <span className="hint">No models loaded for this provider yet. Click Reload or Verify Connection.</span>}
+                    </div>
+                  </div>
+                );
+              })()}
             </section>
 
             <section className="panel-card">
