@@ -1,10 +1,10 @@
-# Release Validation (`v1.4.0` Standalone Native)
+# Release Validation (`v1.5.0` Standalone Native)
 
 Verified on Windows with Node.js (`.node-version` `24.12.0`) and `.NET 10 SDK` + Microsoft Edge WebView2 Runtime (CI runner `windows-latest` with `actions/setup-dotnet@v4`). Zero Electron dependencies.
 
 | Check | Result |
 | --- | --- |
-| Desktop: `npm test` | **236 unit & integration tests passed**, 0 failures (including real E2E ZIP + SHA-256 + PowerShell portable self-update verification) |
+| Desktop: `npm test` | **242 unit & integration tests passed**, 0 failures (covering `detectNexusSelfModification`, `nexus_control`, `ElevatedAdminBroker`, expanded `manage_privacy`, Yeta Labs + active-provider `enabledModels` filtering, local PII display restoration, compact workspace events, `reasoningDurationMs`, and real E2E ZIP + SHA-256 + PowerShell portable self-update verification) |
 | Desktop: `npm run build:ui` | Passed; Vite 8 code-split production build |
 | Desktop: `npm run build:native` | Passed locally on `.NET 10 SDK` — compiles standalone `desktop/release/NEXUS/NEXUS.exe` including `ConPtyHost.cs`, `NativeDesktop.cs`, upgraded `@eN`-ref `NativeBrowser.cs`, and `relaunchElevated` UAC support |
 | Desktop: `npm run dist:portable` | Packages self-contained `desktop/release/NEXUS-Portable/` (including `CHANGELOG.md`) and `desktop/release/NEXUS-Portable-Windows.zip` |

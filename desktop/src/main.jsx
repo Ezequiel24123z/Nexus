@@ -477,7 +477,7 @@ function App() {
             <span>Changelog & Updates</span>
             {updateStatus?.updateAvailable
               ? <span className="nav-badge" style={{ background: 'var(--ok-bg)', color: 'var(--ok-fg)' }}>v{updateStatus.latestVersion}</span>
-              : <span className="nav-badge mono" style={{ opacity: 0.75 }}>v{updateStatus?.currentVersion || '1.4.0'}</span>}
+              : <span className="nav-badge mono" style={{ opacity: 0.75 }}>v{updateStatus?.currentVersion || '1.5.0'}</span>}
           </button>
           <button type="button" className={`nav-btn ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
             <Settings2 size={15} /><span>Settings & Config</span>

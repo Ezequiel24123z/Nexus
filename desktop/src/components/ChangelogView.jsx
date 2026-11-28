@@ -99,7 +99,7 @@ export default function ChangelogView({ state, act, notify, updateStatus, onRefr
     }).filter(Boolean);
   }, [changelog, query, kindFilter]);
 
-  const currentVersion = updateStatus?.currentVersion || changelog?.releases?.[0]?.version || '1.4.0';
+  const currentVersion = updateStatus?.currentVersion || changelog?.releases?.[0]?.version || '1.5.0';
   const hasCustomPrompts = Boolean(s.globalInstructionsCustomized || (s.customSystemPrompt || '').trim());
 
   return (

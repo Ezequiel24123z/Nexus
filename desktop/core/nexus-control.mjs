@@ -202,8 +202,8 @@ export async function executeNexusControl(runtime, currentTask, args = {}, { app
 
     const hostInfo = {
       version: appVersion || (() => {
-        try { return JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8')).version || '1.4.0'; }
-        catch { return '1.4.0'; }
+        try { return JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8')).version || '1.5.0'; }
+        catch { return '1.5.0'; }
       })(),
       platform: process.platform,
       arch: process.arch,

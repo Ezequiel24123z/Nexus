@@ -1,4 +1,4 @@
-# NEXUS Desktop (`v1.4.0`) — Standalone Native Agentic Workstation
+# NEXUS Desktop (`v1.5.0`) — Standalone Native Agentic Workstation
 
 NEXUS is a local-first standalone native Windows application for autonomous agentic coding, integrated private browsing, and unrestricted personal environment control — built with **.NET 10 + Microsoft WebView2 (Zero Electron)** and a decoupled **Node 24 ESM Core Engine**.
 

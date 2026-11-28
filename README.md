@@ -1,6 +1,6 @@
 # NEXUS — Standalone Native Agentic Coding, Private Browser & Personal Operator Workstation
 
-**NEXUS (`v1.4.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
+**NEXUS (`v1.5.0`)** is an open, local-first **Standalone Native Windows Agentic Workstation** built with **.NET 10 + Microsoft WebView2 (Zero Electron)**, a decoupled **Node 24 ESM Core Engine**, and a modular **React 19 + Vite 8 Studio UI**.
 
 Designed for maximum personal autonomy and hackability, NEXUS imposes **zero client-side content filters or artificial generation caps**—delegating content policy solely to the model provider you choose while granting full, auditable power over your local Windows environment, codebase, Win32 ConPTY terminal, Git repositories, integrated browser, REST APIs, dynamic JS plugins, and Model Context Protocol (MCP) servers.
 
@@ -8,7 +8,7 @@ Designed for maximum personal autonomy and hackability, NEXUS imposes **zero cli
 
 ---
 
-## Key Capabilities (`v1.4.0`)
+## Key Capabilities (`v1.5.0`)
 
 ### 1. Native Windows Architecture (Zero Electron)
 - **Standalone Native Host (`desktop/native-host/`)**: C# / .NET 10 WinForms + official Windows `Microsoft.Web.WebView2` runtime (no Electron, no bundled Chromium). Includes native Win11 dark titlebar (`DWMWA`), System Tray, global summon hotkey (`Ctrl+Shift+Space`), single-instance lock, crash watchdogs (`host.log` / `core.log`), WebView2 auto-recovery, and Core daemon auto-restart.
@@ -16,21 +16,24 @@ Designed for maximum personal autonomy and hackability, NEXUS imposes **zero cli
 - **Headless Native WebView2 JS Rendering & DOM Automation (`NativeBrowser.cs`)**: `browser_inspect` executes real JavaScript inside Edge WebView2 (`renderJs: true`), waits for selectors (`waitForSelector`), runs scripted DOM actions (`click`, `type`, `select`, `scroll`, `wait`, `eval`), optionally reuses Account Mode cookies, captures rendered page screenshots, and uses standard Edge/Chrome browser headers across web tools (configurable via `webUserAgent`).
 - **Decoupled Core Engine (`desktop/core/server.mjs`)**: Zero-dependency Node 24 HTTP + SSE daemon with loopback-only CORS, constant-time token auth, live-reloading `nexus.config.json`, Windows DPAPI secret vault (stdin-piped, rotating backups), and standalone Web (`npm run start:web`) or Headless API (`npm run start:headless`) modes.
 
-### 2. Multi-Provider Model Engine (10 Built-In + Unlimited Custom Profiles)
-Switch globally or per chat across **10 built-in providers** plus **unlimited user-defined Custom Provider Profiles** (OpenAI or Anthropic wire format):
+### 2. Multi-Provider Model Engine (11 Built-In + Unlimited Custom Profiles)
+Switch globally or per chat across **11 built-in providers** plus **unlimited user-defined Custom Provider Profiles** (OpenAI or Anthropic wire format):
 - **OpenRouter** (`owner/model`) — 300+ models, ephemeral prompt caching breakpoints for Claude/Gemini, routing priority (`Auto`/`Cheapest`/`Fastest`/`Lowest Latency`), upstream provider pinning, session cache affinity, and native server web search.
+- **Yeta Labs** (`yeta/<model>`) — Zero-data-retention DeepSeek V4.1 Flash (Uncensored & standard, 1M context, vision), GLM 5.3 Flash, Kimi K3.1 Pro, and inline image generation models (`GPT-Image-2`, `Seedream 5.5`) with per-model `reasoning_effort` normalization.
 - **Arli.ai** (`arliai/<model>`) — High-context coding (`DeepSeek-V4.1-Flash-1017`) and derestricted models (`GLM-4.6-Derestricted-v5`).
 - **OpenAI Direct** (`openai/<model>`) — `gpt-5`, `gpt-5-mini`, `gpt-4.1`, `o3`, `o4-mini` with `reasoning_effort`, `prompt_cache_key`, and streaming usage telemetry.
 - **Anthropic Direct** (`anthropic/<model>`) — Native `/v1/messages` + SSE streaming, prompt caching breakpoints, and extended thinking (`thinking` budget).
 - **GitHub Copilot** (`copilot/<model>`) — Automatic OAuth → short-lived Copilot session token exchange with **1-click import** from `gh auth token` or local Copilot config.
 - **DeepSeek Direct** (`deepseek-direct/<model>`), **Google Gemini** (`gemini/<model>`), **xAI Grok** (`xai/<model>`), **Groq** (`groq/<model>`), and **Custom / Local** (`custom/<model>` for Ollama, LM Studio, vLLM, llama.cpp with no API key required).
-- **Copilot-Style Model Picker Popover**: Filter by freedom/restriction tier, capabilities (`Frontier`, `Coding`, `Reasoning`, `Fast`, `Vision`, `200K+ Ctx`, `Budget/Free`), inline reasoning effort, context ceiling, and raw generation overrides (`temperature`, `topP`, `seed`, `extraBody`, `extraHeaders`).
+- **Active-Provider Model Picker Popover**: Strictly scoped to the selected provider and its per-provider **Enabled Models** curation (never dumping OpenRouter when another provider is active), with freedom/restriction filters, capability tags, inline reasoning effort, context ceiling, and raw generation overrides (`temperature`, `topP`, `seed`, `extraBody`, `extraHeaders`).
 
-### 3. 4-Tier Autonomy Levels, Granular Rules & Slash Commands
+### 3. 4-Tier Autonomy Levels, Self-Edit Protection, Single-UAC Admin & `nexus_control`
 - **Interactive** — Confirm every modifying or external tool action.
 - **Semi-Autopilot** — Auto-runs read-only tools and safe workspace edits; prompts with exact risk reason on destructive shell commands, deletions, outside-workspace writes, `git push`/`commit`, or external HTTP mutations, backed by editable **Allow/Deny Rules** (`tool:substring` or `/regex/i`) and 1-click **Always Allow**.
 - **Autopilot** — Executes engineering tasks autonomously end-to-end.
-- **Unrestricted** — Zero local path confinement and zero approval prompts across the host machine.
+- **Unrestricted** — Zero local path confinement and zero routine approval prompts across the host machine, while **NEXUS Self-Edit Protection** still requires explicit one-time user confirmation before modifying NEXUS's own installation, source code, internal state files, or terminating/restarting `NEXUS.exe`.
+- **Single-UAC Persistent Admin Worker (`ElevatedAdminBroker`)**: Per-session Windows Administrator rights prompt Windows UAC **once** and reuse an authenticated loopback elevated worker across all subsequent `run_command` and `shell_session` calls.
+- **Full App Introspection & Control (`nexus_control`)**: Core tool letting the AI read a live feature guide, inspect redacted state/settings, and adjust modes, providers, enabled models, privacy presets, or tools without reading NEXUS source files.
 - **10 Built-in Slash Commands** (`/compact`, `/init`, `/review`, `/architect`, `/diagnostics`, `/explain`, `/fix`, `/test`, `/mcp-create`, `/self-improve`) plus custom user-defined slash commands in `nexus.config.json`.
 
 ### 4. 63 Built-In Agentic Tools & Smart Lazy Toolsets
