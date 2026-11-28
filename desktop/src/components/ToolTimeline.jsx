@@ -1,80 +1,180 @@
 import React, { useState } from 'react';
 import {
-  CheckCircle2, XCircle, Loader2, Slash, ChevronRight, ChevronDown,
-  RotateCcw, Terminal, FileEdit, Search, GitBranch, Globe, Cpu, Layers, Clock
+  XCircle, Loader2, Slash, ChevronRight, ChevronDown,
+  RotateCcw, Terminal, FileText, FilePenLine, FilePlus2, FileMinus2,
+  Search, Folder, GitBranch, Globe, Cpu, Layers, Clock, Shield,
+  SlidersHorizontal, Bookmark, ListChecks, Pencil, Image, Monitor, Wrench
 } from 'lucide-react';
 import { formatDuration, prettyJson } from '../lib/format.mjs';
 
-function pickToolIcon(name = '') {
-  if (name.includes('command') || name.includes('shell') || name.includes('process')) return Terminal;
-  if (name.includes('write') || name.includes('edit') || name.includes('patch') || name.includes('delete') || name.includes('move')) return FileEdit;
-  if (name.includes('grep') || name.includes('glob') || name.includes('search') || name.includes('read') || name.includes('outline') || name.includes('tree')) return Search;
-  if (name.includes('git')) return GitBranch;
-  if (name.includes('web') || name.includes('http') || name.includes('browser') || name.includes('connector')) return Globe;
-  if (name.includes('subagent')) return Cpu;
-  if (name.includes('automation')) return Clock;
-  return Layers;
+function shortFileName(p = '') {
+  const clean = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const parts = clean.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : clean;
 }
 
 function shortPath(p = '') {
-  const clean = String(p || '').replace(/\\/g, '/');
+  const clean = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
   const parts = clean.split('/').filter(Boolean);
   return parts.length <= 2 ? clean : parts.slice(-2).join('/');
 }
 
-export function describeToolAction(name = '', args = {}, running = false) {
+function pickToolIcon(name = '', tool = null) {
+  if (name === 'run_command' || name === 'shell_session' || name === 'manage_process') return Terminal;
+  if (name === 'write_file') return tool?.hasBackup ? FilePenLine : FilePlus2;
+  if (name === 'replace_text' || name === 'multi_edit' || name === 'apply_patch' || name === 'move_file') return FilePenLine;
+  if (name === 'delete_file') return FileMinus2;
+  if (name === 'read_file' || name === 'batch_read_files' || name === 'code_outline' || name === 'read_artifact' || name === 'read_checkpoint' || name === 'read_attachment') return FileText;
+  if (name === 'list_files' || name === 'dir_tree' || name === 'glob_files') return Folder;
+  if (name === 'grep_search' || name === 'search_files' || name === 'search_journal' || name === 'search_history') return Search;
+  if (name === 'git_operation') return GitBranch;
+  if (name === 'web_search' || name === 'web_fetch' || name === 'browser_inspect' || name === 'http_request' || name === 'invoke_connector') return Globe;
+  if (name === 'manage_privacy') return Shield;
+  if (name === 'nexus_control') return SlidersHorizontal;
+  if (name === 'manage_session') return Pencil;
+  if (name === 'memory_store') return Bookmark;
+  if (name === 'todo_write' || name === 'todo_read') return ListChecks;
+  if (name === 'present_media') return Image;
+  if (name.startsWith('desktop_')) return Monitor;
+  if (name === 'delegate_subagent' || name === 'spawn_session' || name === 'send_session_message' || name === 'read_session' || name === 'list_sessions') return Cpu;
+  if (name === 'manage_automation') return Clock;
+  if (name === 'create_dynamic_tool' || name === 'scaffold_mcp_server' || name === 'load_toolset') return Wrench;
+  return Layers;
+}
+
+export function describeToolAction(name = '', args = {}, running = false, tool = null) {
   const a = args && typeof args === 'object' ? args : {};
-  const verb = (past, ing) => (running ? ing : past);
   switch (name) {
-    case 'read_file': return { label: verb('Read', 'Reading'), detail: a.path ? `${shortPath(a.path)}${a.startLine ? `:${a.startLine}-${a.endLine || ''}` : ''}` : '' };
-    case 'batch_read_files': return { label: verb(`Read ${a.files?.length || ''} files`.trim(), 'Reading files'), detail: Array.isArray(a.files) ? a.files.map(f => shortPath(f.path)).slice(0, 3).join(', ') : '' };
-    case 'write_file': return { label: verb('Wrote', 'Writing'), detail: shortPath(a.path) };
+    case 'read_file': {
+      const range = a.startLine ? `lines ${a.startLine}–${a.endLine || 'EOF'}` : '';
+      return { label: `View ${shortFileName(a.path) || 'file'}`, detail: range, monoDetail: false };
+    }
+    case 'batch_read_files': {
+      const count = Array.isArray(a.files) ? a.files.length : 0;
+      const names = Array.isArray(a.files) ? a.files.map(f => shortFileName(f.path)).slice(0, 3).join(', ') : '';
+      return { label: `View ${count || ''} files`.trim(), detail: names, monoDetail: false };
+    }
+    case 'write_file': {
+      const verb = tool?.hasBackup ? 'Edit' : 'Create';
+      return { label: `${verb} ${shortFileName(a.path) || 'file'}`, detail: '', monoDetail: false };
+    }
     case 'replace_text':
     case 'multi_edit':
-    case 'apply_patch': return { label: verb('Edited', 'Editing'), detail: shortPath(a.path) };
-    case 'delete_file': return { label: verb('Deleted', 'Deleting'), detail: shortPath(a.path) };
-    case 'move_file': return { label: verb('Moved', 'Moving'), detail: a.from && a.to ? `${shortPath(a.from)} → ${shortPath(a.to)}` : '' };
+    case 'apply_patch':
+      return { label: `Edit ${shortFileName(a.path) || 'file'}`, detail: '', monoDetail: false };
+    case 'delete_file':
+      return { label: `Delete ${shortFileName(a.path) || 'file'}`, detail: '', monoDetail: false };
+    case 'move_file':
+      return { label: `Move ${shortFileName(a.from) || 'file'}`, detail: a.to ? `→ ${shortPath(a.to)}` : '', monoDetail: true };
     case 'list_files':
-    case 'dir_tree': return { label: verb('Explored', 'Exploring'), detail: a.path ? shortPath(a.path) : '.' };
-    case 'glob_files': return { label: verb('Found files', 'Finding files'), detail: String(a.pattern || '') };
+    case 'dir_tree':
+      return { label: `List ${a.path ? shortPath(a.path) : 'workspace'}`, detail: '', monoDetail: false };
+    case 'glob_files':
+      return { label: 'Find files', detail: String(a.pattern || ''), monoDetail: true };
     case 'grep_search':
-    case 'search_files': return { label: verb('Searched', 'Searching'), detail: a.query ? `"${String(a.query).slice(0, 50)}"${a.glob ? ` in ${a.glob}` : ''}` : '' };
-    case 'code_outline': return { label: verb('Outlined', 'Outlining'), detail: shortPath(a.path || '.') };
-    case 'run_diagnostics': return { label: verb('Checked diagnostics', 'Checking diagnostics'), detail: shortPath(a.path || '.') };
+    case 'search_files':
+      return { label: a.query ? `Search "${String(a.query).slice(0, 44)}"` : 'Search files', detail: a.glob || (a.path ? shortPath(a.path) : ''), monoDetail: true };
+    case 'code_outline':
+      return { label: `Outline ${shortFileName(a.path || '.')}`, detail: '', monoDetail: false };
+    case 'run_diagnostics':
+      return { label: 'Check diagnostics', detail: a.path ? shortPath(a.path) : '', monoDetail: true };
     case 'run_command':
-    case 'shell_session': return { label: verb('Ran command', 'Running command'), detail: String(a.reason || a.command || '').replace(/\s+/g, ' ').slice(0, 72) };
-    case 'manage_process': return { label: verb(`Process ${a.action || ''}`.trim(), `Process ${a.action || ''}`.trim()), detail: String(a.label || a.command || a.id || '').slice(0, 60) };
-    case 'git_operation': return { label: `Git ${a.operation || ''}`.trim(), detail: String(a.branch || a.target || a.message || '').slice(0, 60) };
-    case 'web_search': return { label: verb('Searched web', 'Searching web'), detail: a.query ? `"${String(a.query).slice(0, 60)}"` : '' };
+    case 'shell_session': {
+      const cmdOneLine = String(a.command || '').replace(/\s+/g, ' ').trim();
+      const reason = String(a.reason || '').trim();
+      return {
+        label: reason || (cmdOneLine.slice(0, 56) || 'Run shell command'),
+        detail: reason ? cmdOneLine.slice(0, 96) : '',
+        monoDetail: true,
+      };
+    }
+    case 'manage_process':
+      return { label: `Process ${a.action || ''}`.trim(), detail: String(a.label || a.command || a.id || '').slice(0, 64), monoDetail: true };
+    case 'git_operation':
+      return { label: `Git ${a.operation || ''}`.trim(), detail: String(a.branch || a.target || a.message || '').slice(0, 64), monoDetail: true };
+    case 'web_search':
+      return { label: 'Search web', detail: a.query ? `"${String(a.query).slice(0, 64)}"` : '', monoDetail: false };
     case 'web_fetch':
     case 'browser_inspect': {
       let host = String(a.url || '');
-      try { host = new URL(host).hostname + new URL(host).pathname.slice(0, 30); } catch {}
-      return { label: verb('Fetched', 'Fetching'), detail: host };
+      try { const u = new URL(host); host = u.hostname + (u.pathname && u.pathname !== '/' ? u.pathname.slice(0, 28) : ''); } catch {}
+      return { label: name === 'browser_inspect' ? 'Inspect page' : 'Fetch page', detail: host, monoDetail: true };
     }
     case 'http_request': {
       let host = String(a.url || '');
       try { host = new URL(host).hostname; } catch {}
-      return { label: `HTTP ${(a.method || 'GET').toUpperCase()}`, detail: host };
+      return { label: `HTTP ${(a.method || 'GET').toUpperCase()}`, detail: host, monoDetail: true };
     }
-    case 'load_toolset': return { label: verb('Loaded tools', 'Loading tools'), detail: Array.isArray(a.toolsets) ? a.toolsets.join(', ') : '' };
-    case 'desktop_screenshot': return { label: verb('Captured screen', 'Capturing screen'), detail: '' };
-    case 'desktop_action': return { label: `Desktop ${a.action || ''}`.trim(), detail: a.text ? `"${String(a.text).slice(0, 32)}"` : (a.x != null ? `${a.x}, ${a.y}` : '') };
-    case 'spawn_session': return { label: verb('Spawned session', 'Spawning session'), detail: String(a.title || a.prompt || '').slice(0, 60) };
-    case 'read_session': return { label: verb('Read session', 'Waiting on session'), detail: String(a.sessionId || '').slice(0, 8) };
-    case 'send_session_message': return { label: verb('Messaged session', 'Messaging session'), detail: String(a.message || '').slice(0, 55) };
-    case 'list_sessions': return { label: verb('Listed sessions', 'Listing sessions'), detail: '' };
-    case 'delegate_subagent': return { label: verb('Delegated sub-agent', 'Running sub-agent'), detail: String(a.objective || '').slice(0, 60) };
-    case 'todo_write': return { label: verb('Updated plan', 'Updating plan'), detail: Array.isArray(a.todos) ? `${a.todos.filter(t => t.status === 'completed').length}/${a.todos.length} done` : '' };
-    case 'document_progress': return { label: verb('Documented progress', 'Documenting progress'), detail: '' };
-    case 'memory_store': return { label: `Memory ${a.action || ''}`.trim(), detail: String(a.key || '') };
-    case 'scaffold_mcp_server': return { label: verb('Scaffolded MCP', 'Scaffolding MCP'), detail: String(a.name || '') };
-    case 'create_dynamic_tool': return { label: verb('Created tool', 'Creating tool'), detail: String(a.name || '') };
-    case 'invoke_mcp': return { label: verb('Called MCP', 'Calling MCP'), detail: `${a.server || ''}:${a.tool || ''}` };
-    case 'invoke_connector': return { label: verb('Called connector', 'Calling connector'), detail: String(a.name || '') };
-    case 'system_info': return { label: verb('Checked system', 'Checking system'), detail: '' };
-    default: return { label: name.replaceAll('_', ' '), detail: summarizeArgs(name, a) };
+    case 'manage_session': {
+      const act = String(a.action || 'info');
+      if (act === 'rename') return { label: 'Rename session', detail: a.title ? `"${a.title}"` : '', monoDetail: false };
+      if (act === 'set_ephemeral') return { label: a.ephemeral ? 'Switch to RAM-Only' : 'Switch to Persistent', detail: '', monoDetail: false };
+      return { label: `Session ${act.replaceAll('_', ' ')}`, detail: String(a.projectName || a.workspace || '').slice(0, 50), monoDetail: false };
+    }
+    case 'manage_project':
+      return { label: `Project ${a.action || 'list'}`, detail: String(a.name || a.newName || '').slice(0, 50), monoDetail: false };
+    case 'manage_privacy': {
+      const act = String(a.action || 'status').replaceAll('_', ' ');
+      return { label: `Privacy ${act}`, detail: String(a.preset || a.mode || a.provider || (a.enabled !== undefined ? (a.enabled ? 'on' : 'off') : '')), monoDetail: true };
+    }
+    case 'nexus_control': {
+      const act = String(a.action || 'inspect');
+      const lbl = act === 'guide' ? 'Read NEXUS guide' : act === 'inspect' ? 'Inspect NEXUS' : act === 'update_settings' ? 'Update NEXUS settings' : act === 'update_session' ? 'Update session state' : act === 'manage_provider' ? `Provider ${a.providerAction || ''}`.trim() : `Tools ${a.toolAction || ''}`.trim();
+      const det = String(a.topic || a.section || a.providerId || a.provider || (a.settings ? Object.keys(a.settings).slice(0, 3).join(', ') : '') || '').slice(0, 60);
+      return { label: lbl, detail: det, monoDetail: true };
+    }
+    case 'present_media':
+      return { label: 'Show inline media', detail: shortFileName(a.path || a.items?.[0]?.path || a.title || ''), monoDetail: false };
+    case 'load_toolset':
+      return { label: 'Load toolset', detail: Array.isArray(a.toolsets) ? a.toolsets.join(', ') : '', monoDetail: true };
+    case 'desktop_windows':
+      return { label: 'List desktop windows', detail: '', monoDetail: false };
+    case 'desktop_ui_tree':
+      return { label: 'Inspect UI tree', detail: String(a.windowTitle || a.query || '').slice(0, 48), monoDetail: false };
+    case 'desktop_screenshot':
+      return { label: 'Capture screen', detail: String(a.windowTitle || (a.monitor != null ? `monitor ${a.monitor}` : '')), monoDetail: false };
+    case 'desktop_action':
+      return { label: `Desktop ${a.action || ''}`.trim(), detail: a.text ? `"${String(a.text).slice(0, 32)}"` : (a.x != null ? `${a.x}, ${a.y}` : ''), monoDetail: true };
+    case 'spawn_session':
+      return { label: 'Spawn child session', detail: String(a.title || a.prompt || '').slice(0, 56), monoDetail: false };
+    case 'read_session':
+      return { label: a.wait ? 'Wait on session' : 'Read session', detail: String(a.sessionId || '').slice(0, 8), monoDetail: true };
+    case 'send_session_message':
+      return { label: 'Message session', detail: String(a.message || '').slice(0, 56), monoDetail: false };
+    case 'list_sessions':
+      return { label: 'List sessions', detail: '', monoDetail: false };
+    case 'delegate_subagent':
+      return { label: 'Delegate sub-agent', detail: String(a.objective || '').slice(0, 56), monoDetail: false };
+    case 'todo_write':
+      return { label: 'Update plan', detail: Array.isArray(a.todos) ? `${a.todos.filter(t => t.status === 'completed').length}/${a.todos.length} done` : '', monoDetail: false };
+    case 'todo_read':
+      return { label: 'Check plan', detail: '', monoDetail: false };
+    case 'document_progress':
+      return { label: 'Document progress', detail: '', monoDetail: false };
+    case 'memory_store':
+      return { label: `Memory ${a.action || ''}`.trim(), detail: String(a.key || a.query || '').slice(0, 50), monoDetail: false };
+    case 'scaffold_mcp_server':
+      return { label: 'Create MCP server', detail: String(a.name || ''), monoDetail: true };
+    case 'create_dynamic_tool':
+      return { label: 'Create dynamic tool', detail: String(a.name || ''), monoDetail: true };
+    case 'invoke_mcp':
+      return { label: 'Call MCP tool', detail: `${a.server || ''}:${a.tool || ''}`, monoDetail: true };
+    case 'invoke_connector':
+      return { label: 'Call connector', detail: String(a.name || ''), monoDetail: true };
+    case 'system_info':
+      return { label: 'Inspect system', detail: '', monoDetail: false };
+    default:
+      return { label: name.replaceAll('_', ' '), detail: summarizeArgs(name, a), monoDetail: true };
   }
+}
+
+export function formatThoughtDuration(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 500) return '';
+  const totalSec = Math.max(1, Math.round(ms / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
 }
 
 function summarizeArgs(name, args = {}) {
@@ -96,7 +196,7 @@ function summarizeArgs(name, args = {}) {
 function InlineDiffView({ diff }) {
   if (!diff) return null;
   return (
-    <pre className="pre-box" style={{ maxHeight: 260, fontSize: 11.5, padding: '8px 10px' }}>
+    <pre className="cp-code-box">
       {String(diff).split('\n').map((line, i) => {
         const cls = line.startsWith('+') && !line.startsWith('+++')
           ? 'diff-add'
@@ -111,90 +211,127 @@ function InlineDiffView({ diff }) {
   );
 }
 
-const ToolTimeline = React.memo(function ToolTimeline({ tools = [], taskId, onRevert, defaultExpandDiff = false, quiet = false }) {
-  const [expanded, setExpanded] = useState({});
-  const [reverting, setReverting] = useState('');
-  if (!tools?.length) return null;
+export const ToolActivityRow = React.memo(function ToolActivityRow({ tool, taskId, onRevert, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const [reverting, setReverting] = useState(false);
 
-  const toggle = id => setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
-  const handleRevert = async (e, tool) => {
+  const Icon = pickToolIcon(tool.name, tool);
+  const isRunning = tool.status === 'running';
+  const isError = tool.status === 'error' || (typeof tool.exitCode === 'number' && tool.exitCode !== 0 && !isRunning);
+  const isDenied = tool.status === 'denied';
+  const isShell = tool.name === 'run_command' || tool.name === 'shell_session';
+  const desc = describeToolAction(tool.name, tool.args, isRunning, tool);
+  const hasDiffStats = (tool.addedLines || 0) > 0 || (tool.removedLines || 0) > 0;
+
+  const handleRevert = async e => {
     e.stopPropagation();
     if (!tool.fileChangeEventId || !onRevert) return;
-    setReverting(tool.id);
+    setReverting(true);
     try { await onRevert(taskId, tool.fileChangeEventId); }
-    finally { setReverting(''); }
+    finally { setReverting(false); }
   };
 
   return (
-    <div className={quiet ? 'tool-list-quiet' : 'tool-timeline'} aria-label="Tool execution steps">
-      {tools.map(tool => {
-        const Icon = pickToolIcon(tool.name);
-        const isOpen = expanded[tool.id] !== undefined ? expanded[tool.id] : (defaultExpandDiff && Boolean(tool.diff));
-        const desc = describeToolAction(tool.name, tool.args, tool.status === 'running');
-        const hasDiffStats = (tool.addedLines || 0) > 0 || (tool.removedLines || 0) > 0;
-        return (
-          <div key={tool.id} className={`${quiet ? 'tool-row-quiet' : 'tool-card'} ${tool.status || ''}`}>
-            <button type="button" className={quiet ? 'tool-row-head' : 'tool-card-head'} onClick={() => toggle(tool.id)} aria-expanded={isOpen}>
-              {quiet && (isOpen ? <ChevronDown size={12} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} /> : <ChevronRight size={12} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />)}
-              {tool.status === 'running' ? <Loader2 size={12} className="spin" style={{ color: 'var(--accent)', flexShrink: 0 }} /> :
-               tool.status === 'error' ? <XCircle size={12} style={{ color: 'var(--err-fg)', flexShrink: 0 }} /> :
-               tool.status === 'denied' ? <Slash size={12} style={{ color: 'var(--warn-fg)', flexShrink: 0 }} /> :
-               <CheckCircle2 size={12} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />}
-              {!quiet && <Icon size={12} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />}
-              <span className="tool-label-text">{desc.label}</span>
-              {desc.detail && <span className="tool-arg-preview">{desc.detail}</span>}
-              {hasDiffStats && (
-                <span className="diff-stat-inline tabular">
-                  {tool.addedLines > 0 && <em className="add">+{tool.addedLines}</em>}
-                  {tool.removedLines > 0 && <em className="del">-{tool.removedLines}</em>}
-                </span>
-              )}
-              {tool.hasBackup && tool.fileChangeEventId && onRevert && (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  className="quiet-revert-btn"
-                  title="Revert this file to its automatic pre-edit backup"
-                  onClick={e => handleRevert(e, tool)}
-                  onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleRevert(e, tool); }}
-                >
-                  <RotateCcw size={10} /> {reverting === tool.id ? 'Reverting…' : 'Revert'}
-                </span>
-              )}
-              {tool.durationMs != null && <span className="tool-dur">{formatDuration(tool.durationMs)}</span>}
-              {!quiet && (isOpen ? <ChevronDown size={12} style={{ color: 'var(--ink-faint)' }} /> : <ChevronRight size={12} style={{ color: 'var(--ink-faint)' }} />)}
-            </button>
-            {isOpen && (
-              <div className={quiet ? 'tool-row-body' : 'tool-card-body'}>
-                {tool.diff && (
-                  <div>
-                    <small className="hint" style={{ display: 'block', marginBottom: 4 }}>File diff</small>
-                    <InlineDiffView diff={tool.diff} />
-                  </div>
-                )}
-                {tool.args && Object.keys(tool.args).length > 0 && (
-                  <div>
-                    <small className="hint" style={{ display: 'block', marginBottom: 4 }}>Arguments</small>
-                    <pre>{prettyJson(tool.args)}</pre>
-                  </div>
-                )}
-                {tool.error && (
-                  <div>
-                    <small className="hint" style={{ display: 'block', marginBottom: 4, color: 'var(--err-fg)' }}>Error</small>
-                    <pre style={{ color: 'var(--err-fg)' }}>{tool.error}</pre>
-                  </div>
-                )}
-                {tool.preview && !tool.diff && (
-                  <div>
-                    <small className="hint" style={{ display: 'block', marginBottom: 4 }}>Output preview</small>
-                    <pre>{tool.preview}</pre>
-                  </div>
+    <div className={`cp-row ${isRunning ? 'is-running' : ''} ${isError ? 'is-error' : ''} ${isDenied ? 'is-denied' : ''} ${open ? 'is-open' : ''}`}>
+      <button type="button" className="cp-row-btn" onClick={() => setOpen(v => !v)} aria-expanded={open}>
+        <span className="cp-row-icon">
+          {isRunning ? <Loader2 size={13} className="spin" style={{ color: 'var(--accent)' }} />
+            : isError ? <XCircle size={13} style={{ color: 'var(--err-fg)' }} />
+            : isDenied ? <Slash size={13} style={{ color: 'var(--warn-fg)' }} />
+            : <Icon size={13} />}
+        </span>
+        <span className={`cp-row-label ${isRunning ? 'shimmer-text' : ''}`}>{desc.label}</span>
+        {desc.detail && (
+          <span className={`cp-row-detail ${desc.monoDetail ? 'mono' : ''}`}>{desc.detail}</span>
+        )}
+        {hasDiffStats && (
+          <span className="cp-diff-stat tabular">
+            {tool.addedLines > 0 && <em className="add">+{tool.addedLines}</em>}
+            {tool.removedLines > 0 && <em className="del">-{tool.removedLines}</em>}
+          </span>
+        )}
+        {isShell && typeof tool.exitCode === 'number' && tool.exitCode !== 0 && !isRunning && (
+          <span className="cp-exit-pill err tabular">exit {tool.exitCode}</span>
+        )}
+        {tool.hasBackup && tool.fileChangeEventId && onRevert && (
+          <span
+            role="button"
+            tabIndex={0}
+            className="cp-revert-btn"
+            title="Revert this file to its automatic pre-edit backup"
+            onClick={handleRevert}
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') void handleRevert(e); }}
+          >
+            <RotateCcw size={10} /> {reverting ? 'Reverting…' : 'Revert'}
+          </span>
+        )}
+        <span className="cp-row-right">
+          {tool.durationMs != null && tool.durationMs >= 100 && <span className="cp-dur tabular">{formatDuration(tool.durationMs)}</span>}
+          {open ? <ChevronDown size={12} className="cp-chev" /> : <ChevronRight size={12} className="cp-chev" />}
+        </span>
+      </button>
+
+      {open && (
+        <div className="cp-drawer">
+          {isShell && tool.args?.command && (
+            <div className="cp-drawer-section">
+              <div className="cp-cmd-line mono">
+                <span className="cp-cmd-prompt">$</span>
+                <span>{tool.args.command}</span>
+                {typeof tool.exitCode === 'number' && (
+                  <span className={`cp-exit-pill ${tool.exitCode === 0 ? 'ok' : 'err'} tabular`}>exit {tool.exitCode}</span>
                 )}
               </div>
-            )}
-          </div>
-        );
-      })}
+              {tool.preview && <pre className="cp-code-box">{tool.preview}</pre>}
+              {!tool.preview && !tool.error && <span className="hint" style={{ fontSize: 11.5 }}>(No output)</span>}
+            </div>
+          )}
+
+          {tool.diff && (
+            <div className="cp-drawer-section">
+              {tool.args?.path && <div className="cp-path-line mono">{tool.args.path}</div>}
+              <InlineDiffView diff={tool.diff} />
+            </div>
+          )}
+
+          {tool.error && (
+            <div className="cp-drawer-section">
+              <pre className="cp-code-box err">{tool.error}</pre>
+            </div>
+          )}
+
+          {!isShell && !tool.diff && tool.args && Object.keys(tool.args).length > 0 && (
+            <div className="cp-drawer-section">
+              <small className="cp-drawer-label">Parameters</small>
+              <pre className="cp-code-box">{prettyJson(tool.args)}</pre>
+            </div>
+          )}
+
+          {!isShell && !tool.diff && tool.preview && (
+            <div className="cp-drawer-section">
+              <small className="cp-drawer-label">Result</small>
+              <pre className="cp-code-box">{tool.preview}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const ToolTimeline = React.memo(function ToolTimeline({ tools = [], taskId, onRevert, defaultExpandDiff = false }) {
+  if (!tools?.length) return null;
+  return (
+    <div className="cp-stream" aria-label="Tool execution steps">
+      {tools.map(tool => (
+        <ToolActivityRow
+          key={tool.id}
+          tool={tool}
+          taskId={taskId}
+          onRevert={onRevert}
+          defaultOpen={defaultExpandDiff && Boolean(tool.diff)}
+        />
+      ))}
     </div>
   );
 });

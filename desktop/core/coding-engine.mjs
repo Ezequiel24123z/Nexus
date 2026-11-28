@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
@@ -9,7 +10,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 export function wrapUtf8Ps(cmd = '') {
-  return `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\n${cmd}`;
+  return `[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false);\n${cmd}`;
 }
 
 export function createUnifiedDiff(oldText = '', newText = '', filePath = 'file', maxLines = 120) {
@@ -1208,7 +1209,7 @@ export class StatefulShellManager {
     if (!session.cwd && defaultCwd) session.cwd = defaultCwd;
     return session;
   }
-  async exec(taskId, commandText, { defaultCwd, envOverrides, signal, timeout = 60000 } = {}) {
+  async exec(taskId, commandText, { defaultCwd, envOverrides, signal, timeout = 60000, elevated = false, adminBroker = null } = {}) {
     if (typeof commandText !== 'string' || !commandText.trim()) throw new Error('Provide a shell command.');
     const session = this.getOrInit(taskId, defaultCwd);
     if (envOverrides && typeof envOverrides === 'object') {
@@ -1224,6 +1225,58 @@ export class StatefulShellManager {
     const wrapped = isWin
       ? wrapUtf8Ps(`${commandText}\n$__code = $LASTEXITCODE\nWrite-Output "${marker}:$((Get-Location).Path)"\n$__e = @{}; Get-ChildItem Env: | ForEach-Object { $__e[$_.Name] = $_.Value }\nWrite-Output ("${envMarker}:" + ($__e | ConvertTo-Json -Compress))\nif ($__code -ne $null) { exit $__code }`)
       : `${commandText}\n__code=$?\nprintf "\\n${marker}:%s\\n" "$(pwd)"\nprintf "${envMarker}:"; env -0 | tr '\\0' '\\x1f'; printf "\\n"\nexit $__code`;
+
+    const parseStatefulResult = (rawStdout, rawStderr, code, extra = {}) => {
+      let stdout = String(rawStdout || '');
+      const stderr = String(rawStderr || '');
+      const envRegex = new RegExp(`(?:\\r?\\n)?${envMarker}:([^\\r\\n]+)`);
+      const envMatch = envRegex.exec(stdout);
+      if (envMatch && envMatch[1]) {
+        stdout = stdout.replace(envRegex, '');
+        try {
+          if (isWin) {
+            const afterEnv = JSON.parse(envMatch[1]);
+            const baseLower = new Map(Object.entries(baseEnv).map(([k, v]) => [k.toLowerCase(), String(v ?? '')]));
+            for (const [k, v] of Object.entries(afterEnv)) {
+              const sv = String(v ?? '');
+              if (!baseLower.has(k.toLowerCase()) || baseLower.get(k.toLowerCase()) !== sv) {
+                session.env[k] = sv;
+              }
+            }
+          } else {
+            for (const entry of envMatch[1].split('\x1f')) {
+              const eq = entry.indexOf('=');
+              if (eq <= 0) continue;
+              const k = entry.slice(0, eq), sv = entry.slice(eq + 1);
+              if (baseEnv[k] !== sv) session.env[k] = sv;
+            }
+          }
+        } catch {}
+      }
+      const markerRegex = new RegExp(`(?:\\r?\\n)?${marker}:([^\\r\\n]+)`);
+      const match = markerRegex.exec(stdout);
+      if (match && match[1]) {
+        const nextCwd = match[1].trim();
+        if (fsSync.existsSync(nextCwd)) session.cwd = nextCwd;
+        stdout = stdout.replace(markerRegex, '').trimEnd();
+      }
+      const combined = (stdout.slice(-48000) + (stderr ? '\n' + stderr : '')).trim();
+      session.history.push({ command: commandText, cwd: session.cwd, exitCode: code, at: new Date().toISOString() });
+      if (session.history.length > 50) session.history.shift();
+      return { exitCode: code, cwd: session.cwd, envKeys: Object.keys(session.env), output: combined, ...extra };
+    };
+
+    if (elevated && isWin) {
+      const res = await runElevatedCommand(wrapped, {
+        cwd: session.cwd,
+        env: session.env,
+        signal,
+        timeout,
+        broker: adminBroker,
+      });
+      return parseStatefulResult(res.output, '', res.exitCode, { elevated: true, method: res.method });
+    }
+
     const exe = isWin ? 'powershell.exe' : 'sh';
     const args = isWin ? ['-NoProfile', '-NonInteractive', '-Command', wrapped] : ['-c', wrapped];
 
@@ -1250,41 +1303,7 @@ export class StatefulShellManager {
       child.on('close', code => {
         cleanup();
         if (stopped) return reject(new Error('Stateful shell command stopped or timed out.'));
-        const envRegex = new RegExp(`(?:\\r?\\n)?${envMarker}:([^\\r\\n]+)`);
-        const envMatch = envRegex.exec(stdout);
-        if (envMatch && envMatch[1]) {
-          stdout = stdout.replace(envRegex, '');
-          try {
-            if (isWin) {
-              const afterEnv = JSON.parse(envMatch[1]);
-              const baseLower = new Map(Object.entries(baseEnv).map(([k, v]) => [k.toLowerCase(), String(v ?? '')]));
-              for (const [k, v] of Object.entries(afterEnv)) {
-                const sv = String(v ?? '');
-                if (!baseLower.has(k.toLowerCase()) || baseLower.get(k.toLowerCase()) !== sv) {
-                  session.env[k] = sv;
-                }
-              }
-            } else {
-              for (const entry of envMatch[1].split('\x1f')) {
-                const eq = entry.indexOf('=');
-                if (eq <= 0) continue;
-                const k = entry.slice(0, eq), sv = entry.slice(eq + 1);
-                if (baseEnv[k] !== sv) session.env[k] = sv;
-              }
-            }
-          } catch {}
-        }
-        const markerRegex = new RegExp(`(?:\\r?\\n)?${marker}:([^\\r\\n]+)`);
-        const match = markerRegex.exec(stdout);
-        if (match && match[1]) {
-          const nextCwd = match[1].trim();
-          if (fsSync.existsSync(nextCwd)) session.cwd = nextCwd;
-          stdout = stdout.replace(markerRegex, '').trimEnd();
-        }
-        const combined = (stdout.slice(-48000) + (stderr ? '\n' + stderr : '')).trim();
-        session.history.push({ command: commandText, cwd: session.cwd, exitCode: code, at: new Date().toISOString() });
-        if (session.history.length > 50) session.history.shift();
-        resolve({ exitCode: code, cwd: session.cwd, envKeys: Object.keys(session.env), output: combined });
+        resolve(parseStatefulResult(stdout, stderr, code));
       });
     });
   }
@@ -1514,16 +1533,384 @@ export function isProcessElevated() {
   return _cachedElevated;
 }
 
+// Persistent single-UAC Windows Administrator worker broker.
+// Prompts Windows UAC ONCE when the first elevated command executes (if NEXUS is not already
+// elevated), then reuses that authenticated hidden elevated worker across all subsequent
+// commands in admin-enabled sessions with zero repeated UAC dialogs.
+export class ElevatedAdminBroker {
+  constructor({ spawnWorker = null, connectTimeoutMs = 60000 } = {}) {
+    this._spawnWorker = spawnWorker;
+    this._connectTimeoutMs = connectTimeoutMs;
+    this._socket = null;
+    this._server = null;
+    this._workerPid = null;
+    this._startPromise = null;
+    this._queue = Promise.resolve();
+    this._pending = new Map();
+    this._buf = '';
+    this._closed = false;
+  }
+
+  isConnected() {
+    return Boolean(this._socket && !this._socket.destroyed);
+  }
+
+  _buildSafeWorkerScript({ port, token, parentPid, scriptPath, stageDir }) {
+    // Clean single-reader variant (never overlaps two ReadLineAsync calls on the same StreamReader!)
+    // Uses $stream.DataAvailable to poll for cancel/shutdown frames while child runs.
+    const esc = s => String(s).replace(/'/g, "''");
+    return [
+      '$ErrorActionPreference = "Stop"',
+      '[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)',
+      '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+      '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+      `try { Remove-Item -LiteralPath '${esc(scriptPath)}' -Force -ErrorAction SilentlyContinue } catch {}`,
+      `try { Remove-Item -LiteralPath '${esc(stageDir)}' -Force -ErrorAction SilentlyContinue } catch {}`,
+      `$parentPid = ${Number(parentPid)}`,
+      `$port = ${Number(port)}`,
+      `$token = '${esc(token)}'`,
+      '$utf8 = [System.Text.UTF8Encoding]::new($false)',
+      '$client = [System.Net.Sockets.TcpClient]::new()',
+      '$client.Connect("127.0.0.1", $port)',
+      '$stream = $client.GetStream()',
+      '$reader = [System.IO.StreamReader]::new($stream, $utf8, $false, 65536, $true)',
+      '$writer = [System.IO.StreamWriter]::new($stream, $utf8, 65536, $true)',
+      '$writer.AutoFlush = $true',
+      '$hello = @{ type = "hello"; token = $token; pid = $PID; elevated = $true } | ConvertTo-Json -Compress',
+      '$writer.WriteLine($hello)',
+      'function ParentAlive { try { [void][System.Diagnostics.Process]::GetProcessById($parentPid); return $true } catch { return $false } }',
+      '$shouldExit = $false',
+      'try {',
+      '  while ($client.Connected -and -not $shouldExit) {',
+      '    while (-not $stream.DataAvailable) {',
+      '      if (-not (ParentAlive)) { $shouldExit = $true; break }',
+      '      if ($client.Client.Poll(250000, [System.Net.Sockets.SelectMode]::SelectRead) -and $client.Client.Available -eq 0) { $shouldExit = $true; break }',
+      '    }',
+      '    if ($shouldExit) { break }',
+      '    $line = $reader.ReadLine()',
+      '    if ($null -eq $line) { break }',
+      '    if (-not $line.Trim()) { continue }',
+      '    $msg = $line | ConvertFrom-Json',
+      '    if ($msg.type -eq "shutdown") { break }',
+      '    if ($msg.type -ne "exec") { continue }',
+      '    $id = [string]$msg.id',
+      '    $cmd = [string]$msg.cmd',
+      '    $cwd = if ($msg.cwd -and (Test-Path -LiteralPath ([string]$msg.cwd))) { [string]$msg.cwd } else { "C:\\\\" }',
+      '    $exitCode = 1',
+      '    $output = ""',
+      '    $cancelled = $false',
+      '    try {',
+      '      $wrapped = "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(`$false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); `$OutputEncoding = [System.Text.UTF8Encoding]::new(`$false);`r`n" + $cmd',
+      '      $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrapped))',
+      '      $psi = [System.Diagnostics.ProcessStartInfo]::new()',
+      '      $psi.FileName = "powershell.exe"',
+      '      $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $enc',
+      '      $psi.WorkingDirectory = $cwd',
+      '      $psi.UseShellExecute = $false',
+      '      $psi.CreateNoWindow = $true',
+      '      $psi.RedirectStandardOutput = $true',
+      '      $psi.RedirectStandardError = $true',
+      '      $psi.StandardOutputEncoding = $utf8',
+      '      $psi.StandardErrorEncoding = $utf8',
+      '      if ($msg.env) {',
+      '        foreach ($prop in $msg.env.PSObject.Properties) {',
+      '          if ($null -ne $prop.Value) { $psi.EnvironmentVariables[[string]$prop.Name] = [string]$prop.Value }',
+      '        }',
+      '      }',
+      '      $proc = [System.Diagnostics.Process]::Start($psi)',
+      '      $outTask = $proc.StandardOutput.ReadToEndAsync()',
+      '      $errTask = $proc.StandardError.ReadToEndAsync()',
+      '      while (-not $proc.WaitForExit(120)) {',
+      '        if (-not (ParentAlive)) {',
+      '          try { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null } catch {}',
+      '          $cancelled = $true; $shouldExit = $true; break',
+      '        }',
+      '        if ($stream.DataAvailable) {',
+      '          $cline = $reader.ReadLine()',
+      '          if ($null -eq $cline) {',
+      '            try { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null } catch {}',
+      '            $cancelled = $true; $shouldExit = $true; break',
+      '          }',
+      '          $cmsg = $null; try { $cmsg = $cline | ConvertFrom-Json } catch {}',
+      '          if ($cmsg -and ($cmsg.type -eq "shutdown" -or ($cmsg.type -eq "cancel" -and [string]$cmsg.id -eq $id))) {',
+      '            try { & taskkill /PID $proc.Id /T /F 2>$null | Out-Null } catch {}',
+      '            $cancelled = $true',
+      '            if ($cmsg.type -eq "shutdown") { $shouldExit = $true }',
+      '            break',
+      '          }',
+      '        }',
+      '      }',
+      '      $proc.WaitForExit()',
+      '      $so = if ($outTask.Wait(3000)) { $outTask.Result } else { "" }',
+      '      $se = if ($errTask.Wait(3000)) { $errTask.Result } else { "" }',
+      '      $output = ($so + $se)',
+      '      if ($output.Length -gt 48000) { $output = $output.Substring($output.Length - 48000) }',
+      '      $exitCode = [int]$proc.ExitCode',
+      '      $proc.Dispose()',
+      '    } catch {',
+      '      $output = $_.Exception.Message',
+      '      $exitCode = 1',
+      '    }',
+      '    if ($client.Connected -and -not $shouldExit) {',
+      '      $reply = @{ type = "result"; id = $id; exitCode = $exitCode; output = $output; cancelled = $cancelled } | ConvertTo-Json -Compress',
+      '      $writer.WriteLine($reply)',
+      '    }',
+      '  }',
+      '} finally {',
+      '  try { $writer.Dispose() } catch {}',
+      '  try { $reader.Dispose() } catch {}',
+      '  try { $client.Close() } catch {}',
+      '}',
+    ].join('\r\n');
+  }
+
+  _handleSocketData(chunk) {
+    this._buf += chunk.toString('utf8');
+    let nl;
+    while ((nl = this._buf.indexOf('\n')) !== -1) {
+      const line = this._buf.slice(0, nl).trim();
+      this._buf = this._buf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.type === 'result' && msg.id && this._pending.has(msg.id)) {
+        const entry = this._pending.get(msg.id);
+        this._pending.delete(msg.id);
+        entry.resolve(msg);
+      }
+    }
+  }
+
+  _teardownConnection(reason = 'Elevated admin worker disconnected.') {
+    if (this._socket) {
+      try { this._socket.destroy(); } catch {}
+      this._socket = null;
+    }
+    this._workerPid = null;
+    this._buf = '';
+    for (const [id, entry] of [...this._pending.entries()]) {
+      this._pending.delete(id);
+      entry.reject(new Error(reason));
+    }
+  }
+
+  async ensureStarted(signal) {
+    if (this._closed) throw new Error('Elevated admin broker is shut down.');
+    if (this.isConnected()) return;
+    if (this._startPromise) return this._startPromise;
+
+    this._startPromise = (async () => {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenBuf = Buffer.from(token, 'utf8');
+      let stageDir = null;
+      const server = net.createServer();
+      this._server = server;
+
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+          server.removeListener('error', reject);
+          resolve();
+        });
+      });
+
+      const { port } = server.address();
+      let settled = false;
+
+      try {
+        await new Promise((resolve, reject) => {
+          const finishErr = err => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(connectTimer);
+            signal?.removeEventListener('abort', onAbort);
+            try { server.close(); } catch {}
+            this._server = null;
+            reject(err);
+          };
+          const finishOk = (sock, pid) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(connectTimer);
+            signal?.removeEventListener('abort', onAbort);
+            try { server.close(); } catch {}
+            this._server = null;
+            this._socket = sock;
+            this._workerPid = pid || null;
+            sock.on('data', chunk => this._handleSocketData(chunk));
+            sock.once('close', () => this._teardownConnection('Elevated admin worker exited.'));
+            sock.once('error', () => this._teardownConnection('Elevated admin worker connection error.'));
+            resolve();
+          };
+          const onAbort = () => finishErr(new Error('Elevated command cancelled.'));
+          if (signal?.aborted) return onAbort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+
+          const connectTimer = setTimeout(
+            () => finishErr(new Error('Timed out waiting for elevated Windows Administrator worker to connect.')),
+            this._connectTimeoutMs
+          );
+          connectTimer.unref?.();
+
+          server.on('connection', sock => {
+            if (settled) { try { sock.destroy(); } catch {} return; }
+            let authBuf = '';
+            const onData = chunk => {
+              authBuf += chunk.toString('utf8');
+              const idx = authBuf.indexOf('\n');
+              if (idx === -1) {
+                if (authBuf.length > 4096) { sock.destroy(); }
+                return;
+              }
+              const firstLine = authBuf.slice(0, idx).trim();
+              const remainder = authBuf.slice(idx + 1);
+              let hello;
+              try { hello = JSON.parse(firstLine); } catch { sock.destroy(); return; }
+              const provided = Buffer.from(String(hello?.token || ''), 'utf8');
+              const valid = hello?.type === 'hello' && provided.length === tokenBuf.length && crypto.timingSafeEqual(provided, tokenBuf);
+              if (!valid) {
+                sock.destroy();
+                return;
+              }
+              sock.removeListener('data', onData);
+              finishOk(sock, hello.pid);
+              if (remainder) this._handleSocketData(Buffer.from(remainder, 'utf8'));
+            };
+            sock.on('data', onData);
+            sock.once('error', () => {});
+          });
+
+          if (typeof this._spawnWorker === 'function') {
+            Promise.resolve(this._spawnWorker({ port, token, parentPid: process.pid }))
+              .catch(err => finishErr(err));
+          } else {
+            (async () => {
+              stageDir = path.join(os.tmpdir(), 'nexus-admin-broker-' + crypto.randomUUID().slice(0, 8));
+              await fs.mkdir(stageDir, { recursive: true });
+              const scriptPath = path.join(stageDir, 'worker.ps1');
+              const workerCode = this._buildSafeWorkerScript({ port, token, parentPid: process.pid, scriptPath, stageDir });
+              await fs.writeFile(scriptPath, workerCode, 'utf8');
+              const esc = s => String(s).replace(/'/g, "''");
+              const launcher = `Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','${esc(scriptPath)}')`;
+              const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', launcher], { windowsHide: true });
+              let errOut = '';
+              child.stderr.on('data', d => { errOut += d; });
+              child.on('error', err => finishErr(err));
+              child.on('close', code => {
+                if (code !== 0 && !settled) {
+                  if (/canceled by the user|1223/i.test(errOut)) {
+                    finishErr(new Error('Windows UAC elevation prompt was declined by the user.'));
+                  } else {
+                    finishErr(new Error('Failed to start elevated Windows Administrator session: ' + (errOut.trim() || `exit ${code}`)));
+                  }
+                }
+              });
+            })().catch(err => finishErr(err));
+          }
+        });
+      } finally {
+        if (stageDir) {
+          setTimeout(() => { fs.rm(stageDir, { recursive: true, force: true }).catch(() => {}); }, 10000).unref?.();
+        }
+      }
+    })();
+
+    try {
+      await this._startPromise;
+    } finally {
+      this._startPromise = null;
+    }
+  }
+
+  exec(commandText, { cwd = process.cwd(), env = null, signal, timeout = 120000 } = {}) {
+    const runOne = async () => {
+      await this.ensureStarted(signal);
+      if (!this.isConnected()) throw new Error('Elevated admin worker is not connected.');
+      const id = crypto.randomUUID();
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onCancel);
+          this._pending.delete(id);
+        };
+        const cancelRunning = reason => {
+          if (done) return;
+          done = true;
+          cleanup();
+          try {
+            if (this.isConnected()) {
+              this._socket.write(JSON.stringify({ type: 'cancel', id }) + '\n');
+            }
+          } catch {}
+          reject(new Error(reason));
+        };
+        const onCancel = () => cancelRunning('Elevated command cancelled or timed out.');
+        if (signal?.aborted) return onCancel();
+        signal?.addEventListener('abort', onCancel, { once: true });
+        const timer = timeout > 0 ? setTimeout(() => cancelRunning('Elevated command cancelled or timed out.'), timeout) : null;
+        this._pending.set(id, {
+          resolve: msg => {
+            if (done) return;
+            done = true;
+            cleanup();
+            resolve({
+              exitCode: Number.isFinite(Number(msg.exitCode)) ? Number(msg.exitCode) : 0,
+              output: String(msg.output || '').slice(-48000),
+              elevated: true,
+              method: 'uac-session-broker',
+            });
+          },
+          reject: err => {
+            if (done) return;
+            done = true;
+            cleanup();
+            reject(err);
+          },
+        });
+        try {
+          this._socket.write(JSON.stringify({ type: 'exec', id, cmd: commandText, cwd, env: env && Object.keys(env).length ? env : undefined }) + '\n');
+        } catch (err) {
+          done = true;
+          cleanup();
+          reject(err);
+        }
+      });
+    };
+    const next = this._queue.then(runOne, runOne);
+    this._queue = next.catch(() => {});
+    return next;
+  }
+
+  stop() {
+    this._closed = true;
+    try {
+      if (this.isConnected()) {
+        this._socket.write(JSON.stringify({ type: 'shutdown' }) + '\n');
+        this._socket.end();
+      }
+    } catch {}
+    try { this._server?.close(); } catch {}
+    this._server = null;
+    this._teardownConnection('Elevated admin broker stopped.');
+  }
+}
+
 // Executes a PowerShell command with Windows Administrator privileges.
-// If NEXUS is already elevated, runs directly with zero UAC popups; otherwise invokes Windows UAC (RunAs)
-// capturing stdout, stderr, and exitCode cleanly via a short-lived temp directory.
-export async function runElevatedCommand(commandText, { cwd = process.cwd(), signal, timeout = 120000 } = {}) {
+// If NEXUS is already elevated, runs directly with zero UAC popups.
+// If a persistent ElevatedAdminBroker is supplied, prompts Windows UAC ONCE and reuses the
+// elevated worker across all subsequent commands without repeated UAC prompts.
+export async function runElevatedCommand(commandText, { cwd = process.cwd(), env = null, signal, timeout = 120000, broker = null } = {}) {
   if (typeof commandText !== 'string' || !commandText.trim()) throw new Error('Provide a command to execute elevated.');
   if (process.platform !== 'win32') throw new Error('Windows elevation is only supported on Windows.');
 
   if (isProcessElevated()) {
     return new Promise((resolve, reject) => {
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(commandText)], { cwd, windowsHide: true });
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapUtf8Ps(commandText)], {
+        cwd,
+        env: env ? { ...process.env, ...env } : process.env,
+        windowsHide: true,
+      });
       let output = '';
       let stopped = false;
       const stop = () => { stopped = true; try { child.kill(); } catch {} };
@@ -1535,6 +1922,10 @@ export async function runElevatedCommand(commandText, { cwd = process.cwd(), sig
       child.on('error', err => { done(); reject(err); });
       child.on('close', code => { done(); if (stopped) reject(new Error('Elevated command stopped or timed out.')); else resolve({ exitCode: code ?? 0, output, elevated: true, method: 'process-admin' }); });
     });
+  }
+
+  if (broker && typeof broker.exec === 'function') {
+    return broker.exec(commandText, { cwd, env, signal, timeout });
   }
 
   const stage = path.join(os.tmpdir(), 'nexus-uac-' + crypto.randomUUID().slice(0, 8));

@@ -4,7 +4,7 @@ import {
   Zap, Flame, Check, Hand, X
 } from 'lucide-react';
 import {
-  classifyModel, FREEDOM_TIERS, CAPABILITY_FILTERS, OPENROUTER_UPSTREAMS
+  classifyModel, FREEDOM_TIERS, CAPABILITY_FILTERS, OPENROUTER_UPSTREAMS, filterModelsForProvider
 } from '../lib/model-catalog.mjs';
 import {
   AUTONOMY_LEVELS, normalizeAutonomyId, detectProviderId, PROVIDER_META,
@@ -16,6 +16,7 @@ const EFFORT_LEVELS = [
   ['low', 'Low'],
   ['medium', 'Med'],
   ['high', 'High'],
+  ['xhigh', 'XHigh'],
   ['max', 'Max'],
   ['auto', 'Auto'],
 ];
@@ -36,13 +37,14 @@ const AUTONOMY_ICONS = {
 
 export const MODES = AUTONOMY_LEVELS;
 
-export default function ComposerControls({ task, settings, models, act, onOpenChange }) {
+export default function ComposerControls({ task, settings, models, providerKeys = {}, act, onOpenChange }) {
   const [open, setOpen] = useState(false);
   const popRef = useRef(null);
   useEffect(() => { onOpenChange?.(open); }, [open, onOpenChange]);
   const customProviders = settings.customProviders || [];
 
   const activeModelId = task?.model || settings.model || '';
+  const activeProvider = detectProviderId(activeModelId, customProviders);
   const activeEffort = task?.reasoningEffort ?? settings.reasoningEffort ?? 'none';
   const activeRoute = task?.providerRouting ?? settings.providerRouting ?? 'auto';
   const activeWindow = task?.contextWindow || settings.contextWindow || 50000;
@@ -116,6 +118,8 @@ export default function ComposerControls({ task, settings, models, act, onOpenCh
           task={task}
           settings={settings}
           catalog={classifiedCatalog}
+          providerKeys={providerKeys}
+          activeProvider={activeProvider}
           activeModelId={activeModelId}
           activeModelMeta={activeModelMeta}
           activeEffort={activeEffort}
@@ -133,16 +137,18 @@ export default function ComposerControls({ task, settings, models, act, onOpenCh
 }
 
 function ModelPopoverPanel({
-  task, settings, catalog, activeModelId, activeModelMeta,
+  task, settings, catalog, providerKeys, activeProvider, activeModelId, activeModelMeta,
   activeEffort, activeRoute, activeWindow, activeOrder,
   locked, applyUpdate, act, close,
 }) {
   const customProviders = settings.customProviders || [];
   const favorites = settings.favoriteModels || [];
+  const enabledModelsMap = settings.enabledModels || {};
   const [query, setQuery] = useState('');
   const [freedomFilter, setFreedomFilter] = useState('all');
   const [capFilter, setCapFilter] = useState('all');
-  const [providerFilter, setProviderFilter] = useState('all');
+  const [selectedProvider, setSelectedProvider] = useState(activeProvider);
+  const [manageMode, setManageMode] = useState(false);
   const [sortBy, setSortBy] = useState('quality');
   const [onlyFavs, setOnlyFavs] = useState(false);
   const [showConfig, setShowConfig] = useState(true);
@@ -150,20 +156,36 @@ function ModelPopoverPanel({
   const [upstreamPin, setUpstreamPin] = useState((activeOrder || [])[0] || '');
   const searchRef = useRef(null);
 
+  useEffect(() => { setSelectedProvider(activeProvider); }, [activeProvider]);
   useEffect(() => { searchRef.current?.focus(); }, []);
 
-  const providerOptions = useMemo(() => [
-    ['all', 'All Providers'],
-    ...Object.entries(PROVIDER_META).map(([id, m]) => [id, m.name]),
-    ...customProviders.map(cp => [cp.id, `Custom · ${cp.name}`]),
-  ], [customProviders]);
+  // Only list the active provider plus providers that actually have credentials/configuration enabled
+  const providerOptions = useMemo(() => {
+    const allBuiltins = Object.entries(PROVIDER_META).map(([id, m]) => [id, m.name]);
+    const allCustom = customProviders.map(cp => [cp.id, `Custom · ${cp.name}`]);
+    const combined = [...allBuiltins, ...allCustom];
+    const filteredProvs = combined.filter(([id]) => id === activeProvider || id === selectedProvider || Boolean(providerKeys?.[id]));
+    return filteredProvs.length ? filteredProvs : [[activeProvider, providerLabel(activeProvider, customProviders)]];
+  }, [customProviders, providerKeys, activeProvider, selectedProvider]);
+
+  const enabledForProvider = useMemo(
+    () => (Array.isArray(enabledModelsMap[selectedProvider]) ? enabledModelsMap[selectedProvider] : []),
+    [enabledModelsMap, selectedProvider]
+  );
+  const providerFullCatalog = useMemo(
+    () => filterModelsForProvider(catalog, settings, selectedProvider, { activeModelId, includeAllOfProvider: true }),
+    [catalog, settings, selectedProvider, activeModelId]
+  );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const list = catalog.filter(item => {
+    const scoped = filterModelsForProvider(catalog, settings, selectedProvider, {
+      activeModelId,
+      includeAllOfProvider: manageMode,
+    });
+    const list = scoped.filter(item => {
       if (/:batch$/i.test(item.id) && !q.includes('batch')) return false;
       if (onlyFavs && !favorites.includes(item.id)) return false;
-      if (providerFilter !== 'all' && item.provider !== providerFilter) return false;
       if (freedomFilter !== 'all') {
         const targetRank = FREEDOM_TIERS.find(f => f.id === freedomFilter)?.rank ?? 99;
         if (item.freedomRank > targetRank) return false;
@@ -182,7 +204,23 @@ function ModelPopoverPanel({
       return b.quality - a.quality;
     });
     return list.slice(0, 60);
-  }, [catalog, query, freedomFilter, capFilter, providerFilter, sortBy, onlyFavs, favorites]);
+  }, [catalog, settings, selectedProvider, activeModelId, manageMode, query, freedomFilter, capFilter, sortBy, onlyFavs, favorites]);
+
+  const toggleEnabledModel = (e, id) => {
+    e.stopPropagation();
+    const cur = enabledForProvider.length
+      ? new Set(enabledForProvider)
+      : new Set(providerFullCatalog.map(m => m.id));
+    if (cur.has(id)) cur.delete(id);
+    else cur.add(id);
+    const nextMap = { ...enabledModelsMap };
+    if (cur.size === 0 || cur.size >= providerFullCatalog.length) {
+      delete nextMap[selectedProvider];
+    } else {
+      nextMap[selectedProvider] = [...cur];
+    }
+    void act('settings', { enabledModels: nextMap });
+  };
 
   const selectModel = async id => {
     if (locked || !id) return;
@@ -208,7 +246,7 @@ function ModelPopoverPanel({
           <Search size={14} />
           <input
             ref={searchRef}
-            placeholder="Search models (e.g. deepseek, glm, claude, gpt-5, qwen, local)…"
+            placeholder={`Search ${providerLabel(selectedProvider, customProviders)} models…`}
             value={query}
             onChange={e => setQuery(e.target.value)}
             onKeyDown={e => {
@@ -217,6 +255,15 @@ function ModelPopoverPanel({
           />
           {query && <button type="button" className="btn-icon" style={{ width: 20, height: 20 }} onClick={() => setQuery('')}><X size={12} /></button>}
         </div>
+        <button
+          type="button"
+          className={manageMode ? 'btn-primary' : 'btn-secondary'}
+          style={{ padding: '5px 8px', fontSize: 11.5 }}
+          title="Choose which models of this provider are enabled in the picker"
+          onClick={() => setManageMode(v => !v)}
+        >
+          {manageMode ? 'Done' : `Enabled${enabledForProvider.length ? ` (${enabledForProvider.length})` : ''}`}
+        </button>
         <button
           type="button"
           className={onlyFavs ? 'btn-primary' : 'btn-secondary'}
@@ -237,7 +284,7 @@ function ModelPopoverPanel({
         </button>
       </div>
 
-      {/* Filter Bar: Freedom (Restrictions) + Capability + Provider + Sort */}
+      {/* Filter Bar: Active Provider Scope + Freedom + Capability + Sort */}
       <div className="model-pop-filters">
         <div className="row" style={{ flexWrap: 'wrap', gap: 4 }}>
           <span className="hint" style={{ fontSize: 10.5, fontWeight: 600, marginRight: 2 }}>Restrictions:</span>
@@ -269,7 +316,7 @@ function ModelPopoverPanel({
               {f.label}
             </button>
           ))}
-          <select aria-label="Filter provider" value={providerFilter} onChange={e => setProviderFilter(e.target.value)} style={{ width: 'auto', padding: '3px 8px', fontSize: 11, marginLeft: 'auto' }}>
+          <select aria-label="Selected provider" value={selectedProvider} onChange={e => setSelectedProvider(e.target.value)} style={{ width: 'auto', padding: '3px 8px', fontSize: 11, marginLeft: 'auto' }}>
             {providerOptions.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
           </select>
           <select aria-label="Sort models" value={sortBy} onChange={e => setSortBy(e.target.value)} style={{ width: 'auto', padding: '3px 8px', fontSize: 11 }}>
@@ -279,6 +326,26 @@ function ModelPopoverPanel({
             <option value="context">Largest Context</option>
           </select>
         </div>
+        {manageMode && (
+          <div className="row-between" style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border-subtle)' }}>
+            <small className="hint" style={{ fontSize: 11 }}>
+              Toggle which <strong>{providerLabel(selectedProvider, customProviders)}</strong> models appear in the picker ({enabledForProvider.length ? `${enabledForProvider.length}/${providerFullCatalog.length} enabled` : `all ${providerFullCatalog.length} enabled`}).
+            </small>
+            {enabledForProvider.length > 0 && (
+              <button
+                type="button"
+                className="filter-chip"
+                onClick={() => {
+                  const nextMap = { ...enabledModelsMap };
+                  delete nextMap[selectedProvider];
+                  void act('settings', { enabledModels: nextMap });
+                }}
+              >
+                Enable All
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Scrollable Compact Model List */}
@@ -287,17 +354,29 @@ function ModelPopoverPanel({
         {filtered.map(item => {
           const isSelected = item.id === activeModelId;
           const isFav = favorites.includes(item.id);
+          const isEnabled = enabledForProvider.length === 0 || enabledForProvider.includes(item.id);
           return (
             <div
               key={item.id}
               role="button"
               tabIndex={0}
               className={`model-row ${isSelected ? 'selected' : ''}`}
-              onClick={() => void selectModel(item.id)}
-              onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void selectModel(item.id); } }}
+              style={manageMode && !isEnabled ? { opacity: 0.48 } : undefined}
+              onClick={e => manageMode ? toggleEnabledModel(e, item.id) : void selectModel(item.id)}
+              onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); manageMode ? toggleEnabledModel(e, item.id) : void selectModel(item.id); } }}
             >
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div className="row" style={{ gap: 6 }}>
+                  {manageMode && (
+                    <input
+                      type="checkbox"
+                      checked={isEnabled}
+                      aria-label={`Enable ${item.name}`}
+                      onClick={e => e.stopPropagation()}
+                      onChange={e => toggleEnabledModel(e, item.id)}
+                      style={{ width: 14, height: 14, margin: 0, flexShrink: 0 }}
+                    />
+                  )}
                   {isSelected && <Check size={13} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
                   <strong style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</strong>
                   <span className={`pill ${item.freedomColor}`} style={{ padding: '1px 6px', fontSize: 10 }}>{item.freedomLabel}</span>

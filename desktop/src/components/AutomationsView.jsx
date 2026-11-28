@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Clock, Play, Plus, Trash2, FolderOpen, ArrowUpRight } from 'lucide-react';
 import { AUTONOMY_LEVELS } from '../lib/format.mjs';
+import { filterModelsForProvider } from '../lib/model-catalog.mjs';
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -96,7 +97,7 @@ export default function AutomationsView({ state, workspace, models, act, notify,
               <label className="field">
                 <span>Model (optional)</span>
                 <input list="auto-models" value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="Inherit default" />
-                <datalist id="auto-models">{models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</datalist>
+                <datalist id="auto-models">{filterModelsForProvider(models, state.settings, '', { activeModelId: form.model || state.settings.model }).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</datalist>
               </label>
               <label className="field">
                 <span>Workspace Folder</span>

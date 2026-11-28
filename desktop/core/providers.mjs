@@ -5,6 +5,7 @@ export const arliModel = 'arliai/DeepSeek-V4.1-Flash-1017';
 
 export const PROVIDERS = [
   { id: 'openrouter', name: 'OpenRouter', key: 'OPENROUTER_API_KEY', base: 'https://openrouter.ai/api/v1', prefix: '', apiFormat: 'openai' },
+  { id: 'yeta', name: 'Yeta Labs', key: 'YETA_API_KEY', base: 'https://platform.yeta.ai/v1', prefix: 'yeta/', apiFormat: 'openai' },
   { id: 'arliai', name: 'Arli.ai', key: 'ARLIAI_API_KEY', base: 'https://api.arliai.com/v1', prefix: 'arliai/', apiFormat: 'openai' },
   { id: 'openai', name: 'OpenAI', key: 'OPENAI_API_KEY', base: 'https://api.openai.com/v1', prefix: 'openai/', apiFormat: 'openai' },
   { id: 'copilot', name: 'GitHub Copilot', key: 'GITHUB_COPILOT_TOKEN', base: 'https://api.githubcopilot.com', prefix: 'copilot/', apiFormat: 'openai' },
@@ -17,6 +18,7 @@ export const PROVIDERS = [
 ];
 
 export const SECRET_KEYS = [
+  'YETA_API_KEY',
   'ARLIAI_API_KEY',
   'OPENROUTER_API_KEY',
   'OPENROUTER_MANAGEMENT_KEY',
@@ -71,9 +73,10 @@ export function clearCopilotTokenCache() {
 }
 
 export function allProviders(settings = {}) {
+  const builtinIds = new Set(PROVIDERS.map(p => p.id));
   const extras = Array.isArray(settings?.customProviders)
     ? settings.customProviders
-        .filter(p => p && typeof p.id === 'string' && /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(p.id) && typeof p.baseUrl === 'string' && p.baseUrl.trim())
+        .filter(p => p && typeof p.id === 'string' && /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(p.id) && typeof p.baseUrl === 'string' && p.baseUrl.trim() && !builtinIds.has(p.id.toLowerCase()))
         .map(p => ({
           id: p.id.toLowerCase(),
           name: String(p.name || p.id),
@@ -109,6 +112,7 @@ export function modelConnection(model = '', settings = {}) {
       }
     }
   }
+  if (value.startsWith('yeta/')) return { id: 'yeta', name: 'Yeta Labs', key: 'YETA_API_KEY', base: 'https://platform.yeta.ai/v1', model: value.slice(5), apiFormat: 'openai' };
   if (value.startsWith('arliai/')) return { id: 'arliai', name: 'Arli.ai', key: 'ARLIAI_API_KEY', base: 'https://api.arliai.com/v1', model: value.slice(7), apiFormat: 'openai' };
   if (value.startsWith('openai/')) return { id: 'openai', name: 'OpenAI', key: 'OPENAI_API_KEY', base: 'https://api.openai.com/v1', model: value.slice(7), apiFormat: 'openai' };
   if (value.startsWith('copilot/')) return { id: 'copilot', name: 'GitHub Copilot', key: 'GITHUB_COPILOT_TOKEN', base: settings?.copilotBaseUrl || 'https://api.githubcopilot.com', model: value.slice(8), apiFormat: 'openai' };
@@ -262,7 +266,7 @@ export function completionRequest({ model, messages, settings = {}, tools, outpu
     return { connection, apiFormat: 'anthropic', url: connection.base + '/messages', body, headers };
   }
 
-  const useMaxCompletionTokens = isArli || isOpenAI || isCopilot;
+  const useMaxCompletionTokens = isArli || isOpenAI || isCopilot || id === 'yeta';
   const tokenField = outputLimit > 0 ? { [useMaxCompletionTokens ? 'max_completion_tokens' : 'max_tokens']: outputLimit } : {};
 
   let reasoningField = {};
@@ -271,6 +275,23 @@ export function completionRequest({ model, messages, settings = {}, tools, outpu
       reasoningField = { reasoning_effort: level, include_reasoning: false };
     } else if (isOpenRouter) {
       reasoningField = { reasoning: { effort: level } };
+    } else if (id === 'yeta') {
+      const m = connection.model.toLowerCase();
+      if (!/(gpt-image|seedream|imagen|flux)/i.test(m)) {
+        const allowed = /kimi/.test(m)
+          ? ['low', 'high', 'max']
+          : /glm/.test(m)
+            ? ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+            : ['none', 'low', 'high', 'xhigh', 'max'];
+        let mapped = level;
+        if (!allowed.includes(mapped)) {
+          if (['none', 'minimal'].includes(mapped)) mapped = allowed.includes('none') ? 'none' : 'low';
+          else if (mapped === 'medium') mapped = 'high';
+          else if (['xhigh', 'max'].includes(mapped)) mapped = allowed.includes('max') ? 'max' : 'high';
+          else mapped = allowed[1] || 'high';
+        }
+        reasoningField = { reasoning_effort: mapped };
+      }
     } else if ((isOpenAI || isCopilot || id === 'xai') && !['none', 'minimal'].includes(level)) {
       const mapped = ['xhigh', 'max'].includes(level) ? 'high' : level;
       reasoningField = { reasoning_effort: mapped };
@@ -301,7 +322,7 @@ export function completionRequest({ model, messages, settings = {}, tools, outpu
     };
   }
 
-  const streamUsage = (isArli || isOpenAI || isCopilot || id === 'deepseek' || id === 'gemini' || id === 'xai' || id === 'groq') && settings.streaming ? { stream_options: { include_usage: true } } : {};
+  const streamUsage = (isArli || isOpenAI || isCopilot || id === 'deepseek' || id === 'gemini' || id === 'xai' || id === 'groq' || id === 'yeta') && settings.streaming ? { stream_options: { include_usage: true } } : {};
   const affinity = isOpenRouter && sessionId ? { session_id: sessionId } : (isOpenAI && sessionId ? { prompt_cache_key: sessionId } : {});
 
   // Apply OpenRouter explicit ephemeral cache breakpoints for Claude / Gemini models when promptCaching is active
@@ -401,6 +422,15 @@ const STATIC_CATALOGS = {
     { id: 'groq/llama-3.3-70b-versatile', name: 'Groq · Llama 3.3 70B', context_length: 131072, architecture: { input_modalities: ['text'] }, supported_parameters: ['tools'], reasoning: null, pricing: {}, provider: 'groq', description: 'Ultra-high throughput LPU inference.' },
     { id: 'groq/qwen-qwq-32b', name: 'Groq · QwQ 32B', context_length: 131072, architecture: { input_modalities: ['text'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['low', 'medium', 'high'] }, pricing: {}, provider: 'groq', description: 'High-speed reasoning on Groq LPU.' },
   ],
+  yeta: [
+    { id: 'yeta/deepseek-v4.1-flash-uncensored', name: 'Yeta · DeepSeek V4.1 Flash Uncensored', context_length: 1000000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['none', 'low', 'high', 'xhigh', 'max'] }, pricing: { prompt: '0.00000008', completion: '0.00000035' }, provider: 'yeta', description: 'DeepSeek V4.1 Flash without refusal behavior · 1M context · vision · zero data retention.' },
+    { id: 'yeta/deepseek-v4.1-flash', name: 'Yeta · DeepSeek V4.1 Flash', context_length: 1000000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['none', 'low', 'high', 'xhigh', 'max'] }, pricing: { prompt: '0.00000008', completion: '0.00000035' }, provider: 'yeta', description: 'DeepSeek V4.1 Flash · 1M context · vision · zero data retention.' },
+    { id: 'yeta/glm-5.3-flash', name: 'Yeta · GLM 5.3 Flash', context_length: 262000, architecture: { input_modalities: ['text', 'image', 'video'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] }, pricing: { prompt: '0.00000008', completion: '0.00000042' }, provider: 'yeta', description: 'GLM 5.3 Flash · 262K context · multimodal · zero data retention.' },
+    { id: 'yeta/kimi-k3.1-pro', name: 'Yeta · Kimi K3.1 Pro', context_length: 262000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['none', 'low', 'high', 'max'] }, pricing: { prompt: '0.00000008', completion: '0.00000042' }, provider: 'yeta', description: 'Moonshot Kimi K3.1 Pro · vision + native tool calling · zero data retention.' },
+    { id: 'yeta/gpt-image-2', name: 'Yeta · GPT-Image-2', context_length: 32000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: null, pricing: {}, provider: 'yeta', description: 'Image generation and style transfer via Yeta Labs.' },
+    { id: 'yeta/seedream-5.5-uncensored', name: 'Yeta · Seedream 5.5 Uncensored', context_length: 32000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: null, pricing: {}, provider: 'yeta', description: 'Seedream 5.5 image generation without refusal behavior.' },
+    { id: 'yeta/seedream-5.5', name: 'Yeta · Seedream 5.5', context_length: 32000, architecture: { input_modalities: ['text', 'image'] }, supported_parameters: ['tools'], reasoning: null, pricing: {}, provider: 'yeta', description: 'Seedream 5.5 image generation via Yeta Labs.' },
+  ],
   custom: [
     { id: 'custom/qwen2.5-coder:32b', name: 'Local · Qwen 2.5 Coder 32B', context_length: 131072, architecture: { input_modalities: ['text'] }, supported_parameters: ['tools'], reasoning: null, pricing: {}, provider: 'custom', description: 'Local unrestricted coding model via Ollama / vLLM / LM Studio.' },
     { id: 'custom/deepseek-r1:32b', name: 'Local · DeepSeek R1 32B', context_length: 131072, architecture: { input_modalities: ['text'] }, supported_parameters: ['tools'], reasoning: { supported_efforts: ['none', 'low', 'medium', 'high'] }, pricing: {}, provider: 'custom', description: 'Local reasoning model via OpenAI-compatible server.' },
@@ -452,7 +482,7 @@ export async function providerCatalog(provider, { sort = '', request = fetch, se
     const fallback = STATIC_CATALOGS[provider];
     const providerMeta = PROVIDERS.find(p => p.id === provider);
     const key = getSecret?.(providerMeta?.key);
-    const canQueryLive = (provider === 'custom' && settings?.customBaseUrl) || (key && ['openai', 'anthropic', 'copilot', 'deepseek', 'xai', 'groq'].includes(provider));
+    const canQueryLive = (provider === 'custom' && settings?.customBaseUrl) || (key && ['yeta', 'openai', 'anthropic', 'copilot', 'deepseek', 'xai', 'groq'].includes(provider));
     if (canQueryLive) {
       try {
         let base = provider === 'custom' ? String(settings.customBaseUrl).replace(/\/+$/, '') : providerMeta.base;

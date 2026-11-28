@@ -41,6 +41,7 @@ const CONFIG_KEYS = [
   'autoWorkspaceWrites',
   'desktopEnabled',
   'favoriteModels',
+  'enabledModels',
   'temperature',
   'topP',
   'presencePenalty',

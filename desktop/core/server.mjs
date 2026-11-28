@@ -357,9 +357,24 @@ export async function createNexusServer({
     wireguardStart: a => invoke('wireguardStart', a),
     wireguardStartChainTor: a => invoke('wireguardStartChainTor', a),
     wireguardStop: () => invoke('wireguardStop'),
+    wireguardInstall: a => invoke('wireguardInstall', a),
+    wireguardRemoveProfile: a => invoke('wireguardRemoveProfile', a),
+    torInstall: a => invoke('torInstall', a),
     torStart: a => invoke('torStart', a),
     torStop: () => invoke('torStop'),
     torNewIdentity: () => invoke('torNewIdentity'),
+    privacyStatus: () => invoke('privacyStatus'),
+    privacyProbes: () => invoke('privacyProbes'),
+    wipeBrowser: async () => {
+      const accountProfile = path.join(dataDir, 'browser-account-profile');
+      const cleared = [];
+      if (fs.existsSync(accountProfile)) {
+        await fsp.rm(accountProfile, { recursive: true, force: true }).catch(() => {});
+        cleared.push(accountProfile);
+      }
+      pushSse('browser_wipe', { at: new Date().toISOString() });
+      return { wiped: true, clearedPaths: cleared };
+    },
   };
 
   const configFile = new ConfigFileManager(dataDir, runtime);

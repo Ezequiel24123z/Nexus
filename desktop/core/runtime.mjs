@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { baseTools, executeTool, READ_ONLY_TOOL_NAMES } from './tools.mjs';
-import { ProcessManager, StatefulShellManager, discoverWorkspaceInstructions, expandSlashCommand, revertFileBackup } from './coding-engine.mjs';
+import { ProcessManager, StatefulShellManager, ElevatedAdminBroker, discoverWorkspaceInstructions, expandSlashCommand, revertFileBackup } from './coding-engine.mjs';
 import { aggregateUsage, normalizeUsage } from './telemetry.mjs';
 import {citationsFromAnnotations, readCompletionStream, readAnthropicStream, normalizeAnthropicResponse} from './stream.mjs';
 import {hydrateAttachmentReferences, materializeImageAttachment, materializeToolResult, saveRawArtifact} from './artifacts.mjs';
@@ -19,13 +21,128 @@ import {modelConnection,completionRequest,allProviders,resolveCopilotAuth} from 
 import {isNetworkFailure,retryableNetworkFailure,networkFailure,providerHttpFailure,extractSafeProviderDetail} from './provider-errors.mjs';
 import {isStockGlobalInstructions, globalInstructions as stockGlobalInstructions} from './store.mjs';
 import {PiiScrubber, isLocalModelEndpoint} from './pii-scrubber.mjs';
-import {buildPrivacyAudit, PRIVACY_MODE_GUIDE} from './privacy-proxy.mjs';
+import {buildPrivacyAudit, checkPrivacyStatus, probeLocalProxies, detectSystemVpn, PRIVACY_MODE_GUIDE} from './privacy-proxy.mjs';
+import {executeNexusControl} from './nexus-control.mjs';
 import {SEARCH_PROVIDER_CATALOG} from './search-engines.mjs';
 import {setTimeout as retryDelay} from 'node:timers/promises';
+
+export const NEXUS_APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const externalEffects=new Set(['write_file','replace_text','multi_edit','apply_patch','delete_file','move_file','run_command','shell_session','git_operation','manage_process','invoke_mcp','invoke_connector','http_request','desktop_action','create_connector','save_capability','scaffold_mcp_server','manage_automation','create_dynamic_tool']);
 
 const RISKY_COMMAND_RE = /\b(rm|rmdir|del|erase|remove-item|format|diskpart|stop-process|taskkill|shutdown|restart-computer|netsh|icacls|takeown|bcdedit|invoke-expression|iex|chmod|chown|runas|sudo|reg\s+(add|delete)|git\s+(push|reset\s+--hard|clean\s+-f)|npm\s+publish)\b|\|\s*(sh|bash|powershell|iex)\b/i;
+
+const SELF_MUTATE_SHELL_RE = /\b(set-content|add-content|out-file|writealltext|writeallbytes|writefilesync|writefile|renamesync|unlinksync|remove-item|move-item|copy-item|new-item|mkdir|rmdir|del|rm|ren|mv|cp|sed\s+-i|npm\s+run\s+build|dotnet\s+build|vite\s+build|git\s+(commit|checkout|reset|clean|push|pull|stash|apply|cherry-pick|rebase|merge)|encoding-repair|repair-workspace)\b|(?<![<>])>{1,2}(?!\s*&|\s*null|\s*\$null)/i;
+
+const SELF_KILL_SHELL_RE = /\b(stop-process|taskkill|closemainwindow|kill\s*\(|restart-nexus|start-process[^\r\n]*nexus\.exe)\b/i;
+
+const PROTECTED_DATA_FILES = new Set(['workspace.json', 'nexus.config.json', 'vault.dpapi', 'vault.bin', 'workspace.sqlite', 'workspace.sqlite-wal', 'workspace.sqlite-shm']);
+
+export function isPathWithin(root, candidate) {
+  if (!root || !candidate) return false;
+  const normRoot = path.resolve(root);
+  const normCand = path.resolve(candidate);
+  const a = process.platform === 'win32' ? normRoot.toLowerCase() : normRoot;
+  const b = process.platform === 'win32' ? normCand.toLowerCase() : normCand;
+  if (a === b) return true;
+  const rel = path.relative(a, b);
+  return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+export function safeDefaultWorkspace(appRoot = NEXUS_APP_ROOT) {
+  const cwd = process.cwd();
+  if (isPathWithin(appRoot, cwd)) return os.homedir();
+  return cwd;
+}
+
+export function detectNexusSelfModification(name, args = {}, task = {}, { appRoot = NEXUS_APP_ROOT, dataDir = '' } = {}) {
+  const safeTools = new Set([
+    ...READ_ONLY_TOOL_NAMES,
+    'manage_session',
+    'manage_project',
+    'manage_privacy',
+    'nexus_control',
+    'memory_store',
+    'todo_write',
+    'document_progress',
+    'search_capabilities',
+    'get_capability',
+    'get_connector',
+    'present_media',
+  ]);
+  if (safeTools.has(name)) return { blocked: false, reason: '' };
+
+  const baseCwd = task?.workspace || safeDefaultWorkspace(appRoot);
+  const isProtectedDataFile = resolved => {
+    if (!dataDir || !isPathWithin(dataDir, resolved)) return false;
+    const base = path.basename(resolved).toLowerCase();
+    return PROTECTED_DATA_FILES.has(base);
+  };
+  const isProtectedPath = rawPath => {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    const resolved = path.resolve(baseCwd, rawPath);
+    if (isPathWithin(appRoot, resolved)) return { kind: 'app', resolved };
+    if (isProtectedDataFile(resolved)) return { kind: 'data', resolved };
+    return null;
+  };
+
+  if (['write_file', 'replace_text', 'multi_edit', 'apply_patch', 'delete_file', 'move_file'].includes(name)) {
+    const candidates = name === 'move_file' ? [args?.from, args?.to] : [args?.path];
+    for (const raw of candidates) {
+      const hit = isProtectedPath(raw);
+      if (hit) {
+        return {
+          blocked: true,
+          reason: hit.kind === 'app'
+            ? `NEXUS Self-Edit Protection: "${name}" targets NEXUS application/source path (${hit.resolved}). Editing NEXUS itself requires your explicit permission even in Unrestricted mode.`
+            : `NEXUS Self-Edit Protection: "${name}" targets protected internal NEXUS state file (${hit.resolved}). Explicit user permission is required even in Unrestricted mode.`,
+        };
+      }
+    }
+    return { blocked: false, reason: '' };
+  }
+
+  if (name === 'git_operation') {
+    const mutatingGit = new Set(['commit', 'checkout', 'checkout_new', 'discard', 'stash', 'pull', 'push', 'stage', 'unstage', 'worktree_add', 'worktree_remove']);
+    if (!mutatingGit.has(args?.operation)) return { blocked: false, reason: '' };
+    const gitCwd = args?.cwd ? path.resolve(baseCwd, args.cwd) : baseCwd;
+    const appParent = path.basename(appRoot).toLowerCase() === 'desktop' ? path.dirname(appRoot) : '';
+    if (isPathWithin(appRoot, gitCwd) || (appParent && path.resolve(gitCwd).toLowerCase() === appParent.toLowerCase())) {
+      return {
+        blocked: true,
+        reason: `NEXUS Self-Edit Protection: mutating git_operation (${args.operation}) targets the NEXUS repository (${gitCwd}). Explicit user permission is required even in Unrestricted mode.`,
+      };
+    }
+    return { blocked: false, reason: '' };
+  }
+
+  if (['run_command', 'shell_session', 'manage_process'].includes(name)) {
+    if (name === 'manage_process' && args?.action !== 'start') return { blocked: false, reason: '' };
+    const cmd = String(args?.command || '');
+    if (SELF_KILL_SHELL_RE.test(cmd) && /\bnexus\b/i.test(cmd)) {
+      return {
+        blocked: true,
+        reason: 'NEXUS Self-Edit Protection: command attempts to close, terminate, or restart NEXUS itself. Explicit user permission is required even in Unrestricted mode.',
+      };
+    }
+    const normCmd = cmd.replace(/\//g, '\\').toLowerCase();
+    const normApp = path.resolve(appRoot).replace(/\//g, '\\').toLowerCase();
+    const normData = dataDir ? path.resolve(dataDir).replace(/\//g, '\\').toLowerCase() : '';
+    const referencesApp = normApp && normCmd.includes(normApp);
+    const referencesProtectedData = Boolean(
+      normData && normCmd.includes(normData) && [...PROTECTED_DATA_FILES].some(f => normCmd.includes(f))
+    ) || /\b(workspace\.json|nexus\.config\.json|vault\.dpapi|vault\.bin)\b/i.test(cmd);
+    const cwdInApp = Boolean(task?.workspace && isPathWithin(appRoot, task.workspace));
+    if ((referencesApp || referencesProtectedData || cwdInApp) && SELF_MUTATE_SHELL_RE.test(cmd)) {
+      return {
+        blocked: true,
+        reason: `NEXUS Self-Edit Protection: shell command attempts to modify NEXUS application/source files or protected internal state (${referencesApp ? appRoot : (cwdInApp ? task.workspace : 'NEXUS data')}). Explicit user permission is required even in Unrestricted mode.`,
+      };
+    }
+  }
+
+  return { blocked: false, reason: '' };
+}
 
 export function matchesSemiAutoRule(rule, name, args = {}) {
   const raw = String(rule || '').trim();
@@ -88,8 +205,16 @@ export function assessActionRisk(name, args = {}, task = {}, settings = {}) {
   }
   if (name === 'manage_privacy') {
     const act = String(args?.action || 'status').toLowerCase();
-    if (act === 'status' || act === 'explain') return { risky: false, reason: '' };
+    if (act === 'status' || act === 'explain' || act === 'verify') return { risky: false, reason: '' };
     return { risky: true, reason: `Changing NEXUS privacy/network setting (${act})` };
+  }
+  if (name === 'nexus_control') {
+    const act = String(args?.action || 'inspect').toLowerCase();
+    const sub = String(args?.providerAction || args?.toolAction || '').toLowerCase();
+    if (act === 'guide' || act === 'inspect') return { risky: false, reason: '' };
+    if (act === 'manage_provider' && ['list', 'list_models', 'check_connection'].includes(sub)) return { risky: false, reason: '' };
+    if (act === 'manage_tools' && sub === 'list') return { risky: false, reason: '' };
+    return { risky: true, reason: `Changing NEXUS configuration/state (${act}${sub ? ':' + sub : ''})` };
   }
   if (name === 'invoke_mcp') {
     return { risky: true, reason: `External MCP tool (${args?.server || 'server'}:${args?.tool || 'tool'})` };
@@ -149,7 +274,26 @@ export class Runtime extends EventEmitter {
     this.attachments=new AttachmentStore(store);
     this.processes=new ProcessManager();
     this.shells=new StatefulShellManager();
+    this.adminBroker=new ElevatedAdminBroker();
     this.plugins=new PluginManager(store.directory);
+    this._workspaceMetaCache=new Map();
+  }
+  _getWorkspaceMeta(workspace) {
+    if (!workspace) return { rules: '', skills: [] };
+    const now = Date.now();
+    const cached = this._workspaceMetaCache.get(workspace);
+    if (cached && now - cached.at < 5000) return cached;
+    const entry = {
+      at: now,
+      rules: discoverWorkspaceInstructions(workspace),
+      skills: discoverWorkspaceSkills(workspace),
+    };
+    this._workspaceMetaCache.set(workspace, entry);
+    if (this._workspaceMetaCache.size > 32) {
+      const firstKey = this._workspaceMetaCache.keys().next().value;
+      if (firstKey) this._workspaceMetaCache.delete(firstKey);
+    }
+    return entry;
   }
   activePiiScrubber() {
     const s = this.store.state.settings || {};
@@ -207,6 +351,7 @@ export class Runtime extends EventEmitter {
       compacting: this.compacting.has(task.id),
       liveText: task.liveText || '',
       liveReasoning: task.liveReasoning || '',
+      liveReasoningStartedAt: task.liveReasoningStartedAt || null,
       liveActivity: task.liveActivity || '',
       liveTools: task.liveTools || [],
       liveSubagents: task.liveSubagents || [],
@@ -226,8 +371,8 @@ export class Runtime extends EventEmitter {
       mcpStatus:this.mcp?.status({compact:activeTaskId!==undefined}) || {},
       tasks: this.store.state.tasks.map(task => {
         if(activeTaskId!==undefined&&task.id!==activeTaskId)return {
-          id:task.id,title:task.title,prompt:task.prompt,projectId:task.projectId,parentTaskId:task.parentTaskId||null,workspace:task.workspace,
-          status:task.status,model:task.model,agentMode:task.agentMode,ephemeral:Boolean(task.ephemeral),adminMode:Boolean(task.adminMode),arenaGroupId:task.arenaGroupId||null,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,
+          id:task.id,title:task.title,titleCustomized:Boolean(task.titleCustomized),prompt:task.prompt,projectId:task.projectId,parentTaskId:task.parentTaskId||null,workspace:task.workspace,
+          status:task.status,liveActivity:task.liveActivity||'',model:task.model,agentMode:task.agentMode,ephemeral:Boolean(task.ephemeral),adminMode:Boolean(task.adminMode),arenaGroupId:task.arenaGroupId||null,dependsOn:task.dependsOn,pinned:task.pinned,createdAt:task.createdAt,updatedAt:task.updatedAt||task.createdAt,
           compacting:this.compacting.has(task.id),summaryOnly:true
         };
         const conversationStart=Math.max(0,task.conversation.length-120),eventsStart=Math.max(0,task.events.length-80);
@@ -236,7 +381,7 @@ export class Runtime extends EventEmitter {
         const compressionThreshold=effectiveWindow*this.store.state.settings.compressionPercent/100;
         return {...task,messages:undefined,pendingImages:undefined,_ramArtifacts:undefined,_ramAttachments:undefined,ramCheckpoints:undefined,compacting:this.compacting.has(task.id),todos:task.todos||[],liveTools:task.liveTools||[],liveSubagents:task.liveSubagents||[],calls:(task.calls||[]).slice(-80),callsTotal:(task.calls||[]).length,callsStart:Math.max(0,(task.calls||[]).length-80),effects:(task.effects||[]).slice(-60),effectsTotal:(task.effects||[]).length,events:task.events.slice(eventsStart),eventsStart,eventsTotal:task.events.length,conversation:task.conversation.slice(conversationStart),conversationStart,conversationTotal:task.conversation.length,contextTokens,needsCompression:contextTokens>=compressionThreshold};
       }),
-      approvals: [...this.approvals].filter(([,item])=>activeTaskId===undefined||item.taskId===activeTaskId).map(([id, item]) => ({ id, taskId: item.taskId, name: item.name, args: item.args, reason: item.reason || '', suggestedPattern: item.suggestedPattern || item.name })),
+      approvals: [...this.approvals].filter(([,item])=>activeTaskId===undefined||item.taskId===activeTaskId).map(([id, item]) => ({ id, taskId: item.taskId, name: item.name, args: item.args, reason: item.reason || '', suggestedPattern: item.criticalSelfEdit ? '' : (item.suggestedPattern || item.name), criticalSelfEdit: Boolean(item.criticalSelfEdit) })),
       hasKey: Boolean(conn.optionalKey || this.getSecret(conn.key)),
       providerKeys: Object.fromEntries(allProviders(this.store.state.settings).map(p => [p.id, Boolean(p.optionalKey || this.getSecret(p.key))])),
     };
@@ -264,12 +409,13 @@ export class Runtime extends EventEmitter {
     const effectiveMode = agentMode || expanded.mode;
     if(effectiveMode!==undefined && !agentModes.includes(effectiveMode))throw new Error('Invalid agent mode.');
     const chosenModel = model || this.store.state.settings.model;
-    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), prompt: effectivePrompt, workspace, projectId:projectId || null, parentTaskId: parentTaskId || null, notifyParentOnIdle: Boolean(notifyParentOnIdle), ephemeral: Boolean(ephemeral), adminMode: Boolean(adminMode), engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
+    const nowIso = new Date().toISOString();
+    const task = { id: crypto.randomUUID(), title: (title || prompt).slice(0, 80), titleCustomized: Boolean(title && String(title).trim()), prompt: effectivePrompt, workspace, projectId:projectId || null, parentTaskId: parentTaskId || null, notifyParentOnIdle: Boolean(notifyParentOnIdle), ephemeral: Boolean(ephemeral), adminMode: Boolean(adminMode), engine:modelConnection(chosenModel, this.store.state.settings).id, model: chosenModel,
       ...(effectiveMode ? { agentMode: effectiveMode } : {}),
       ...(arenaGroupId ? { arenaGroupId } : {}),
       ...(typeof temperature === 'number' ? { temperature } : {}),
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
-      dependsOn, attachments, status: 'queued', createdAt: new Date().toISOString(), messages: [], conversation: [], events: [], effects: [], todos: [], liveTools: [], liveSubagents: [], summary: '', compressions: 0, steps: 0, contextTokens: 0 };
+      dependsOn, attachments, status: 'queued', createdAt: nowIso, updatedAt: nowIso, messages: [], conversation: [], events: [], effects: [], todos: [], liveTools: [], liveSubagents: [], summary: '', compressions: 0, steps: 0, contextTokens: 0 };
     if (!task.model) throw new Error('Select a model in Settings.');
     if(!task.workspace&&attachments.length)task.workspace=this.attachments.workspace(task.id);
     this.store.state.tasks.unshift(task);
@@ -374,6 +520,16 @@ export class Runtime extends EventEmitter {
     }
     if (typeof input.model === 'string' && input.model.length < 180) s.model = input.model;
     if(input.favoriteModels!==undefined){if(!Array.isArray(input.favoriteModels)||input.favoriteModels.length>100||input.favoriteModels.some(id=>typeof id!=='string'||!id.trim()||id.length>180))throw new Error('Invalid favorite models list.');s.favoriteModels=[...new Set(input.favoriteModels.map(id=>id.trim()))];}
+    if(input.enabledModels!==undefined){
+      if(!input.enabledModels||typeof input.enabledModels!=='object'||Array.isArray(input.enabledModels))throw new Error('Invalid enabledModels map.');
+      const clean={};
+      for(const [provId, list] of Object.entries(input.enabledModels)){
+        const key=String(provId||'').trim().toLowerCase();
+        if(!key||key.length>64||!Array.isArray(list))continue;
+        clean[key]=[...new Set(list.filter(id=>typeof id==='string'&&id.trim()&&id.length<=180).map(id=>id.trim()))].slice(0,500);
+      }
+      s.enabledModels=clean;
+    }
     if(input.customProviders!==undefined){
       if(!Array.isArray(input.customProviders)||input.customProviders.length>50)throw new Error('Invalid customProviders list.');
       s.customProviders=input.customProviders.filter(p=>p&&typeof p.id==='string'&&/^[a-z0-9][a-z0-9_-]{0,31}$/i.test(p.id)&&typeof p.baseUrl==='string'&&p.baseUrl.trim()).map(p=>({
@@ -475,7 +631,7 @@ export class Runtime extends EventEmitter {
     if(input.projectId&& !this.store.state.projects.some(project=>project.id===input.projectId))throw new Error('Project not found');
     Object.assign(task,options);
     if(options.model)task.engine=modelConnection(options.model,this.store.state.settings).id;
-    if(typeof input.title==='string'&&input.title.trim())task.title=input.title.trim().slice(0,120);
+    if(typeof input.title==='string'&&input.title.trim()){task.title=input.title.trim().slice(0,120);task.titleCustomized=true;task.titleUpdatedAt=new Date().toISOString();}
     if(typeof input.pinned==='boolean')task.pinned=input.pinned;
     if(typeof input.adminMode==='boolean')task.adminMode=input.adminMode;
     if(typeof input.ephemeral==='boolean')this.store.setTaskEphemeral(task.id, input.ephemeral, 'User toggled storage mode');
@@ -760,6 +916,8 @@ export class Runtime extends EventEmitter {
       if (!nextTitle) throw new Error('manage_session rename requires a non-empty title.');
       const previous = target.title;
       target.title = nextTitle;
+      target.titleCustomized = true;
+      target.titleUpdatedAt = new Date().toISOString();
       this.store.journal(target, 'session_renamed', { previous, title: nextTitle });
       this.changed(target);
       return { renamed: true, sessionId: target.id, previousTitle: previous, title: nextTitle };
@@ -817,37 +975,149 @@ export class Runtime extends EventEmitter {
   }
   async managePrivacy(currentTask, args = {}) {
     const action = String(args.action || 'status').toLowerCase();
-    const s = this.store.state.settings || {};
-    const getStatusPayload = () => ({
-      posture: this.privacyPostureLine(),
-      audit: buildPrivacyAudit(s, this.tor || null, this.store, this.wireguard || null),
-      settings: {
-        browserProxyMode: s.browserProxyMode || 'direct',
-        browserProxyUrl: s.browserProxyUrl || '',
-        torRouteAllTraffic: Boolean(s.torRouteAllTraffic),
-        browserRouteAgentTraffic: Boolean(s.browserRouteAgentTraffic),
-        torStrictFailClosed: Boolean(s.torStrictFailClosed),
-        stealthMode: Boolean(s.stealthMode),
-        privacyScrubPii: Boolean(s.privacyScrubPii),
-        privacyScrubCustomRulesCount: (s.privacyScrubCustomRules || []).length,
-        searchProvider: s.searchProvider || 'auto',
-        searchStrictZeroTrack: Boolean(s.searchStrictZeroTrack),
-        browserSearxUrl: s.browserSearxUrl || '',
-        searchTorchOnionUrl: s.searchTorchOnionUrl || '',
-        browserPersistentProfile: Boolean(s.browserPersistentProfile),
-        browserBlockTrackers: s.browserBlockTrackers !== false,
-        browserAntiFingerprint: s.browserAntiFingerprint !== false,
-        browserEngineMode: s.browserEngineMode || 'dual',
-        promptCaching: s.promptCaching !== false,
-        cacheAffinity: Boolean(s.cacheAffinity),
-      },
-      tor: this.tor?.status?.() || { installed: false, running: false },
-      wireguard: this.wireguard?.status?.(s.wireguardBinaryPath) || { installed: false, running: false, profiles: [] },
-      piiScrubber: this.activePiiScrubber().summary(),
-    });
+    const getStatusPayload = () => {
+      const s = this.store.state.settings || {};
+      const torSt = this.tor?.status?.() || { installed: false, running: false };
+      const wgSt = this.wireguard?.status?.(s.wireguardBinaryPath) || { installed: false, running: false, profiles: [] };
+      const warnings = [];
+      const mode = s.browserProxyMode || 'direct';
+      if (mode === 'wireguard-tor') {
+        if (!wgSt.profiles?.length) warnings.push('Routing is set to wireguard-tor, but no WireGuard .conf profile is imported.');
+        else if (!wgSt.running) warnings.push('Routing is set to wireguard-tor, but WireGuard tunnel is stopped.');
+        if (!torSt.running) warnings.push('Routing is set to wireguard-tor, but Managed Tor is stopped.');
+      } else if (mode === 'wireguard' && !wgSt.running) {
+        warnings.push(wgSt.profiles?.length ? 'Routing is set to wireguard, but WireGuard tunnel is stopped.' : 'Routing is set to wireguard, but no WireGuard .conf profile is imported.');
+      } else if (mode === 'managed-tor' && !torSt.running) {
+        warnings.push('Routing is set to managed-tor, but Managed Tor is stopped.');
+      } else if (mode === 'direct' && s.torStrictFailClosed) {
+        warnings.push('Kill-switch (torStrictFailClosed) is enabled while routing mode is direct.');
+      }
+      return {
+        posture: this.privacyPostureLine(),
+        warnings,
+        audit: buildPrivacyAudit(s, this.tor || null, this.store, this.wireguard || null),
+        settings: {
+          browserProxyMode: mode,
+          browserProxyUrl: s.browserProxyUrl || '',
+          torRouteAllTraffic: Boolean(s.torRouteAllTraffic),
+          browserRouteAgentTraffic: Boolean(s.browserRouteAgentTraffic),
+          torStrictFailClosed: Boolean(s.torStrictFailClosed),
+          stealthMode: Boolean(s.stealthMode),
+          privacyScrubPii: Boolean(s.privacyScrubPii),
+          privacyScrubCustomRulesCount: (s.privacyScrubCustomRules || []).length,
+          searchProvider: s.searchProvider || 'auto',
+          searchStrictZeroTrack: Boolean(s.searchStrictZeroTrack),
+          browserSearxUrl: s.browserSearxUrl || '',
+          searchTorchOnionUrl: s.searchTorchOnionUrl || '',
+          browserPersistentProfile: Boolean(s.browserPersistentProfile),
+          browserBlockTrackers: s.browserBlockTrackers !== false,
+          browserAntiFingerprint: s.browserAntiFingerprint !== false,
+          browserEngineMode: s.browserEngineMode || 'dual',
+          wireguardActiveProfileId: s.wireguardActiveProfileId || '',
+          wireguardBinaryPath: s.wireguardBinaryPath || '',
+          promptCaching: s.promptCaching !== false,
+          cacheAffinity: Boolean(s.cacheAffinity),
+        },
+        tor: torSt,
+        wireguard: wgSt,
+        piiScrubber: this.activePiiScrubber().summary(),
+      };
+    };
 
     if (action === 'status') {
       return getStatusPayload();
+    }
+    if (action === 'verify') {
+      const s = this.store.state.settings || {};
+      const liveNetwork = this.privacyController?.privacyStatus
+        ? await this.privacyController.privacyStatus()
+        : await checkPrivacyStatus(s, this.tor || null, this.wireguard || null);
+      const probes = this.privacyController?.privacyProbes
+        ? await this.privacyController.privacyProbes()
+        : { vpn: await detectSystemVpn(), localProxies: await probeLocalProxies() };
+      return { verified: true, liveNetwork, probes, ...getStatusPayload() };
+    }
+    if (action === 'apply_preset') {
+      const preset = String(args.preset || 'maximum').toLowerCase();
+      const s = this.store.state.settings || {};
+      const notes = [];
+      let daemonResult = null;
+      if (['maximum', 'max', 'wireguard-tor', 'tor', 'managed-tor', 'wireguard'].includes(preset)) {
+        const wgSt = this.wireguard?.status?.(s.wireguardBinaryPath) || { profiles: [] };
+        const hasWgProfile = Boolean(wgSt.profiles?.length);
+        let desiredMode = preset === 'wireguard'
+          ? 'wireguard'
+          : (preset === 'tor' || preset === 'managed-tor')
+            ? 'managed-tor'
+            : (hasWgProfile ? 'wireguard-tor' : 'managed-tor');
+        if ((preset === 'wireguard' || preset === 'wireguard-tor') && !hasWgProfile) {
+          notes.push('No WireGuard .conf profile is imported yet; import one with manage_privacy(action="wireguard_import") to enable WireGuard.');
+          if (preset === 'wireguard-tor') desiredMode = 'managed-tor';
+        }
+        const patch = {
+          stealthMode: true,
+          browserProxyMode: desiredMode,
+          torRouteAllTraffic: args.routeAllTraffic !== false,
+          browserRouteAgentTraffic: true,
+          torStrictFailClosed: args.killSwitch !== false,
+          browserPersistentProfile: false,
+          browserBlockTrackers: true,
+          browserAntiFingerprint: true,
+          searchStrictZeroTrack: true,
+          searchProvider: args.provider || (desiredMode.includes('tor') ? (s.searchProvider || 'auto') : 'auto'),
+          privacyScrubPii: args.pii !== false,
+        };
+        if (desiredMode === 'managed-tor' || desiredMode === 'wireguard-tor') {
+          patch.browserProxyUrl = this.tor?.getSocksUrl?.() || 'socks5://127.0.0.1:9055';
+        } else if (desiredMode === 'wireguard') {
+          patch.browserProxyUrl = this.wireguard?.getSocksUrl?.() || 'socks5://127.0.0.1:9060';
+        }
+        this.settings(patch);
+        if (args.startDaemons !== false && this.privacyController) {
+          try {
+            if (desiredMode === 'wireguard-tor' && hasWgProfile) {
+              daemonResult = await this.privacyController.wireguardStartChainTor({ profileId: args.profileId || s.wireguardActiveProfileId || '', autoInstall: args.autoInstall !== false });
+            } else if (desiredMode === 'wireguard' && hasWgProfile) {
+              daemonResult = await this.privacyController.wireguardStart({ profileId: args.profileId || s.wireguardActiveProfileId || '', autoInstall: args.autoInstall !== false, activate: true });
+            } else if (desiredMode === 'managed-tor') {
+              daemonResult = await this.privacyController.torStart({ autoInstall: args.autoInstall !== false, activate: true });
+            }
+          } catch (err) {
+            notes.push('Settings applied, but daemon start returned an error: ' + err.message);
+          }
+        }
+        if (args.sessionEphemeral === true && currentTask && !currentTask.ephemeral) {
+          this.store.setTaskEphemeral(currentTask.id, true, `Privacy preset (${preset})`);
+          notes.push('Current session migrated to RAM-Only ephemeral mode (disk traces purged).');
+        }
+      } else if (preset === 'balanced') {
+        this.settings({
+          stealthMode: false,
+          torStrictFailClosed: false,
+          privacyScrubPii: args.pii !== false,
+          browserPersistentProfile: false,
+          browserBlockTrackers: true,
+          browserAntiFingerprint: true,
+          searchStrictZeroTrack: true,
+        });
+      } else if (preset === 'direct' || preset === 'off') {
+        if (args.stopDaemons !== false && this.privacyController) {
+          try { if (this.tor?.isRunning?.() || ['managed-tor', 'wireguard-tor'].includes(s.browserProxyMode)) await this.privacyController.torStop(); } catch {}
+          try { if (this.wireguard?.isRunning?.() || ['wireguard', 'wireguard-tor'].includes(s.browserProxyMode)) await this.privacyController.wireguardStop(); } catch {}
+        }
+        this.settings({
+          stealthMode: false,
+          browserProxyMode: 'direct',
+          torRouteAllTraffic: false,
+          browserRouteAgentTraffic: false,
+          torStrictFailClosed: false,
+          ...(args.disablePii === true ? { privacyScrubPii: false } : {}),
+        });
+      } else {
+        throw new Error('Unsupported privacy preset. Use: maximum, wireguard-tor, wireguard, tor, balanced, or off.');
+      }
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, preset, notes });
+      return { applied: true, preset, notes, ...(daemonResult ? { daemonResult } : {}), ...getStatusPayload() };
     }
     if (action === 'explain') {
       return {
@@ -892,6 +1162,7 @@ export class Runtime extends EventEmitter {
       return { updated: true, applied: patch, ...getStatusPayload() };
     }
     if (action === 'set_pii') {
+      const s = this.store.state.settings || {};
       const patch = {};
       if (typeof args.enabled === 'boolean') patch.privacyScrubPii = args.enabled;
       let rules = [...(s.privacyScrubCustomRules || [])];
@@ -918,20 +1189,56 @@ export class Runtime extends EventEmitter {
       if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, patch });
       return { updated: true, applied: patch, ...getStatusPayload() };
     }
+    if (action === 'set_wireguard_binary') {
+      this.settings({ wireguardBinaryPath: String(args.binaryPath || args.filePath || '').trim() });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { updated: true, ...getStatusPayload() };
+    }
     if (action === 'wireguard_import') {
+      const s = this.store.state.settings || {};
       if (!this.wireguard) throw new Error('WireGuard manager is not available in this runtime.');
       let confText = String(args.configText || '');
       let derivedName = String(args.name || '');
       if (!confText && args.filePath) {
-        const fp = path.resolve(currentTask?.workspace || process.cwd(), String(args.filePath));
+        const fp = path.resolve(currentTask?.workspace || safeDefaultWorkspace(), String(args.filePath));
         if (!fsSync.existsSync(fp)) throw new Error('WireGuard .conf file not found: ' + fp);
         confText = fsSync.readFileSync(fp, 'utf8');
         if (!derivedName) derivedName = path.basename(fp).replace(/\.conf$/i, '');
       }
       const profile = this.wireguard.addProfile({ name: derivedName, configText: confText });
-      if (!s.wireguardActiveProfileId) this.settings({ wireguardActiveProfileId: profile.id });
+      if (!s.wireguardActiveProfileId || args.activate !== false) this.settings({ wireguardActiveProfileId: profile.id });
       if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, profileId: profile.id, name: profile.name });
       return { imported: true, profile, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_select') {
+      if (!this.wireguard) throw new Error('WireGuard manager is not available in this runtime.');
+      const list = this.wireguard.status(this.store.state.settings?.wireguardBinaryPath)?.profiles || [];
+      const match = args.profileId
+        ? list.find(p => p.id === args.profileId)
+        : (args.name ? list.find(p => p.name.toLowerCase() === String(args.name).trim().toLowerCase()) : null);
+      if (!match) throw new Error('WireGuard profile not found. Call manage_privacy(action="status") to list available profiles.');
+      this.settings({ wireguardActiveProfileId: match.id });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, profileId: match.id, name: match.name });
+      return { selected: true, profile: match, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_remove') {
+      if (!args.profileId) throw new Error('wireguard_remove requires profileId.');
+      if (this.privacyController?.wireguardRemoveProfile) {
+        await this.privacyController.wireguardRemoveProfile({ id: args.profileId });
+      } else if (this.wireguard) {
+        await this.wireguard.removeProfile(args.profileId);
+        if (this.store.state.settings?.wireguardActiveProfileId === args.profileId) this.settings({ wireguardActiveProfileId: '' });
+      } else {
+        throw new Error('WireGuard manager is not available in this runtime.');
+      }
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action, profileId: args.profileId });
+      return { removed: true, profileId: args.profileId, ...getStatusPayload() };
+    }
+    if (action === 'wireguard_install') {
+      if (!this.privacyController?.wireguardInstall) throw new Error('WireGuard installer is not attached to this runtime.');
+      const res = await this.privacyController.wireguardInstall({ force: Boolean(args.force) });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { installed: true, result: res, ...getStatusPayload() };
     }
     if (action === 'wireguard_connect') {
       if (!this.privacyController) throw new Error('WireGuard/Tor daemon control is not attached to this runtime.');
@@ -946,6 +1253,12 @@ export class Runtime extends EventEmitter {
       await this.privacyController.wireguardStop();
       if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
       return { disconnected: true, ...getStatusPayload() };
+    }
+    if (action === 'tor_install') {
+      if (!this.privacyController?.torInstall) throw new Error('Tor installer is not attached to this runtime.');
+      const res = await this.privacyController.torInstall({ force: Boolean(args.force) });
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { installed: true, result: res, ...getStatusPayload() };
     }
     if (action === 'tor_start') {
       if (!this.privacyController) throw new Error('Tor daemon control is not attached to this runtime.');
@@ -965,7 +1278,17 @@ export class Runtime extends EventEmitter {
       if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
       return { rotated: true, ...res, ...getStatusPayload() };
     }
+    if (action === 'wipe_browser') {
+      const wiped = this.privacyController?.wipeBrowser
+        ? await this.privacyController.wipeBrowser()
+        : { wiped: false, note: 'Browser profile wipe is only available when running the NEXUS desktop server.' };
+      if (currentTask) this.store.journal(currentTask, 'privacy_updated', { action });
+      return { ...wiped, ...getStatusPayload() };
+    }
     throw new Error('Unsupported manage_privacy action: ' + action);
+  }
+  async nexusControl(currentTask, args = {}) {
+    return executeNexusControl(this, currentTask, args, { appRoot: NEXUS_APP_ROOT });
   }
   async revertFileChange(id, eventId) {
     const task = this.store.task(id);
@@ -1041,11 +1364,11 @@ export class Runtime extends EventEmitter {
   approve(id, allowed, { allowSession = false, alwaysAllowPattern = '' } = {}) {
     const pending = this.approvals.get(id);
     if (!pending) throw new Error('Approval request expired.');
-    if (allowed && allowSession) {
+    if (allowed && allowSession && !pending.criticalSelfEdit) {
       const task = this.store.state.tasks.find(t => t.id === pending.taskId);
       if (task) task.sessionAutoApprove = true;
     }
-    if (allowed && alwaysAllowPattern) {
+    if (allowed && alwaysAllowPattern && !pending.criticalSelfEdit) {
       const pattern = String(alwaysAllowPattern).trim();
       if (pattern) {
         const cur = Array.isArray(this.store.state.settings.semiAutoAllowRules) ? this.store.state.settings.semiAutoAllowRules : [];
@@ -1056,22 +1379,38 @@ export class Runtime extends EventEmitter {
     }
     pending.resolve(Boolean(allowed));
   }
-  approval(task, name, args, signal, reason = '') {
+  approval(task, name, args, signal, reason = '', { criticalSelfEdit = false } = {}) {
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       const finish = (allowed) => {
         signal.removeEventListener('abort', cancel); this.approvals.delete(id);
         task.status = 'running';
-        this.store.journal(task, 'approval', { name, allowed, reason });
+        this.store.journal(task, 'approval', { name, allowed, reason, criticalSelfEdit: Boolean(criticalSelfEdit) });
         this.changed(task); resolve(allowed);
       };
       const cancel = () => { this.approvals.delete(id); this.changed(task); reject(new Error('Cancelled')); };
       if (signal.aborted) return cancel();
       signal.addEventListener('abort', cancel, { once: true });
-      this.approvals.set(id, { taskId: task.id, name, args, reason, suggestedPattern: suggestAllowPattern(name, args), resolve:finish }); task.status = 'approval'; this.changed(task);
+      this.approvals.set(id, {
+        taskId: task.id,
+        name,
+        args,
+        reason,
+        criticalSelfEdit: Boolean(criticalSelfEdit),
+        suggestedPattern: criticalSelfEdit ? '' : suggestAllowPattern(name, args),
+        resolve: finish,
+      });
+      task.status = 'approval'; this.changed(task);
     });
   }
   approvalCheck(name, task, args = {}) {
+    // Hard invariant: protecting NEXUS's own installation, source code, internal state files,
+    // and process ALWAYS requires explicit user confirmation — even in Unrestricted mode or
+    // when sessionAutoApprove / Semi-Autopilot allow rules are enabled.
+    const selfMod = detectNexusSelfModification(name, args, task, { dataDir: this.store?.directory || '' });
+    if (selfMod.blocked) {
+      return { required: true, criticalSelfEdit: true, reason: selfMod.reason };
+    }
     if (['search_capabilities', 'get_capability', 'get_connector', 'load_toolset'].includes(name)) return { required: false, reason: '' };
     if (task?.sessionAutoApprove) return { required: false, reason: '' };
     const level = task?.agentMode || this.store.state.settings.agentMode || 'autopilot';
@@ -1081,6 +1420,16 @@ export class Runtime extends EventEmitter {
       return { required: false, reason: '' };
     }
     if (name === 'manage_project' && args?.action !== 'delete') {
+      return { required: false, reason: '' };
+    }
+    if (name === 'nexus_control') {
+      const act = String(args?.action || 'inspect').toLowerCase();
+      const sub = String(args?.providerAction || args?.toolAction || '').toLowerCase();
+      if (act === 'guide' || act === 'inspect' || (act === 'manage_provider' && ['list', 'list_models', 'check_connection'].includes(sub)) || (act === 'manage_tools' && sub === 'list')) {
+        return { required: false, reason: '' };
+      }
+    }
+    if (name === 'manage_privacy' && ['status', 'explain', 'verify'].includes(String(args?.action || 'status').toLowerCase())) {
       return { required: false, reason: '' };
     }
     if (level === 'interactive') {
@@ -1127,9 +1476,9 @@ export class Runtime extends EventEmitter {
     const responseId=crypto.randomUUID();
     const responseJournal=tools && !silent && !task.ephemeral ? new ResponseJournal(this.store.directoryFor(task.id),responseId) : null;
     let record=normalizeUsage(undefined,{id:crypto.randomUUID(),responseId,model:task.model,kind:tools?'generation':'compression',status:'pending',sessionAffinity:connection.id==='openrouter'&&settings.cacheAffinity===true});
-    let attemptStarted=started, receivedOutput=false, succeeded=false;
+    let attemptStarted=started, receivedOutput=false, succeeded=false, reasoningStartedAt=null, reasoningEndedAt=null;
     task.calls ||= [];task.calls.push(record);
-    if (!silent) { task.liveText=''; task.liveReasoning=''; task.liveActivity='Querying model…'; }
+    if (!silent) { task.liveText=''; task.liveReasoning=''; task.liveReasoningStartedAt=null; task.liveActivity='Querying model…'; }
     const account=()=>{task.telemetry=aggregateUsage(task.calls);task.lastTurnTelemetry=aggregateUsage(task.calls.slice(task.turnCallStart||0));};
     account();
     try { this.store.save(task); } catch {}
@@ -1160,17 +1509,22 @@ export class Runtime extends EventEmitter {
       onOutput:()=>{receivedOutput=true;},
       onText:text=>{
         bump();
+        if (reasoningStartedAt && !reasoningEndedAt) reasoningEndedAt = Date.now();
         if(!tools||silent)return;
         const firstToken = !record.firstTokenMs;
-        task.liveText=text;
+        task.liveText=scrubber.enabled ? scrubber.unscrubText(text) : text;
         task.liveActivity='';
         if(firstToken)record.firstTokenMs=Date.now()-started;
-        try { responseJournal?.update(text); } catch {}
+        try { responseJournal?.update(task.liveText); } catch {}
         if(firstToken){lastPaint=Date.now();this.emit('change');this.emitDelta(task);}
         else if(Date.now()-lastPaint>45){lastPaint=Date.now();this.emitDelta(task);}
       },
       onReasoning:text=>{
         bump();
+        if (!reasoningStartedAt) {
+          reasoningStartedAt = Date.now();
+          if (!silent) task.liveReasoningStartedAt = reasoningStartedAt;
+        }
         if(!tools||silent)return;
         task.liveReasoning=text;
         task.liveActivity='Thinking…';
@@ -1234,9 +1588,13 @@ export class Runtime extends EventEmitter {
     }
     if (!message || (!message.content && !message.tool_calls?.length)) throw new Error('The provider returned an empty response.');
     succeeded = true;
-    return { responseId, message: { role:'assistant', content:message.content || null, ...(message.reasoning_details ? {reasoning_details:message.reasoning_details} : {}), ...(message.tool_calls?.length ? { tool_calls:message.tool_calls } : {}), ...(citations.length ? {sources:citations} : {}) }, usage:data.usage };
+    const hasReasoning = Boolean(reasoningToText(message.reasoning_details) || reasoningStartedAt);
+    const reasoningDurationMs = hasReasoning
+      ? Math.max(0, (reasoningEndedAt || Date.now()) - (reasoningStartedAt || attemptStarted))
+      : null;
+    return { responseId, reasoningDurationMs, message: { role:'assistant', content:message.content || null, ...(message.reasoning_details ? {reasoning_details:message.reasoning_details} : {}), ...(message.tool_calls?.length ? { tool_calls:message.tool_calls } : {}), ...(citations.length ? {sources:citations} : {}) }, usage:data.usage };
     }catch(error){const guardFired=guard.signal.aborted&&!signal.aborted;const timedOut=guardFired&&(error?.name==='TimeoutError'||error?.name==='AbortError'||/aborted due to timeout/i.test(error?.message||''));record.status=signal.aborted?'interrupted':'failed';if(!silent&&task.liveText){task.conversation.push({id:responseId,role:'assistant',content:task.liveText+'\n\n[Interrupted response; incomplete.]'});this.store.journal(task,'partial_response',{text:task.liveText});}if(timedOut)throw new Error('The provider stopped responding in time (slow stream or generation timeout). Any partial text has been preserved; you can resume the task.');throw error;}
-    finally{clearTimeout(hardCap);if(idleTimer)clearInterval(idleTimer);try{responseJournal?.close();}catch{}record.latencyMs=Date.now()-attemptStarted;account();if(!silent&&(!keepLiveOnSuccess||!succeeded)){task.liveText='';task.liveReasoning='';task.liveActivity='';this.changed(task);}else if(silent){this.changed(task);}}
+    finally{clearTimeout(hardCap);if(idleTimer)clearInterval(idleTimer);try{responseJournal?.close();}catch{}record.latencyMs=Date.now()-attemptStarted;account();if(!silent&&(!keepLiveOnSuccess||!succeeded)){task.liveText='';task.liveReasoning='';task.liveReasoningStartedAt=null;task.liveActivity='';this.changed(task);}else if(silent){this.changed(task);}}
   }
   calibrate(task, messages, tools, promptTokens,toolSchema=requestTools(this.effectiveSettings(task), this.plugins, task.loadedToolsets)) {
     if (!Number.isFinite(promptTokens) || promptTokens <= 0) return;
@@ -1361,22 +1719,29 @@ export class Runtime extends EventEmitter {
       ? '\nSession Storage: RAM-ONLY (EPHEMERAL). Zero disk traces are written for this session; child sessions inherit RAM-Only by default. You can migrate back to Regular storage via manage_session(action="set_ephemeral", ephemeral=false) if requested.'
       : '';
     const adminRule = task.adminMode
-      ? '\nWindows Privileges: ADMINISTRATOR RIGHTS ENABLED for this session. run_command executes elevated (services, VPN/network adapters, firewall, registry, system administration).'
+      ? '\nWindows Privileges: ADMINISTRATOR RIGHTS ENABLED for this session. run_command and shell_session execute elevated via a persistent single-UAC Windows Admin worker (services, VPN/network adapters, firewall, registry, system administration).'
       : '';
-    const privacyLine = '\n' + this.privacyPostureLine();
+    const appIntegrityRule = `\nApp Integrity & Self-Knowledge Policy (STRICT — applies in ALL autonomy levels including UNRESTRICTED):
+1) Before reading NEXUS source files to see what features, providers, privacy modes, or settings NEXUS supports or how anything is configured, ALWAYS call nexus_control(action="guide") or nexus_control(action="inspect") first, and use nexus_control / manage_privacy / manage_session / manage_project to change settings, modes, providers, enabled models, tools, or privacy. Only inspect NEXUS source files when diagnosing a confirmed bug or when the user explicitly asks.
+2) NEVER edit, patch, overwrite, delete, drop temporary scripts into, or kill/restart the NEXUS application installation (${NEXUS_APP_ROOT}), its bundled UI/core/native files, protected internal data files (workspace.json, nexus.config.json, vault.*), or NEXUS's own source code unless the user explicitly instructs you to modify NEXUS itself. If modifying NEXUS is 100% unavoidable for another goal, STOP first, warn the user clearly about which NEXUS files would be changed and why, and ask for explicit permission before attempting any edit. Runtime protection will also block and prompt for explicit approval.`;
+    const namingRule = !task.titleCustomized
+      ? `\nSession Naming (PROACTIVE — REQUIRED AT START): This session still has an auto-generated raw prompt title (${JSON.stringify(task.title)}). On your VERY FIRST step (in parallel with your initial tools or before answering), call manage_session(action="rename", title="...") to set a crisp, clear 3-6 word title matching the user's language and real goal. Later, if the conversation's main topic or objective meaningfully shifts, call manage_session(action="rename", title="...") again to keep it accurate.`
+      : `\nSession Naming: Current session title is ${JSON.stringify(task.title)}. Whenever the conversation's main topic, purpose, or primary goal meaningfully shifts to a different objective, proactively update the title with manage_session(action="rename", title="...") (3-6 crisp words in the user's language).`;
+    const privacyLine = '\n' + this.privacyPostureLine() + '\nPrivacy Control: You have full control over NEXUS privacy via manage_privacy (status, explain, verify, apply_preset, stealth, set_routing, set_search, set_pii, set_browser, wireguard_import, wireguard_select, wireguard_remove, wireguard_install, wireguard_connect, wireguard_disconnect, set_wireguard_binary, tor_install, tor_start, tor_stop, tor_new_identity, wipe_browser) and RAM-Only sessions via manage_session(action="set_ephemeral"). Whenever the user asks you to enable, configure, verify, or disable privacy, perform it directly with manage_privacy.';
     const baseInstructions = task.systemPromptOverride?.trim() || this.store.state.settings.globalInstructions;
     const customAddendum = this.store.state.settings.customSystemPrompt?.trim()
       ? `\n\n[User Custom System Prompt — Always Preserved]\n${this.store.state.settings.customSystemPrompt.trim()}`
       : '';
     const unrestricted = mode === 'unrestricted' || mode === 'autopilot' || this.store.state.settings.autonomous;
-    const workspaceLabel = task.workspace || (unrestricted ? `${process.cwd()} (default cwd; unrestricted access)` : '(no folder)');
-    const context = [{ role:'system', content:baseInstructions + customAddendum + '\nProject: ' + workspaceLabel + (project?.name ? ` (${project.name})` : '') + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule + silentRule + storageRule + adminRule + privacyLine }];
+    const workspaceLabel = task.workspace || (unrestricted ? `${safeDefaultWorkspace()} (default cwd; unrestricted access)` : '(no folder)');
+    const context = [{ role:'system', content:baseInstructions + customAddendum + '\nProject: ' + workspaceLabel + (project?.name ? ` (${project.name})` : '') + '\nProject instructions: ' + (project?.instructions || '') + '\nOriginal objective: ' + task.prompt + webRule + modeRule + silentRule + storageRule + adminRule + appIntegrityRule + namingRule + privacyLine }];
     const sections=[{id:'instructions',label:'Instructions & Objective',reason:'Stable prefix: global instructions, workspace folder, project instructions, and original objective.',value:context[0],count:1}];
     if(pinned.length)sections.push({id:'pins',label:'Pinned Messages',reason:'Explicitly pinned by the user to survive compaction.',value:pinned,count:pinned.length});
     if(dependencyContext.length)sections.push({id:'dependencies',label:'Task Dependencies',reason:'Results and recent progress notes from prerequisite tasks.',value:dependencyContext,count:dependencyContext.length});
-    const workspaceRules = task.workspace ? discoverWorkspaceInstructions(task.workspace) : '';
+    const wsMeta = task.workspace ? this._getWorkspaceMeta(task.workspace) : { rules: '', skills: [] };
+    const workspaceRules = wsMeta.rules;
     if(workspaceRules)sections.push({id:'workspace-rules',label:'Repository Rules (NEXUS.md / CLAUDE.md / AGENTS.md)',reason:'Auto-discovered project instruction files in the workspace root.',value:workspaceRules,count:1});
-    const projectSkills = task.workspace ? discoverWorkspaceSkills(task.workspace) : [];
+    const projectSkills = wsMeta.skills;
     if(projectSkills.length)sections.push({id:'project-skills',label:'Project Skills (SKILL.md)',reason:'Auto-discovered SKILL.md files in .nexus/skills, .github/skills, or .claude/skills.',value:projectSkills.map(s=>({name:s.name,description:s.description,sourcePath:s.sourcePath})),count:projectSkills.length});
     const relevantMemories = selectMemoriesForContext(this.store.state.memories || [], { workspace: task.workspace || '' });
     const formattedMemories = formatMemoriesForPrompt(relevantMemories);
@@ -1583,7 +1948,7 @@ export class Runtime extends EventEmitter {
             const scrubber = this.activePiiScrubber();
             if (scrubber.enabled) parsedArgs = scrubber.unscrubValue(parsedArgs);
             const approvalDecision = this.approvalCheck(call.function.name, parentTask, parsedArgs);
-            if (approvalDecision.required && !(await this.approval(parentTask, call.function.name, parsedArgs, signal, approvalDecision.reason))) {
+            if (approvalDecision.required && !(await this.approval(parentTask, call.function.name, parsedArgs, signal, approvalDecision.reason, { criticalSelfEdit: approvalDecision.criticalSelfEdit }))) {
               toolResult = { denied: true, reason: 'The user declined this sub-agent action.' };
             } else {
               toolResult = await executeTool(this, parentTask, call.function.name, parsedArgs, signal);
@@ -1641,8 +2006,8 @@ export class Runtime extends EventEmitter {
         this.desktopOwner = task.id;
       }
       const approvalDecision = this.approvalCheck(name, task, args);
-      if (approvalDecision.required && !(await this.approval(task, name, args, signal, approvalDecision.reason))) {
-        result = { denied:true, reason:'The user declined this action. Respect this decision.' };
+      if (approvalDecision.required && !(await this.approval(task, name, args, signal, approvalDecision.reason, { criticalSelfEdit: approvalDecision.criticalSelfEdit }))) {
+        result = { denied:true, reason: approvalDecision.criticalSelfEdit ? 'The user declined modifying NEXUS application/source files or process. Respect this decision and do not retry without explicit user request.' : 'The user declined this action. Respect this decision.' };
         toolRunRecord.status = 'denied';
       } else {
         this.store.journal(task, 'tool_intent', {name,args});
@@ -1697,23 +2062,34 @@ export class Runtime extends EventEmitter {
       this.store.journal(task, 'tool_result', {name, result:materialized.journal});
       if(effect)this.store.updateEffect(task,effect.id,'observed',{artifact:materialized.artifact || null});
       task.liveActivity='Verifying output of '+name.replaceAll('_',' ')+'…';
-      if (result && typeof result === 'object' && result.written) {
-        const lastFileEvent = task.events.findLast(e => e.kind === 'file_change');
-        toolRunRecord.filePath = result.written;
-        toolRunRecord.fileChangeEventId = lastFileEvent?.id || null;
-        toolRunRecord.hasBackup = Boolean(result.backup || lastFileEvent);
-        if (result.diff) {
-          toolRunRecord.diff = String(result.diff).slice(0, 6000);
-          toolRunRecord.addedLines = result.addedLines || 0;
-          toolRunRecord.removedLines = result.removedLines || 0;
+      if (result && typeof result === 'object') {
+        if (typeof result.exitCode === 'number') toolRunRecord.exitCode = result.exitCode;
+        if (result.written) {
+          const lastFileEvent = task.events.findLast(e => e.kind === 'file_change');
+          toolRunRecord.filePath = result.written;
+          toolRunRecord.fileChangeEventId = lastFileEvent?.id || null;
+          toolRunRecord.hasBackup = Boolean(result.backup || lastFileEvent);
+          if (result.diff) {
+            toolRunRecord.diff = String(result.diff).slice(0, 6000);
+            toolRunRecord.addedLines = result.addedLines || 0;
+            toolRunRecord.removedLines = result.removedLines || 0;
+          }
         }
       }
+      const rawObj = result;
       result=materialized.model;
       const serialized = typeof result === 'string' ? result : JSON.stringify(result);
       toolRunRecord.durationMs = Date.now() - started;
-      toolRunRecord.preview = serialized.slice(0, 800);
+      if (['run_command', 'shell_session'].includes(name) && rawObj && typeof rawObj.output === 'string') {
+        toolRunRecord.preview = rawObj.output.trim().slice(0, 2400);
+      } else if (name === 'read_file' && rawObj && typeof rawObj.content === 'string') {
+        toolRunRecord.preview = rawObj.content.slice(0, 1600);
+      } else {
+        toolRunRecord.preview = serialized.slice(0, 1000);
+      }
       task._repeatErrorKey = '';
       task._repeatErrorCount = 0;
+      task._consecutiveErrorCount = 0;
       return { callId: call.id, serialized };
     } catch (error) {
       toolRunRecord.durationMs = Date.now() - started;
@@ -1725,9 +2101,12 @@ export class Runtime extends EventEmitter {
       const errKey = `${call.function.name}|${call.function.arguments || ''}|${error.message}`;
       if (task._repeatErrorKey === errKey) task._repeatErrorCount = (task._repeatErrorCount || 1) + 1;
       else { task._repeatErrorKey = errKey; task._repeatErrorCount = 1; }
+      task._consecutiveErrorCount = (task._consecutiveErrorCount || 0) + 1;
       const payload = { error: error.message };
       if (task._repeatErrorCount >= 3) {
         payload.loopWarning = `You have called ${call.function.name} with the exact same arguments and hit the same error ${task._repeatErrorCount} times in a row. Do NOT repeat this identical call; change the arguments, use an alternative operation/tool, or report the limitation.`;
+      } else if (task._consecutiveErrorCount >= 4) {
+        payload.loopWarning = `${task._consecutiveErrorCount} consecutive tool calls have failed. Step back, verify your assumptions or inspect state cleanly before trying another approach—do not keep creating trial scripts in a loop.`;
       }
       return { callId: call.id, serialized: JSON.stringify(payload) };
     }
@@ -1735,6 +2114,7 @@ export class Runtime extends EventEmitter {
   async run(task, signal) {
     await this.plugins.ready;
     task.turnCallStart=task.calls?.length || 0;
+    task._consecutiveErrorCount = 0;
     this.repairInterruptedCalls(task);
     this.flushPendingImages(task);
     const maxSteps = this.store.state.settings.maxSteps;
@@ -1747,7 +2127,9 @@ export class Runtime extends EventEmitter {
       this.emitDelta(task);
       const settings = this.effectiveSettings(task);
       const effectiveTools = requestTools(settings, this.plugins, task.loadedToolsets);
-      task.contextTokens = Math.max(this.estimate(task, this.buildContext(task,{hydrate:false})) + this.estimate(task, effectiveTools), task.lastInputTokens || 0);
+      const toolsEstimate = this.estimate(task, effectiveTools);
+      let baseEstimate = this.estimate(task, this.buildContext(task,{hydrate:false})) + toolsEstimate;
+      task.contextTokens = Math.max(baseEstimate, task.lastInputTokens || 0);
       const threshold = settings.contextWindow * settings.compressionPercent / 100;
       if (task.contextTokens >= threshold) {
         // Stage 1: Zero-cost micro-compaction prunes old oversized tool outputs into lossless artifact references first
@@ -1755,21 +2137,26 @@ export class Runtime extends EventEmitter {
           const micro = await this.microCompactTask(task);
           if (micro.prunedCount > 0) {
             task.lastInputTokens = 0;
-            task.contextTokens = this.estimate(task, this.buildContext(task, { hydrate: false })) + this.estimate(task, effectiveTools);
+            baseEstimate = this.estimate(task, this.buildContext(task, { hydrate: false })) + toolsEstimate;
+            task.contextTokens = baseEstimate;
           }
         }
         // Stage 2: Full structured LLM checkpoint compaction if still at or above threshold
         if (task.contextTokens >= threshold) {
           await this.compact(task, signal);
           task.lastInputTokens = 0;
+          baseEstimate = this.estimate(task, this.buildContext(task, { hydrate: false })) + toolsEstimate;
         }
       }
-      if (this.estimate(task, this.buildContext(task,{hydrate:false})) + this.estimate(task, effectiveTools) > settings.contextWindow) throw new Error('Context exceeds the operating ceiling even after compaction. Increase the context ceiling or split the task; history is preserved.');
-      const {message, usage, responseId} = await this.completion(this.buildContext(task), task, signal, { keepLiveOnSuccess: true });
+      if (baseEstimate > settings.contextWindow) throw new Error('Context exceeds the operating ceiling even after compaction. Increase the context ceiling or split the task; history is preserved.');
+      const {message, usage, responseId, reasoningDurationMs} = await this.completion(this.buildContext(task), task, signal, { keepLiveOnSuccess: true });
       task.steps++; task.lastInputTokens = usage?.prompt_tokens || 0; task.usage = (task.usage || 0) + (usage?.total_tokens || 0);
       this.store.transcript(task, message);
       const stepReasoning=reasoningToText(message.reasoning_details);
-      const cleanContent = typeof message.content === 'string' && message.content.trim() ? message.content : null;
+      const displayScrubber = this.activePiiScrubber();
+      const rawCleanContent = typeof message.content === 'string' && message.content.trim() ? message.content : null;
+      const cleanContent = rawCleanContent && displayScrubber.enabled ? displayScrubber.unscrubText(rawCleanContent) : rawCleanContent;
+      task.updatedAt = new Date().toISOString();
       const toolRecords = (message.tool_calls || []).map(call => ({
         id: crypto.randomUUID(),
         callId: call.id,
@@ -1786,7 +2173,7 @@ export class Runtime extends EventEmitter {
           id: responseId,
           role: 'assistant',
           content: cleanContent,
-          ...(stepReasoning ? { reasoning: stepReasoning } : {}),
+          ...(stepReasoning ? { reasoning: stepReasoning, ...(reasoningDurationMs != null ? { reasoningDurationMs } : {}) } : {}),
           ...(message.sources?.length ? { sources: message.sources } : {}),
           ...(toolRecords.length ? { toolRuns: toolRecords } : {}),
           step: task.steps || undefined,
@@ -1797,20 +2184,28 @@ export class Runtime extends EventEmitter {
       // Clear live stream atomically in the same synchronous frame as pushing convEntry (zero flicker!)
       task.liveText = '';
       task.liveReasoning = '';
+      task.liveReasoningStartedAt = null;
       task.liveActivity = toolRecords.length ? `Running ${toolRecords.length} ${toolRecords.length === 1 ? 'tool' : 'tools'}…` : '';
       task.liveTools = [];
       task.contextTokens=this.estimate(task,this.buildContext(task,{hydrate:false}))+this.estimate(task,requestTools(this.effectiveSettings(task), this.plugins, task.loadedToolsets));
       if (!message.tool_calls?.length) {
-        task.result = message.content; task.status = 'complete';
-        this.store.journal(task, 'complete', { result:message.content });
+        task.result = cleanContent ?? message.content; task.status = 'complete'; task.updatedAt = new Date().toISOString();
+        this.store.journal(task, 'complete', { result: task.result });
         this.changed(task);
         return;
       }
       this.changed(task);
 
-      const canParallel = message.tool_calls.length > 1 && message.tool_calls.every(call =>
-        (READ_ONLY_TOOL_NAMES.has(call.function.name) || this.plugins?.findTool(call.function.name)?.tool?.readOnly) && !this.needsApproval(call.function.name, task)
-      );
+      const canParallel = message.tool_calls.length > 1 && message.tool_calls.every(call => {
+        const fnName = call.function.name;
+        let parsed = {};
+        try { parsed = JSON.parse(call.function.arguments || '{}'); } catch {}
+        const isParallelSafeSessionRename = fnName === 'manage_session' && ['rename', 'info'].includes(String(parsed?.action || '').toLowerCase());
+        const isParallelSafeReadControl = (fnName === 'nexus_control' && ['guide', 'inspect'].includes(String(parsed?.action || 'inspect').toLowerCase()))
+          || (fnName === 'manage_privacy' && ['status', 'explain', 'verify'].includes(String(parsed?.action || 'status').toLowerCase()));
+        const isReadLike = isParallelSafeSessionRename || isParallelSafeReadControl || READ_ONLY_TOOL_NAMES.has(fnName) || this.plugins?.findTool(fnName)?.tool?.readOnly;
+        return isReadLike && !this.needsApproval(fnName, task, parsed);
+      });
       if (canParallel) {
         const results = await Promise.all(message.tool_calls.map((call, idx) => this.executeSingleToolCall(task, call, signal, toolRecords[idx])));
         for (const item of results) {
@@ -1897,5 +2292,5 @@ export class Runtime extends EventEmitter {
     try { const result=await this.invokeConnector(effect.args,signal,effect);return this.store.updateEffect(task,id,'observed',{lastStatus:result.status}); }
     catch(error){this.store.updateEffect(task,id,'uncertain',{note:'Retry did not produce a verifiable result.',error:error.message});throw error;}
   }
-  shutdown() { this.closed = true; for (const controller of this.active.values()) controller.abort();for(const controller of this.compressionControllers.values())controller.abort(); this.processes?.stopAll(); try{this.store.flushSave();}catch{} }
+  shutdown() { this.closed = true; for (const controller of this.active.values()) controller.abort();for(const controller of this.compressionControllers.values())controller.abort(); this.processes?.stopAll(); try{this.adminBroker?.stop();}catch{} try{this.store.flushSave();}catch{} }
 }

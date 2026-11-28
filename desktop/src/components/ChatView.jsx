@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { MarkdownRenderer, StreamingMarkdown, CopyButton } from './MarkdownRenderer.jsx';
 import ChatMediaCard from './ChatMediaCard.jsx';
-import ToolTimeline, { describeToolAction } from './ToolTimeline.jsx';
+import ToolTimeline, { ToolActivityRow, describeToolAction, formatThoughtDuration } from './ToolTimeline.jsx';
 import useSmoothStream from '../useSmoothStream.jsx';
 import ComposerControls from './ModelPickerPopover.jsx';
 import SessionMetricsPopover from './SessionMetricsPopover.jsx';
@@ -62,26 +62,45 @@ function LiveReasoningContent({ text }) {
   );
 }
 
-const ReasoningBlock = React.memo(function ReasoningBlock({ text, step, live }) {
+const ReasoningBlock = React.memo(function ReasoningBlock({ text, durationMs = null, startedAt = null, live = false }) {
+  const [open, setOpen] = useState(Boolean(live));
+  const [elapsedMs, setElapsedMs] = useState(() => (live && startedAt ? Math.max(0, Date.now() - startedAt) : durationMs));
+
+  useEffect(() => {
+    if (!live) {
+      setElapsedMs(durationMs);
+      return;
+    }
+    const base = startedAt || Date.now();
+    const tick = () => setElapsedMs(Math.max(0, Date.now() - base));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [live, startedAt, durationMs]);
+
   if (!text) return null;
-  const preview = String(text).trim().replace(/\s+/g, ' ').slice(0, 110);
+  const durStr = formatThoughtDuration(elapsedMs);
+  const label = live
+    ? (durStr ? `Thinking… ${durStr}` : 'Thinking…')
+    : (durStr ? `Thought for ${durStr}` : 'Thought');
+
   return (
-    <details className={`reasoning-ghost ${live ? 'live' : ''}`} open={live ? true : undefined}>
-      <summary>
-        <ChevronRight size={12} className="ghost-chevron" />
-        <span className={`reasoning-title ${live ? 'shimmer-text' : ''}`}>
-          {live ? 'Thinking…' : 'Thought'}
+    <div className={`cp-row cp-thought ${live ? 'is-running' : ''} ${open ? 'is-open' : ''}`}>
+      <button type="button" className="cp-row-btn" onClick={() => setOpen(v => !v)} aria-expanded={open}>
+        <span className="cp-row-icon">
+          {live ? <Loader2 size={13} className="spin" style={{ color: 'var(--accent)' }} /> : <Sparkles size={13} />}
         </span>
-        {!live && <span className="ghost-preview">{preview}</span>}
-      </summary>
-      {live ? (
-        <LiveReasoningContent text={text} />
-      ) : (
-        <div className="reasoning-rail">
-          <MarkdownRenderer text={text} />
+        <span className={`cp-row-label cp-thought-label ${live ? 'shimmer-text' : ''}`}>{label}</span>
+        <span className="cp-row-right">
+          <ChevronRight size={12} className={`cp-chev ${open ? 'rot' : ''}`} />
+        </span>
+      </button>
+      {open && (
+        <div className="cp-drawer cp-thought-drawer">
+          {live ? <LiveReasoningContent text={text} /> : <div className="reasoning-rail"><MarkdownRenderer text={text} /></div>}
         </div>
       )}
-    </details>
+    </div>
   );
 });
 
@@ -113,19 +132,17 @@ function groupConversationTurns(messages = [], isRunning = false) {
   return turns;
 }
 
-// Build chronological segments inside ONE NEXUS turn:
-// - Reasoning blocks stay visible in sequence between steps
-// - Assistant prose between tool calls renders directly inline (never collapsed!)
-// - Consecutive tool calls (within a step or across silent tool-only steps) group into one compact collapsible ToolCluster
+// Build flat chronological Copilot-style stream inside ONE NEXUS turn:
+// Interleaves Reasoning rows ("Thought for 18s"), individual Tool rows ("View ...", "Edit ... +2 -2", ">_ Run ..."),
+// and inline prose cleanly in exact execution order — no awkward nested accordion boxes!
 function buildTurnSegments(batch = [], silentToolSteps = false) {
   const segments = [];
-  const pushTools = (stepId, toolRuns) => {
-    if (!toolRuns?.length) return;
+  const pushActivity = item => {
     const prev = segments[segments.length - 1];
-    if (prev && prev.kind === 'tools') {
-      prev.tools = prev.tools.concat(toolRuns);
+    if (prev && prev.kind === 'activity') {
+      prev.items.push(item);
     } else {
-      segments.push({ kind: 'tools', key: 'tools-' + stepId, tools: [...toolRuns] });
+      segments.push({ kind: 'activity', key: 'act-' + item.key, items: [item] });
     }
   };
 
@@ -134,7 +151,13 @@ function buildTurnSegments(batch = [], silentToolSteps = false) {
     const hasTools = Boolean(step.toolRuns?.length);
     const isLast = idx === batch.length - 1;
     if (step.reasoning?.trim()) {
-      segments.push({ kind: 'reasoning', key: 'reason-' + step.id, step: step.step, text: step.reasoning });
+      pushActivity({
+        kind: 'reasoning',
+        key: 'reason-' + step.id,
+        step: step.step,
+        text: step.reasoning,
+        durationMs: step.reasoningDurationMs ?? null,
+      });
     }
     const showProse = Boolean(
       (step.content?.trim() && (!silentToolSteps || !hasTools || isLast)) ||
@@ -154,81 +177,58 @@ function buildTurnSegments(batch = [], silentToolSteps = false) {
       });
     }
     if (hasTools) {
-      pushTools(step.id, step.toolRuns);
+      for (const tool of step.toolRuns) {
+        pushActivity({ kind: 'tool', key: 'tool-' + tool.id, tool });
+      }
     }
   }
   return segments;
 }
 
-const ToolCluster = React.memo(function ToolCluster({ tools, taskId, onRevert }) {
-  if (!tools?.length) return null;
-  // Single tool: render directly as one flat borderless disclosure row (no double-nesting!)
-  if (tools.length === 1) {
-    return (
-      <div className="tool-single-wrap">
-        <ToolTimeline tools={tools} taskId={taskId} onRevert={onRevert} defaultExpandDiff={false} quiet />
-      </div>
-    );
-  }
-  const anyRunning = tools.some(t => t.status === 'running');
-  const errorCount = tools.filter(t => t.status === 'error').length;
-  const totalMs = tools.reduce((m, t) => m + (t.durationMs || 0), 0);
-  const added = tools.reduce((m, t) => m + (t.addedLines || 0), 0);
-  const removed = tools.reduce((m, t) => m + (t.removedLines || 0), 0);
+const ActivityStreamBlock = React.memo(function ActivityStreamBlock({ items = [], taskId, onRevert, activeTurn = false }) {
+  const [showAll, setShowAll] = useState(false);
+  if (!items.length) return null;
 
-  const uniqueNames = [...new Set(tools.map(t => t.name))];
-  let headline = '';
-  let detail = '';
-  if (uniqueNames.length === 1 && uniqueNames[0] === 'read_file') {
-    headline = anyRunning ? `Reading ${tools.length} files…` : `Read ${tools.length} files`;
-    detail = tools.map(t => describeToolAction(t.name, t.args).detail).filter(Boolean).slice(0, 3).join(', ');
-  } else if (uniqueNames.length === 1 && ['write_file', 'replace_text', 'multi_edit', 'apply_patch'].includes(uniqueNames[0])) {
-    headline = anyRunning ? `Editing ${tools.length} files…` : `Edited ${tools.length} files`;
-    detail = tools.map(t => describeToolAction(t.name, t.args).detail).filter(Boolean).slice(0, 3).join(', ');
-  } else {
-    headline = anyRunning ? `Running ${tools.length} actions…` : `${tools.length} actions`;
-    detail = uniqueNames.slice(0, 3).map(n => describeToolAction(n, {}).label.toLowerCase()).join(', ') + (uniqueNames.length > 3 ? ` +${uniqueNames.length - 3}` : '');
-  }
+  const COLLAPSE_THRESHOLD = 16;
+  const shouldFold = !activeTurn && !showAll && items.length > COLLAPSE_THRESHOLD;
+  const visibleItems = shouldFold ? items.slice(-5) : items;
+  const hiddenCount = items.length - visibleItems.length;
+
+  const toolItems = items.filter(it => it.kind === 'tool').map(it => it.tool);
+  const editCount = toolItems.filter(t => ['write_file', 'replace_text', 'multi_edit', 'apply_patch'].includes(t.name)).length;
+  const added = toolItems.reduce((m, t) => m + (t.addedLines || 0), 0);
+  const removed = toolItems.reduce((m, t) => m + (t.removedLines || 0), 0);
 
   return (
-    <details className={`tool-ghost ${anyRunning ? 'running' : errorCount ? 'has-error' : ''}`} open={anyRunning || errorCount > 0 || undefined}>
-      <summary className="tool-ghost-summary">
-        <ChevronRight size={12} className="ghost-chevron" />
-        {anyRunning ? (
-          <Loader2 size={12} className="spin" style={{ color: 'var(--accent)', flexShrink: 0 }} />
-        ) : errorCount > 0 ? (
-          <AlertCircle size={12} style={{ color: 'var(--err-fg)', flexShrink: 0 }} />
-        ) : (
-          <CheckCircle2 size={12} style={{ color: 'var(--ink-faint)', flexShrink: 0 }} />
-        )}
-        <span className={`tool-ghost-label ${anyRunning ? 'shimmer-text' : ''}`}>{headline}</span>
-        {detail && <span className="ghost-preview">{detail}</span>}
-        {(added > 0 || removed > 0) && (
-          <span className="diff-stat-inline tabular">
-            {added > 0 && <em className="add">+{added}</em>}
-            {removed > 0 && <em className="del">-{removed}</em>}
-          </span>
-        )}
-        {errorCount > 0 && <span className="ghost-err-tag">{errorCount} failed</span>}
-        {totalMs > 0 && <span className="tool-dur">{formatDuration(totalMs)}</span>}
-      </summary>
-      <div className="tool-ghost-rail">
-        <ToolTimeline tools={tools} taskId={taskId} onRevert={onRevert} defaultExpandDiff={false} quiet />
-      </div>
-    </details>
+    <div className="cp-stream" aria-label="Agent activity timeline">
+      {shouldFold && (
+        <button type="button" className="cp-fold-btn" onClick={() => setShowAll(true)}>
+          <ChevronRight size={12} />
+          <span>Show {hiddenCount} earlier steps</span>
+          {editCount > 0 && (
+            <span className="cp-diff-stat tabular">
+              {added > 0 && <em className="add">+{added}</em>}
+              {removed > 0 && <em className="del">-{removed}</em>}
+            </span>
+          )}
+        </button>
+      )}
+      {visibleItems.map(item => (
+        item.kind === 'reasoning'
+          ? <ReasoningBlock key={item.key} text={item.text} durationMs={item.durationMs} />
+          : <ToolActivityRow key={item.key} tool={item.tool} taskId={taskId} onRevert={onRevert} />
+      ))}
+    </div>
   );
 });
 
-const AssistantTurnBody = React.memo(function AssistantTurnBody({ batch, taskId, onRevert, silentToolSteps = false }) {
+const AssistantTurnBody = React.memo(function AssistantTurnBody({ batch, taskId, onRevert, silentToolSteps = false, activeTurn = false }) {
   const segments = useMemo(() => buildTurnSegments(batch, silentToolSteps), [batch, silentToolSteps]);
   return (
     <div className="turn-flow">
       {segments.map(seg => {
-        if (seg.kind === 'reasoning') {
-          return <ReasoningBlock key={seg.key} text={seg.text} step={seg.step} />;
-        }
-        if (seg.kind === 'tools') {
-          return <ToolCluster key={seg.key} tools={seg.tools} taskId={taskId} onRevert={onRevert} />;
+        if (seg.kind === 'activity') {
+          return <ActivityStreamBlock key={seg.key} items={seg.items} taskId={taskId} onRevert={onRevert} activeTurn={activeTurn} />;
         }
         return (
           <div key={seg.key} id={'message-' + seg.id} tabIndex={-1} className="turn-prose">
@@ -316,6 +316,7 @@ export default function ChatView({
   const matchedDelta = (task?.id && liveDelta?.taskId === task.id) ? liveDelta : null;
   const effectiveLiveText = matchedDelta?.liveText || task?.liveText || '';
   const effectiveLiveReasoning = matchedDelta?.liveReasoning || task?.liveReasoning || '';
+  const effectiveLiveReasoningStartedAt = matchedDelta?.liveReasoningStartedAt || task?.liveReasoningStartedAt || null;
   const effectiveLiveActivity = matchedDelta?.liveActivity || task?.liveActivity || '';
   const effectiveLiveSubagents = (matchedDelta?.liveSubagents?.length ? matchedDelta.liveSubagents : task?.liveSubagents) || [];
   const isRunning = Boolean(task && (task.compacting || ['running', 'approval', 'queued'].includes(task.status)));
@@ -598,12 +599,12 @@ export default function ChatView({
                 className={`filter-chip ${task.adminMode ? 'admin-chip-active' : ''}`}
                 style={{ padding: '3px 8px', fontSize: 11 }}
                 title={task.adminMode
-                  ? 'Windows Administrator Rights ENABLED for this session (elevated commands for VPN, services, firewall). Click to revoke.'
-                  : 'Standard user privileges. Click to grant Windows Administrator rights to this session.'}
+                  ? 'Windows Administrator Rights ENABLED (single-UAC persistent elevated worker — no repeated Windows prompts). Click to revoke.'
+                  : 'Standard user privileges. Click to grant Windows Administrator rights (prompts Windows UAC once, then reuses elevated session automatically).'}
                 onClick={async () => {
                   const next = !task.adminMode;
                   if (await act('updateChat', { id: task.id, adminMode: next })) {
-                    notify(next ? 'Admin Rights enabled for this session (commands run elevated).' : 'Revoked Admin Rights for this session.', 'info');
+                    notify(next ? 'Admin Rights enabled — Windows will ask UAC once on first elevated command, then run automatically without repeated popups.' : 'Revoked Admin Rights for this session.', 'info');
                   }
                 }}
               >
@@ -780,11 +781,11 @@ export default function ChatView({
                           </div>
                         </div>
 
-                        <AssistantTurnBody batch={turn.batch} taskId={task.id} onRevert={handleRevert} silentToolSteps={Boolean(s.silentToolSteps)} />
+                        <AssistantTurnBody batch={turn.batch} taskId={task.id} onRevert={handleRevert} silentToolSteps={Boolean(s.silentToolSteps)} activeTurn={turn.activeTurn} />
 
                         {showLiveInsideThisTurn && (
                           <div className="live-continuation">
-                            {effectiveLiveReasoning && <ReasoningBlock text={effectiveLiveReasoning} live />}
+                            {effectiveLiveReasoning && <ReasoningBlock text={effectiveLiveReasoning} startedAt={effectiveLiveReasoningStartedAt} live />}
                             {effectiveLiveText && <StreamingMarkdown text={effectiveLiveText} />}
                           </div>
                         )}
@@ -818,7 +819,7 @@ export default function ChatView({
                           </span>
                         </div>
                       </div>
-                      {effectiveLiveReasoning && <ReasoningBlock text={effectiveLiveReasoning} live />}
+                      {effectiveLiveReasoning && <ReasoningBlock text={effectiveLiveReasoning} startedAt={effectiveLiveReasoningStartedAt} live />}
                       {effectiveLiveText && <StreamingMarkdown text={effectiveLiveText} />}
                     </article>
                   )}
@@ -892,18 +893,22 @@ export default function ChatView({
         )}
 
         {approvals.map(a => (
-          <div key={a.id} className="approval-card">
+          <div key={a.id} className={`approval-card ${a.criticalSelfEdit ? 'critical-self-edit' : ''}`}>
             <div className="row-between" style={{ flexWrap: 'wrap' }}>
               <div>
                 <div className="row">
-                  <span className="pill warn">Approval Required</span>
+                  <span className={`pill ${a.criticalSelfEdit ? 'err' : 'warn'}`}>
+                    {a.criticalSelfEdit ? 'NEXUS Self-Edit Protection' : 'Approval Required'}
+                  </span>
                   <strong className="mono" style={{ fontSize: 13 }}>{a.name}</strong>
                 </div>
-                {a.reason && <small className="hint" style={{ display: 'block', marginTop: 4 }}>{a.reason}</small>}
+                {a.reason && <small className="hint" style={{ display: 'block', marginTop: 4, color: a.criticalSelfEdit ? 'var(--err-fg)' : undefined }}>{a.reason}</small>}
               </div>
               <div className="row" style={{ flexWrap: 'wrap' }}>
-                <button type="button" className="btn-primary" onClick={() => act('approve', { id: a.id, allowed: true })}><Check size={14} /> Execute</button>
-                {a.suggestedPattern && (
+                <button type="button" className="btn-primary" onClick={() => act('approve', { id: a.id, allowed: true })}>
+                  <Check size={14} /> {a.criticalSelfEdit ? 'Approve Once' : 'Execute'}
+                </button>
+                {!a.criticalSelfEdit && a.suggestedPattern && (
                   <button
                     type="button"
                     className="btn-secondary"
@@ -913,7 +918,9 @@ export default function ChatView({
                     Always Allow: <code style={{ fontSize: 11 }}>{a.suggestedPattern}</code>
                   </button>
                 )}
-                <button type="button" className="btn-secondary" onClick={() => act('approve', { id: a.id, allowed: true, allowSession: true })}>Allow All This Session</button>
+                {!a.criticalSelfEdit && (
+                  <button type="button" className="btn-secondary" onClick={() => act('approve', { id: a.id, allowed: true, allowSession: true })}>Allow All This Session</button>
+                )}
                 <button type="button" className="btn-danger" onClick={() => act('approve', { id: a.id, allowed: false })}><X size={14} /> Decline</button>
               </div>
             </div>
@@ -922,7 +929,7 @@ export default function ChatView({
         ))}
 
         <div className="composer-wrap">
-          <ComposerControls task={task} settings={s} models={models} act={act} onOpenChange={setModelPickerOpen} />
+          <ComposerControls task={task} settings={s} models={models} providerKeys={state.providerKeys} act={act} onOpenChange={setModelPickerOpen} />
 
           <form
             className={`composer-box ${dragOver ? 'drag-over' : ''}`}
